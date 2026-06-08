@@ -272,11 +272,16 @@ In progress.
   `bootstrap/adacomp.c`. Walker `emit_expression_ast` reproduces the
   same C output (modulo aggressive parens on binary nodes). Self-
   hosting still verifies.
-- [ ] **Step 2.** Mirror the AST conversion in `src/adacomp.adb` so
-  the Ada self-host walks the same data structure. *Next concrete
-  commit.*
+- [x] **Step 2.** Same AST conversion ported to `src/adacomp.adb`.
+  The Ada self-host now walks the same data structure: flat parallel
+  `Node_Store` arrays, an `NPool` character buffer for names and
+  string literals, and `Emit_Expression_AST` as the walker. All
+  external callers still use the public `Parse_Expression`, which is
+  a build / emit / reset wrapper. Self-hosting verifies — stage1 and
+  stage2 produce identical output.
 - [ ] **Step 3.** Extend the AST to statements (if / while / for /
-  return / exit / assignment / call) in both files.
+  return / exit / assignment / call) in both files. *Next concrete
+  commit.*
 - [ ] **Step 4.** Extend the AST to declarations (variable, procedure,
   function, type) in both files.
 - [ ] Replace fixed-size buffers (source, token, name pool, symbol

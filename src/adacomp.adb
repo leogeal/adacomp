@@ -135,6 +135,72 @@ procedure Adacomp is
    -- becomes `return 0;` in C's int main).
    In_Main_Proc : Integer := 0;
 
+   -- ---- AST (expressions only, for now) ----
+   -- The parser builds an explicit tree for each top-level expression,
+   -- then the walker emits it. Statements and declarations still emit
+   -- directly; Phase 1 introduces the AST incrementally. Index 0 is
+   -- reserved as "no node"; allocations start at 1.
+
+   -- AST node kinds
+   A_INT_LIT   : constant Integer := 1;
+   A_CHAR_LIT  : constant Integer := 2;
+   A_STR_LIT   : constant Integer := 3;
+   A_BOOL_LIT  : constant Integer := 4;
+   A_IDENT     : constant Integer := 5;
+   A_UNARY     : constant Integer := 6;
+   A_BINARY    : constant Integer := 7;
+   A_INDEX     : constant Integer := 8;
+   A_INDEX2    : constant Integer := 9;
+   A_CALL      : constant Integer := 10;
+   A_DOTTED    : constant Integer := 11;
+   A_ATTR_TYPE : constant Integer := 12;
+   A_ATTR_VAR  : constant Integer := 13;
+
+   -- Operator codes (for UNARY / BINARY)
+   OP_ADD : constant Integer := 1;
+   OP_SUB : constant Integer := 2;
+   OP_MUL : constant Integer := 3;
+   OP_DIV : constant Integer := 4;
+   OP_MOD : constant Integer := 5;
+   OP_EQ  : constant Integer := 6;
+   OP_NEQ : constant Integer := 7;
+   OP_LT  : constant Integer := 8;
+   OP_GT  : constant Integer := 9;
+   OP_LE  : constant Integer := 10;
+   OP_GE  : constant Integer := 11;
+   OP_AND : constant Integer := 12;
+   OP_OR  : constant Integer := 13;
+   OP_NEG : constant Integer := 14;
+   OP_NOT : constant Integer := 15;
+
+   -- Attribute kinds (for ATTR_TYPE / ATTR_VAR)
+   ATTR_IMAGE  : constant Integer := 1;
+   ATTR_POS    : constant Integer := 2;
+   ATTR_VAL    : constant Integer := 3;
+   ATTR_LENGTH : constant Integer := 4;
+   ATTR_FIRST  : constant Integer := 5;
+   ATTR_LAST   : constant Integer := 6;
+
+   -- Node storage as parallel arrays
+   type Node_Store is array (1 .. 10000) of Integer;
+   N_Kind    : Node_Store;
+   N_Op      : Node_Store;
+   N_Int     : Node_Store;  -- literal value, sym index, or sub-name length for DOTTED
+   N_Str_Off : Node_Store;  -- offset into NPool
+   N_Str_Len : Node_Store;
+   N_Left    : Node_Store;  -- primary operand
+   N_Right   : Node_Store;  -- BINARY rhs / INDEX rhs
+   N_Arg2    : Node_Store;  -- INDEX2 second index / DOTTED sub-name offset
+   N_First   : Node_Store;  -- arg list head for CALL / DOTTED
+   N_Next    : Node_Store;  -- sibling pointer in arg lists
+   N_Line    : Node_Store;
+   N_Count   : Integer := 1;  -- index 0 reserved; allocations start at 1
+
+   -- Character pool for AST names and string literals
+   type NPool_Buf is array (1 .. 200000) of Character;
+   NPool     : NPool_Buf;
+   NPool_Len : Integer := 0;
+
    -- Helper: lowercase character
    function To_Lower (C : Character) return Character is
    begin
@@ -676,10 +742,74 @@ procedure Adacomp is
       Scope_Depth := Scope_Depth - 1;
    end Pop_Scope;
 
+   -- ---- AST helpers ----
+
+   procedure Reset_AST is
+   begin
+      N_Count := 1;
+      NPool_Len := 0;
+   end Reset_AST;
+
+   function New_Node (Kind : Integer) return Integer is
+      N : Integer;
+   begin
+      N := N_Count;
+      N_Count := N_Count + 1;
+      N_Kind (N) := Kind;
+      N_Op (N) := 0;
+      N_Int (N) := 0;
+      N_Str_Off (N) := 0;
+      N_Str_Len (N) := 0;
+      N_Left (N) := 0;
+      N_Right (N) := 0;
+      N_Arg2 (N) := 0;
+      N_First (N) := 0;
+      N_Next (N) := 0;
+      N_Line (N) := Line_Num;
+      return N;
+   end New_Node;
+
+   function Pool_Str (Buf : Tok_Buffer; Len : Integer) return Integer is
+      Off : Integer;
+   begin
+      Off := NPool_Len + 1;
+      for I in 1 .. Len loop
+         NPool_Len := NPool_Len + 1;
+         NPool (NPool_Len) := Buf (I);
+      end loop;
+      return Off;
+   end Pool_Str;
+
+   function NPool_Eq_CI (Off : Integer; Len : Integer; S : String) return Boolean is
+   begin
+      if Len /= S'Length then
+         return False;
+      end if;
+      for I in 1 .. Len loop
+         if To_Lower (NPool (Off + I - 1)) /= To_Lower (S (S'First + I - 1)) then
+            return False;
+         end if;
+      end loop;
+      return True;
+   end NPool_Eq_CI;
+
+   procedure Emit_Pool_Lower (Off : Integer; Len : Integer) is
+   begin
+      for I in 1 .. Len loop
+         Emit_Ch (To_Lower (NPool (Off + I - 1)));
+      end loop;
+   end Emit_Pool_Lower;
+
    -- Forward declarations
    procedure Parse_Expression;
    procedure Parse_Statements;
    procedure Parse_Declarations;
+   function  Parse_Expression_AST return Integer;
+   function  Parse_Comparison_AST return Integer;
+   function  Parse_Term_AST return Integer;
+   function  Parse_Factor_AST return Integer;
+   function  Parse_Primary_AST return Integer;
+   procedure Emit_Expression_AST (N : Integer);
 
    -- Parse type reference
    function Parse_Type_Ref return Integer is
@@ -746,62 +876,68 @@ procedure Adacomp is
       return True;
    end Name_Eq;
 
-   -- Parse primary expression
-   procedure Parse_Primary is
+   -- ---- AST-building expression parsers ----
+   -- Each returns the index of the AST node it constructs.
+
+   function Parse_Primary_AST return Integer is
+      N : Integer;
       Saved : Tok_Buffer;
       Saved_Len : Integer;
       Sym_Idx : Integer;
    begin
       if Tok = TK_INT_LIT then
-         Emit_Tok;
+         N := New_Node (A_INT_LIT);
+         N_Int (N) := Tok_Int;
          Next_Token;
-
-      elsif Tok = TK_CHAR_LIT then
-         Emit ("'");
-         if Tok_Val (1) = ''' then
-            Emit ("\'");
-         elsif Tok_Val (1) = '\' then
-            Emit ("\\");
-         else
-            Emit_Ch (Tok_Val (1));
-         end if;
-         Emit ("'");
+         return N;
+      end if;
+      if Tok = TK_CHAR_LIT then
+         N := New_Node (A_CHAR_LIT);
+         N_Int (N) := Character'Pos (Tok_Val (1));
          Next_Token;
-
-      elsif Tok = TK_STR_LIT then
-         Emit_Ch ('"');
-         for I in 1 .. Tok_Len loop
-            if Tok_Val (I) = '"' then
-               Emit ("\""");
-            elsif Tok_Val (I) = '\' then
-               Emit ("\\");
-            else
-               Emit_Ch (Tok_Val (I));
-            end if;
-         end loop;
-         Emit_Ch ('"');
+         return N;
+      end if;
+      if Tok = TK_STR_LIT then
+         N := New_Node (A_STR_LIT);
+         N_Str_Off (N) := Pool_Str (Tok_Val, Tok_Len);
+         N_Str_Len (N) := Tok_Len;
          Next_Token;
-
-      elsif Tok = TK_TRUE then
-         Emit ("1"); Next_Token;
-
-      elsif Tok = TK_FALSE then
-         Emit ("0"); Next_Token;
-
-      elsif Tok = TK_NOT then
-         Emit ("!"); Next_Token;
-         Parse_Primary;
-
-      elsif Tok = TK_LPAREN then
-         Emit ("("); Next_Token;
-         Parse_Expression;
-         Emit (")"); Expect (TK_RPAREN);
-
-      elsif Tok = TK_MINUS then
-         Emit ("-"); Next_Token;
-         Parse_Primary;
-
-      elsif Tok = TK_INTEGER or Tok = TK_CHARACTER or Tok = TK_BOOLEAN then
+         return N;
+      end if;
+      if Tok = TK_TRUE then
+         N := New_Node (A_BOOL_LIT);
+         N_Int (N) := 1;
+         Next_Token;
+         return N;
+      end if;
+      if Tok = TK_FALSE then
+         N := New_Node (A_BOOL_LIT);
+         N_Int (N) := 0;
+         Next_Token;
+         return N;
+      end if;
+      if Tok = TK_NOT then
+         Next_Token;
+         N := New_Node (A_UNARY);
+         N_Op (N) := OP_NOT;
+         N_Left (N) := Parse_Primary_AST;
+         return N;
+      end if;
+      if Tok = TK_MINUS then
+         Next_Token;
+         N := New_Node (A_UNARY);
+         N_Op (N) := OP_NEG;
+         N_Left (N) := Parse_Primary_AST;
+         return N;
+      end if;
+      if Tok = TK_LPAREN then
+         -- Parens contribute no node; the inner expression carries through.
+         Next_Token;
+         N := Parse_Expression_AST;
+         Expect (TK_RPAREN);
+         return N;
+      end if;
+      if Tok = TK_INTEGER or Tok = TK_CHARACTER or Tok = TK_BOOLEAN then
          -- Type-name attribute: Integer'Image (X), Character'Pos/Val (X)
          Next_Token;
          if Tok /= TK_TICK then Error ("expected ' after type name"); end if;
@@ -815,24 +951,23 @@ procedure Adacomp is
                Attr (I) := Tok_Val (I);
             end loop;
             Next_Token;
+            N := New_Node (A_ATTR_TYPE);
             if Name_Eq (Attr, Attr_Len, "Image") then
-               Emit ("int_to_str(");
-               Expect (TK_LPAREN); Parse_Expression;
-               Emit (")"); Expect (TK_RPAREN);
+               N_Op (N) := ATTR_IMAGE;
             elsif Name_Eq (Attr, Attr_Len, "Pos") then
-               Emit ("((int)(");
-               Expect (TK_LPAREN); Parse_Expression;
-               Emit ("))"); Expect (TK_RPAREN);
+               N_Op (N) := ATTR_POS;
             elsif Name_Eq (Attr, Attr_Len, "Val") then
-               Emit ("((char)(");
-               Expect (TK_LPAREN); Parse_Expression;
-               Emit ("))"); Expect (TK_RPAREN);
+               N_Op (N) := ATTR_VAL;
             else
                Error ("unsupported type-name attribute");
             end if;
+            Expect (TK_LPAREN);
+            N_Left (N) := Parse_Expression_AST;
+            Expect (TK_RPAREN);
+            return N;
          end;
-
-      elsif Tok = TK_IDENT then
+      end if;
+      if Tok = TK_IDENT then
          Saved_Len := Tok_Len;
          for I in 1 .. Tok_Len loop
             Saved (I) := Tok_Val (I);
@@ -852,63 +987,70 @@ procedure Adacomp is
                   Attr (I) := Tok_Val (I);
                end loop;
                Next_Token;
+               N := New_Node (A_ATTR_VAR);
+               N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+               N_Str_Len (N) := Saved_Len;
                if Name_Eq (Attr, Attr_Len, "Length") then
-                  Emit ("(int)strlen(");
-                  Emit_Lower (Saved, Saved_Len);
-                  Emit (")");
+                  N_Op (N) := ATTR_LENGTH;
                elsif Name_Eq (Attr, Attr_Len, "First") then
-                  Emit ("1");
+                  N_Op (N) := ATTR_FIRST;
                elsif Name_Eq (Attr, Attr_Len, "Last") then
-                  Emit ("(int)strlen(");
-                  Emit_Lower (Saved, Saved_Len);
-                  Emit (")");
+                  N_Op (N) := ATTR_LAST;
                else
                   Error ("unsupported variable attribute");
                end if;
+               return N;
             end;
+         end if;
 
-         elsif Tok = TK_LPAREN then
+         if Tok = TK_LPAREN then
             if Sym_Idx > 0 and then (Sym_Kind (Sym_Idx) = SK_PROC or Sym_Kind (Sym_Idx) = SK_FUNC) then
-               Emit_Lower (Saved, Saved_Len);
-               Emit ("(");
+               -- Function/procedure call: name (arg, arg, ...)
                Next_Token;
+               N := New_Node (A_CALL);
+               N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+               N_Str_Len (N) := Saved_Len;
+               N_Int (N) := Sym_Idx;
                if Tok /= TK_RPAREN then
-                  Parse_Expression;
-                  while Tok = TK_COMMA loop
-                     Emit (", "); Next_Token;
-                     Parse_Expression;
-                  end loop;
+                  declare
+                     First : Integer;
+                     Prev : Integer;
+                     Arg : Integer;
+                  begin
+                     First := Parse_Expression_AST;
+                     N_First (N) := First;
+                     Prev := First;
+                     while Tok = TK_COMMA loop
+                        Next_Token;
+                        Arg := Parse_Expression_AST;
+                        N_Next (Prev) := Arg;
+                        Prev := Arg;
+                     end loop;
+                  end;
                end if;
-               Emit (")");
                Expect (TK_RPAREN);
-            else
-               -- Array indexing, possibly chained for 2D
-               Emit_Lower (Saved, Saved_Len);
-               Emit ("[");
-               Next_Token;
-               Parse_Expression;
-               if Sym_Idx > 0 then
-                  Emit (" - ");
-                  Emit_Int (Sym_Arr_Lo (Sym_Idx));
-               else
-                  Emit (" - 1");
-               end if;
-               Emit ("]");
-               Expect (TK_RPAREN);
-               if Tok = TK_LPAREN and Sym_Idx > 0
-                  and then Sym_Arr_Inner_Hi (Sym_Idx) /= 0
-               then
-                  Next_Token;
-                  Emit ("[");
-                  Parse_Expression;
-                  Emit (" - ");
-                  Emit_Int (Sym_Arr_Inner_Lo (Sym_Idx));
-                  Emit ("]");
-                  Expect (TK_RPAREN);
-               end if;
+               return N;
             end if;
+            -- Array indexing, possibly chained for 2D
+            Next_Token;
+            N := New_Node (A_INDEX);
+            N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+            N_Str_Len (N) := Saved_Len;
+            N_Int (N) := Sym_Idx;
+            N_Right (N) := Parse_Expression_AST;
+            Expect (TK_RPAREN);
+            if Tok = TK_LPAREN and then Sym_Idx > 0
+               and then Sym_Arr_Inner_Hi (Sym_Idx) /= 0
+            then
+               Next_Token;
+               N_Kind (N) := A_INDEX2;
+               N_Arg2 (N) := Parse_Expression_AST;
+               Expect (TK_RPAREN);
+            end if;
+            return N;
+         end if;
 
-         elsif Tok = TK_DOT then
+         if Tok = TK_DOT then
             Next_Token;
             declare
                Sub : Tok_Buffer;
@@ -927,115 +1069,341 @@ procedure Adacomp is
                   end loop;
                   Next_Token;
                end loop;
-               if Name_Eq (Sub, Sub_Len, "Argument_Count") then
-                  Emit ("(argc - 1)");
-               elsif Name_Eq (Sub, Sub_Len, "Argument") then
-                  Emit ("argv[");
-                  Expect (TK_LPAREN);
-                  Parse_Expression;
-                  Emit ("]");
-                  Expect (TK_RPAREN);
-               elsif Name_Eq (Sub, Sub_Len, "End_Of_File") then
-                  Emit ("feof(");
-                  Expect (TK_LPAREN);
-                  Parse_Expression;
-                  Emit (")");
-                  Expect (TK_RPAREN);
-               else
-                  Emit_Lower (Saved, Saved_Len);
-                  Emit ("_");
-                  Emit_Lower (Sub, Sub_Len);
-                  if Tok = TK_LPAREN then
-                     Emit ("(");
-                     Next_Token;
-                     if Tok /= TK_RPAREN then
-                        Parse_Expression;
+               N := New_Node (A_DOTTED);
+               N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+               N_Str_Len (N) := Saved_Len;
+               N_Arg2 (N) := Pool_Str (Sub, Sub_Len);
+               N_Int (N) := Sub_Len;
+               if Tok = TK_LPAREN then
+                  Next_Token;
+                  if Tok /= TK_RPAREN then
+                     declare
+                        First : Integer;
+                        Prev : Integer;
+                        Arg : Integer;
+                     begin
+                        First := Parse_Expression_AST;
+                        N_First (N) := First;
+                        Prev := First;
                         while Tok = TK_COMMA loop
-                           Emit (", "); Next_Token;
-                           Parse_Expression;
+                           Next_Token;
+                           Arg := Parse_Expression_AST;
+                           N_Next (Prev) := Arg;
+                           Prev := Arg;
                         end loop;
-                     end if;
-                     Emit (")");
-                     Expect (TK_RPAREN);
+                     end;
                   end if;
+                  Expect (TK_RPAREN);
                end if;
+               return N;
             end;
-         else
-            -- Simple variable, or parameterless function call.
-            Emit_Lower (Saved, Saved_Len);
-            if Sym_Idx > 0 and then Sym_Kind (Sym_Idx) = SK_FUNC then
-               Emit ("()");
-            end if;
          end if;
 
-      else
-         Error ("expected expression");
+         -- Simple variable, or parameterless function call.
+         N := New_Node (A_IDENT);
+         N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+         N_Str_Len (N) := Saved_Len;
+         N_Int (N) := Sym_Idx;
+         return N;
       end if;
-   end Parse_Primary;
+      Error ("expected expression");
+      return 0;
+   end Parse_Primary_AST;
 
-   procedure Parse_Factor is
+   function Parse_Factor_AST return Integer is
+      LHS : Integer;
+      RHS : Integer;
+      N : Integer;
+      Op : Integer;
    begin
-      Parse_Primary;
+      LHS := Parse_Primary_AST;
       while Tok = TK_STAR or Tok = TK_SLASH or Tok = TK_MOD loop
          if Tok = TK_STAR then
-            Emit (" * ");
+            Op := OP_MUL;
          elsif Tok = TK_SLASH then
-            Emit (" / ");
+            Op := OP_DIV;
          else
-            Emit (" % ");
+            Op := OP_MOD;
          end if;
          Next_Token;
-         Parse_Primary;
+         RHS := Parse_Primary_AST;
+         N := New_Node (A_BINARY);
+         N_Op (N) := Op;
+         N_Left (N) := LHS;
+         N_Right (N) := RHS;
+         LHS := N;
       end loop;
-   end Parse_Factor;
+      return LHS;
+   end Parse_Factor_AST;
 
-   procedure Parse_Term is
+   function Parse_Term_AST return Integer is
+      LHS : Integer;
+      RHS : Integer;
+      N : Integer;
+      Op : Integer;
    begin
-      Parse_Factor;
+      LHS := Parse_Factor_AST;
       while Tok = TK_PLUS or Tok = TK_MINUS or Tok = TK_AMP loop
-         if Tok = TK_AMP then
-            Emit (" + ");
-         elsif Tok = TK_PLUS then
-            Emit (" + ");
+         if Tok = TK_PLUS then
+            Op := OP_ADD;
+         elsif Tok = TK_MINUS then
+            Op := OP_SUB;
          else
-            Emit (" - ");
+            Op := OP_ADD;  -- `&` simplified to concatenation-as-add
          end if;
          Next_Token;
-         Parse_Factor;
+         RHS := Parse_Factor_AST;
+         N := New_Node (A_BINARY);
+         N_Op (N) := Op;
+         N_Left (N) := LHS;
+         N_Right (N) := RHS;
+         LHS := N;
       end loop;
-   end Parse_Term;
+      return LHS;
+   end Parse_Term_AST;
 
-   procedure Parse_Comparison is
+   function Parse_Comparison_AST return Integer is
+      LHS : Integer;
+      RHS : Integer;
+      N : Integer;
+      Op : Integer := 0;
    begin
-      Parse_Term;
+      LHS := Parse_Term_AST;
       if Tok = TK_EQ then
-         Emit (" == "); Next_Token; Parse_Term;
+         Op := OP_EQ;
       elsif Tok = TK_NEQ then
-         Emit (" != "); Next_Token; Parse_Term;
+         Op := OP_NEQ;
       elsif Tok = TK_LT then
-         Emit (" < "); Next_Token; Parse_Term;
+         Op := OP_LT;
       elsif Tok = TK_GT then
-         Emit (" > "); Next_Token; Parse_Term;
+         Op := OP_GT;
       elsif Tok = TK_LE then
-         Emit (" <= "); Next_Token; Parse_Term;
+         Op := OP_LE;
       elsif Tok = TK_GE then
-         Emit (" >= "); Next_Token; Parse_Term;
+         Op := OP_GE;
       end if;
-   end Parse_Comparison;
+      if Op /= 0 then
+         Next_Token;
+         RHS := Parse_Term_AST;
+         N := New_Node (A_BINARY);
+         N_Op (N) := Op;
+         N_Left (N) := LHS;
+         N_Right (N) := RHS;
+         return N;
+      end if;
+      return LHS;
+   end Parse_Comparison_AST;
 
-   procedure Parse_Expression is
+   function Parse_Expression_AST return Integer is
+      LHS : Integer;
+      RHS : Integer;
+      N : Integer;
+      Op : Integer;
    begin
-      Parse_Comparison;
+      LHS := Parse_Comparison_AST;
       while Tok = TK_AND or Tok = TK_OR loop
          if Tok = TK_AND then
-            Emit (" && "); Next_Token;
+            Op := OP_AND;
+            Next_Token;
             if Tok = TK_THEN then Next_Token; end if;
          else
-            Emit (" || "); Next_Token;
+            Op := OP_OR;
+            Next_Token;
             if Tok = TK_ELSE then Next_Token; end if;
          end if;
-         Parse_Comparison;
+         RHS := Parse_Comparison_AST;
+         N := New_Node (A_BINARY);
+         N_Op (N) := Op;
+         N_Left (N) := LHS;
+         N_Right (N) := RHS;
+         LHS := N;
       end loop;
+      return LHS;
+   end Parse_Expression_AST;
+
+   -- ---- AST walker ----
+   -- Walks an expression tree and emits the equivalent C. Binary nodes
+   -- get wrapped in `(...)` so source-explicit groupings survive and
+   -- C-precedence ambiguities are impossible.
+
+   procedure Emit_Expression_AST (N : Integer) is
+      Kind : Integer;
+      C : Character;
+      Sym_Idx : Integer;
+      Sub_Off : Integer;
+      Sub_Len : Integer;
+      A : Integer;
+      First : Boolean;
+   begin
+      if N = 0 then return; end if;
+      Kind := N_Kind (N);
+      if Kind = A_INT_LIT then
+         Emit_Int (N_Int (N));
+      elsif Kind = A_CHAR_LIT then
+         C := Character'Val (N_Int (N));
+         Emit ("'");
+         if C = ''' then
+            Emit ("\'");
+         elsif C = '\' then
+            Emit ("\\");
+         else
+            Emit_Ch (C);
+         end if;
+         Emit ("'");
+      elsif Kind = A_STR_LIT then
+         Emit_Ch ('"');
+         for I in 1 .. N_Str_Len (N) loop
+            C := NPool (N_Str_Off (N) + I - 1);
+            if C = '"' then
+               Emit ("\""");
+            elsif C = '\' then
+               Emit ("\\");
+            else
+               Emit_Ch (C);
+            end if;
+         end loop;
+         Emit_Ch ('"');
+      elsif Kind = A_BOOL_LIT then
+         if N_Int (N) = 1 then
+            Emit ("1");
+         else
+            Emit ("0");
+         end if;
+      elsif Kind = A_IDENT then
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Sym_Idx := N_Int (N);
+         if Sym_Idx > 0 and then Sym_Kind (Sym_Idx) = SK_FUNC then
+            Emit ("()");
+         end if;
+      elsif Kind = A_UNARY then
+         if N_Op (N) = OP_NEG then
+            Emit ("-");
+         else
+            Emit ("!");
+         end if;
+         Emit_Expression_AST (N_Left (N));
+      elsif Kind = A_BINARY then
+         Emit ("(");
+         Emit_Expression_AST (N_Left (N));
+         if N_Op (N) = OP_ADD then Emit (" + ");
+         elsif N_Op (N) = OP_SUB then Emit (" - ");
+         elsif N_Op (N) = OP_MUL then Emit (" * ");
+         elsif N_Op (N) = OP_DIV then Emit (" / ");
+         elsif N_Op (N) = OP_MOD then Emit (" % ");
+         elsif N_Op (N) = OP_EQ then Emit (" == ");
+         elsif N_Op (N) = OP_NEQ then Emit (" != ");
+         elsif N_Op (N) = OP_LT then Emit (" < ");
+         elsif N_Op (N) = OP_GT then Emit (" > ");
+         elsif N_Op (N) = OP_LE then Emit (" <= ");
+         elsif N_Op (N) = OP_GE then Emit (" >= ");
+         elsif N_Op (N) = OP_AND then Emit (" && ");
+         elsif N_Op (N) = OP_OR then Emit (" || ");
+         end if;
+         Emit_Expression_AST (N_Right (N));
+         Emit (")");
+      elsif Kind = A_INDEX then
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit ("[");
+         Emit_Expression_AST (N_Right (N));
+         Sym_Idx := N_Int (N);
+         if Sym_Idx > 0 then
+            Emit (" - ");
+            Emit_Int (Sym_Arr_Lo (Sym_Idx));
+         else
+            Emit (" - 1");
+         end if;
+         Emit ("]");
+      elsif Kind = A_INDEX2 then
+         Sym_Idx := N_Int (N);
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit ("[");
+         Emit_Expression_AST (N_Right (N));
+         Emit (" - "); Emit_Int (Sym_Arr_Lo (Sym_Idx));
+         Emit ("][");
+         Emit_Expression_AST (N_Arg2 (N));
+         Emit (" - "); Emit_Int (Sym_Arr_Inner_Lo (Sym_Idx));
+         Emit ("]");
+      elsif Kind = A_CALL then
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit ("(");
+         A := N_First (N);
+         First := True;
+         while A /= 0 loop
+            if not First then Emit (", "); end if;
+            First := False;
+            Emit_Expression_AST (A);
+            A := N_Next (A);
+         end loop;
+         Emit (")");
+      elsif Kind = A_ATTR_TYPE then
+         if N_Op (N) = ATTR_IMAGE then
+            Emit ("int_to_str(");
+            Emit_Expression_AST (N_Left (N));
+            Emit (")");
+         elsif N_Op (N) = ATTR_POS then
+            Emit ("((int)(");
+            Emit_Expression_AST (N_Left (N));
+            Emit ("))");
+         elsif N_Op (N) = ATTR_VAL then
+            Emit ("((char)(");
+            Emit_Expression_AST (N_Left (N));
+            Emit ("))");
+         end if;
+      elsif Kind = A_ATTR_VAR then
+         if N_Op (N) = ATTR_LENGTH or N_Op (N) = ATTR_LAST then
+            Emit ("(int)strlen(");
+            Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            Emit (")");
+         elsif N_Op (N) = ATTR_FIRST then
+            Emit ("1");
+         end if;
+      elsif Kind = A_DOTTED then
+         Sub_Off := N_Arg2 (N);
+         Sub_Len := N_Int (N);
+         if NPool_Eq_CI (Sub_Off, Sub_Len, "Argument_Count") then
+            Emit ("(argc - 1)");
+         elsif NPool_Eq_CI (Sub_Off, Sub_Len, "Argument") then
+            Emit ("argv[");
+            Emit_Expression_AST (N_First (N));
+            Emit ("]");
+         elsif NPool_Eq_CI (Sub_Off, Sub_Len, "End_Of_File") then
+            Emit ("feof(");
+            Emit_Expression_AST (N_First (N));
+            Emit (")");
+         elsif NPool_Eq_CI (Sub_Off, Sub_Len, "Get_Line") then
+            Emit ("ada_get_line(");
+            Emit_Expression_AST (N_First (N));
+            Emit (")");
+         else
+            Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            Emit ("_");
+            Emit_Pool_Lower (Sub_Off, Sub_Len);
+            if N_First (N) /= 0 then
+               Emit ("(");
+               A := N_First (N);
+               First := True;
+               while A /= 0 loop
+                  if not First then Emit (", "); end if;
+                  First := False;
+                  Emit_Expression_AST (A);
+                  A := N_Next (A);
+               end loop;
+               Emit (")");
+            end if;
+         end if;
+      end if;
+   end Emit_Expression_AST;
+
+   -- Public wrapper: build AST, walk it, discard the nodes.
+   -- All external callers in Parse_Statement / Parse_Declarations still
+   -- call Parse_Expression — only the internal recursive structure has
+   -- changed.
+   procedure Parse_Expression is
+      N : Integer;
+   begin
+      N := Parse_Expression_AST;
+      Emit_Expression_AST (N);
+      Reset_AST;
    end Parse_Expression;
 
    procedure Parse_Statement is
