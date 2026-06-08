@@ -477,8 +477,90 @@ static void pop_scope(void) {
     cur_scope--;
 }
 
+/* ---- AST (expressions only, for now) ----
+
+   The parser builds an explicit tree for each top-level expression, then
+   the emitter walks it. Direct emission still drives statements and
+   declarations — Phase 1 introduces the AST incrementally. Index 0 is
+   reserved as "no node"; allocations start at 1. */
+
+#define MAX_NODES   10000
+#define MAX_NPOOL   200000
+
+enum {
+    A_INT_LIT=1, A_CHAR_LIT=2, A_STR_LIT=3, A_BOOL_LIT=4,
+    A_IDENT=5,
+    A_UNARY=6, A_BINARY=7,
+    A_INDEX=8, A_INDEX2=9,
+    A_CALL=10, A_DOTTED=11,
+    A_ATTR_TYPE=12, A_ATTR_VAR=13
+};
+
+enum {
+    OP_ADD=1, OP_SUB=2, OP_MUL=3, OP_DIV=4, OP_MOD=5,
+    OP_EQ=6, OP_NEQ=7, OP_LT=8, OP_GT=9, OP_LE=10, OP_GE=11,
+    OP_AND=12, OP_OR=13,
+    OP_NEG=14, OP_NOT=15
+};
+
+enum {
+    ATTR_IMAGE=1, ATTR_POS=2, ATTR_VAL=3,
+    ATTR_LENGTH=4, ATTR_FIRST=5, ATTR_LAST=6
+};
+
+static int n_kind[MAX_NODES];
+static int n_op[MAX_NODES];
+static int n_int[MAX_NODES];     /* literal value / sym index / sub-name length for DOTTED */
+static int n_str_off[MAX_NODES]; /* name/string pool offset */
+static int n_str_len[MAX_NODES]; /* name/string length */
+static int n_left[MAX_NODES];    /* primary operand: UNARY operand, BINARY lhs, INDEX/INDEX2 base, ATTR arg */
+static int n_right[MAX_NODES];   /* BINARY rhs, INDEX/INDEX2 index expression */
+static int n_arg2[MAX_NODES];    /* INDEX2 second index, DOTTED sub-name offset */
+static int n_first[MAX_NODES];   /* CALL/DOTTED arg list head */
+static int n_next[MAX_NODES];    /* sibling pointer in arg lists */
+static int n_line[MAX_NODES];    /* source line at parse time */
+static int n_count = 1;          /* index 0 reserved; first real allocation at 1 */
+
+static char npool[MAX_NPOOL];
+static int npool_len = 0;
+
+static void reset_ast(void) {
+    n_count = 1;
+    npool_len = 0;
+}
+
+static int new_node(int kind) {
+    if (n_count >= MAX_NODES) error("AST node overflow");
+    int n = n_count++;
+    n_kind[n] = kind;
+    n_op[n] = 0;
+    n_int[n] = 0;
+    n_str_off[n] = 0;
+    n_str_len[n] = 0;
+    n_left[n] = 0;
+    n_right[n] = 0;
+    n_arg2[n] = 0;
+    n_first[n] = 0;
+    n_next[n] = 0;
+    n_line[n] = line_num;
+    return n;
+}
+
+static int pool_str(const char *s, int len) {
+    if (npool_len + len > MAX_NPOOL) error("AST name pool overflow");
+    int off = npool_len;
+    for (int i = 0; i < len; i++) npool[npool_len++] = s[i];
+    return off;
+}
+
 /* ---- Forward declarations ---- */
 static void parse_expression(void);
+static int  parse_expression_ast(void);
+static int  parse_comparison_ast(void);
+static int  parse_term_ast(void);
+static int  parse_factor_ast(void);
+static int  parse_primary_ast(void);
+static void emit_expression_ast(int n);
 static void parse_statements(void);
 static void parse_declarations(void);
 
@@ -529,43 +611,61 @@ static void emit_str_lower(const char *s, int len) {
     for (int i = 0; i < len; i++) fputc(tolower((unsigned char)s[i]), out_file);
 }
 
-static void parse_primary(void) {
+static int parse_primary_ast(void) {
+    int n;
     if (tok == TK_INT_LIT) {
-        emit_tok_val();
+        n = new_node(A_INT_LIT);
+        n_int[n] = tok_int;
         next_token();
-    } else if (tok == TK_CHAR_LIT) {
-        emit("'");
-        if (tok_val[0] == '\'') emit("\\'");
-        else if (tok_val[0] == '\\') emit("\\\\");
-        else emit_char(tok_val[0]);
-        emit("'");
+        return n;
+    }
+    if (tok == TK_CHAR_LIT) {
+        n = new_node(A_CHAR_LIT);
+        n_int[n] = (int)(unsigned char)tok_val[0];
         next_token();
-    } else if (tok == TK_STR_LIT) {
-        emit("\"");
-        for (int i = 0; i < tok_len; i++) {
-            if (tok_val[i] == '"') emit("\\\"");
-            else if (tok_val[i] == '\\') emit("\\\\");
-            else if (tok_val[i] == '\n') emit("\\n");
-            else emit_char(tok_val[i]);
-        }
-        emit("\"");
+        return n;
+    }
+    if (tok == TK_STR_LIT) {
+        n = new_node(A_STR_LIT);
+        n_str_off[n] = pool_str(tok_val, tok_len);
+        n_str_len[n] = tok_len;
         next_token();
-    } else if (tok == TK_TRUE) {
-        emit("1"); next_token();
-    } else if (tok == TK_FALSE) {
-        emit("0"); next_token();
-    } else if (tok == TK_NOT) {
-        emit("!"); next_token();
-        parse_primary();
-    } else if (tok == TK_LPAREN) {
-        emit("("); next_token();
-        parse_expression();
-        emit(")"); expect(TK_RPAREN);
-    } else if (tok == TK_MINUS) {
-        emit("-"); next_token();
-        parse_primary();
-    } else if ((tok == TK_INTEGER || tok == TK_CHARACTER || tok == TK_BOOLEAN)
-               && src_pos < src_len) {
+        return n;
+    }
+    if (tok == TK_TRUE) {
+        n = new_node(A_BOOL_LIT);
+        n_int[n] = 1;
+        next_token();
+        return n;
+    }
+    if (tok == TK_FALSE) {
+        n = new_node(A_BOOL_LIT);
+        n_int[n] = 0;
+        next_token();
+        return n;
+    }
+    if (tok == TK_NOT) {
+        next_token();
+        n = new_node(A_UNARY);
+        n_op[n] = OP_NOT;
+        n_left[n] = parse_primary_ast();
+        return n;
+    }
+    if (tok == TK_MINUS) {
+        next_token();
+        n = new_node(A_UNARY);
+        n_op[n] = OP_NEG;
+        n_left[n] = parse_primary_ast();
+        return n;
+    }
+    if (tok == TK_LPAREN) {
+        /* Parens contribute no node; the inner expression carries through. */
+        next_token();
+        n = parse_expression_ast();
+        expect(TK_RPAREN);
+        return n;
+    }
+    if (tok == TK_INTEGER || tok == TK_CHARACTER || tok == TK_BOOLEAN) {
         /* Type-name attribute: Integer'Image (X), Character'Pos (X), Character'Val (X). */
         next_token();
         if (tok != TK_TICK) error("expected ' after type name");
@@ -574,22 +674,17 @@ static void parse_primary(void) {
         int attr_len = tok_len;
         memcpy(attr, tok_val, tok_len);
         next_token();
-        if (attr_len == 5 && strncasecmp(attr, "Image", 5) == 0) {
-            emit("int_to_str(");
-            expect(TK_LPAREN); parse_expression();
-            emit(")"); expect(TK_RPAREN);
-        } else if (attr_len == 3 && strncasecmp(attr, "Pos", 3) == 0) {
-            emit("((int)(");
-            expect(TK_LPAREN); parse_expression();
-            emit("))"); expect(TK_RPAREN);
-        } else if (attr_len == 3 && strncasecmp(attr, "Val", 3) == 0) {
-            emit("((char)(");
-            expect(TK_LPAREN); parse_expression();
-            emit("))"); expect(TK_RPAREN);
-        } else {
-            error("unsupported type-name attribute");
-        }
-    } else if (tok == TK_IDENT) {
+        n = new_node(A_ATTR_TYPE);
+        if (attr_len == 5 && strncasecmp(attr, "Image", 5) == 0)      n_op[n] = ATTR_IMAGE;
+        else if (attr_len == 3 && strncasecmp(attr, "Pos", 3) == 0)   n_op[n] = ATTR_POS;
+        else if (attr_len == 3 && strncasecmp(attr, "Val", 3) == 0)   n_op[n] = ATTR_VAL;
+        else error("unsupported type-name attribute");
+        expect(TK_LPAREN);
+        n_left[n] = parse_expression_ast();
+        expect(TK_RPAREN);
+        return n;
+    }
+    if (tok == TK_IDENT) {
         char saved[MAX_TOK];
         int saved_len = tok_len;
         memcpy(saved, tok_val, tok_len);
@@ -603,197 +698,341 @@ static void parse_primary(void) {
             int attr_len = tok_len;
             memcpy(attr, tok_val, tok_len);
             next_token();
-            if (attr_len == 6 && strncasecmp(attr, "Length", 6) == 0) {
-                emit("(int)strlen(");
-                emit_str_lower(saved, saved_len);
-                emit(")");
-            } else if (attr_len == 5 && strncasecmp(attr, "First", 5) == 0) {
-                emit("1");
-            } else if (attr_len == 4 && strncasecmp(attr, "Last", 4) == 0) {
-                emit("(int)strlen(");
-                emit_str_lower(saved, saved_len);
-                emit(")");
-            } else {
-                error("unsupported variable attribute");
-            }
-            return;
-        }
-
-        /* Handle __image, __pos, __val attributes (legacy, kept harmless) */
-        if (saved_len == 7 && strncmp(saved, "__image", 7) == 0) {
-            /* Integer'Image(X) -> int_to_str(X) */
-            emit("int_to_str(");
-            expect(TK_LPAREN);
-            parse_expression();
-            emit(")");
-            expect(TK_RPAREN);
-            return;
-        }
-        if (saved_len == 5 && strncmp(saved, "__pos", 5) == 0) {
-            emit("((int)(");
-            expect(TK_LPAREN);
-            parse_expression();
-            emit("))");
-            expect(TK_RPAREN);
-            return;
-        }
-        if (saved_len == 5 && strncmp(saved, "__val", 5) == 0) {
-            emit("((char)(");
-            expect(TK_LPAREN);
-            parse_expression();
-            emit("))");
-            expect(TK_RPAREN);
-            return;
+            n = new_node(A_ATTR_VAR);
+            n_str_off[n] = pool_str(saved, saved_len);
+            n_str_len[n] = saved_len;
+            if (attr_len == 6 && strncasecmp(attr, "Length", 6) == 0)     n_op[n] = ATTR_LENGTH;
+            else if (attr_len == 5 && strncasecmp(attr, "First", 5) == 0) n_op[n] = ATTR_FIRST;
+            else if (attr_len == 4 && strncasecmp(attr, "Last", 4) == 0)  n_op[n] = ATTR_LAST;
+            else error("unsupported variable attribute");
+            return n;
         }
 
         if (tok == TK_LPAREN) {
             if (sidx >= 0 && (sym_kind[sidx]==SK_PROC || sym_kind[sidx]==SK_FUNC)) {
-                /* Function/procedure call */
-                emit_str_lower(saved, saved_len);
-                emit("(");
+                /* Function/procedure call: name(arg, arg, ...) */
                 next_token();
+                n = new_node(A_CALL);
+                n_str_off[n] = pool_str(saved, saved_len);
+                n_str_len[n] = saved_len;
+                n_int[n] = sidx;
                 if (tok != TK_RPAREN) {
-                    parse_expression();
-                    while (tok == TK_COMMA) { emit(", "); next_token(); parse_expression(); }
-                }
-                emit(")");
-                expect(TK_RPAREN);
-            } else {
-                /* Array indexing */
-                emit_str_lower(saved, saved_len);
-                emit("[");
-                next_token();
-                parse_expression();
-                if (sidx >= 0) { emit(" - "); emit_int(sym_arr_lo[sidx]); }
-                else emit(" - 1");
-                emit("]");
-                expect(TK_RPAREN);
-                /* Chained index for 2D arrays: name(i)(j) -> name[i-lo][j-inner_lo] */
-                if (tok == TK_LPAREN && sidx >= 0 && sym_arr_inner_hi[sidx] != 0) {
-                    next_token();
-                    emit("[");
-                    parse_expression();
-                    emit(" - "); emit_int(sym_arr_inner_lo[sidx]);
-                    emit("]");
-                    expect(TK_RPAREN);
-                }
-            }
-        } else if (tok == TK_DOT) {
-            /* Dotted name */
-            next_token();
-            if (tok == TK_IDENT) {
-                char sub[MAX_TOK];
-                int sub_len = tok_len;
-                memcpy(sub, tok_val, tok_len);
-                next_token();
-
-                /* Handle additional dots */
-                while (tok == TK_DOT) {
-                    next_token();
-                    sub_len = tok_len;
-                    memcpy(sub, tok_val, tok_len);
-                    next_token();
-                }
-
-                /* Map known stdlib calls in expression context */
-                if (sub_len == 14 && strncasecmp(sub, "Argument_Count", 14) == 0) {
-                    emit("(argc - 1)");
-                } else if (sub_len == 8 && strncasecmp(sub, "Argument", 8) == 0) {
-                    emit("argv[");
-                    expect(TK_LPAREN);
-                    parse_expression();
-                    emit("]");
-                    expect(TK_RPAREN);
-                } else if (sub_len == 11 && strncasecmp(sub, "End_Of_File", 11) == 0) {
-                    emit("feof(");
-                    expect(TK_LPAREN);
-                    parse_expression();
-                    emit(")");
-                    expect(TK_RPAREN);
-                } else if (sub_len == 8 && strncasecmp(sub, "Get_Line", 8) == 0) {
-                    /* In expression context */
-                    emit("ada_get_line(");
-                    expect(TK_LPAREN);
-                    parse_expression();
-                    emit(")");
-                    expect(TK_RPAREN);
-                } else {
-                    /* Generic: pkg_func */
-                    emit_str_lower(saved, saved_len);
-                    emit("_");
-                    emit_str_lower(sub, sub_len);
-                    if (tok == TK_LPAREN) {
-                        emit("(");
+                    int first = parse_expression_ast();
+                    n_first[n] = first;
+                    int prev = first;
+                    while (tok == TK_COMMA) {
                         next_token();
-                        if (tok != TK_RPAREN) {
-                            parse_expression();
-                            while (tok == TK_COMMA) { emit(", "); next_token(); parse_expression(); }
-                        }
-                        emit(")");
-                        expect(TK_RPAREN);
+                        int arg = parse_expression_ast();
+                        n_next[prev] = arg;
+                        prev = arg;
                     }
                 }
-            } else {
-                emit_str_lower(saved, saved_len);
+                expect(TK_RPAREN);
+                return n;
             }
-        } else {
-            /* Simple variable, or parameterless function call.
-               Ada allows `X := Foo;` where Foo is a 0-arg function;
-               C needs the trailing `()`. */
-            emit_str_lower(saved, saved_len);
-            if (sidx >= 0 && sym_kind[sidx] == SK_FUNC) {
-                emit("()");
+            /* Array indexing. The base name is held in str_off/str_len; the
+               resolved sym index in n_int lets the walker pick up Sym_Arr_Lo
+               and the inner-dim fields without re-looking-up. */
+            next_token();
+            n = new_node(A_INDEX);
+            n_str_off[n] = pool_str(saved, saved_len);
+            n_str_len[n] = saved_len;
+            n_int[n] = sidx;
+            n_right[n] = parse_expression_ast();
+            expect(TK_RPAREN);
+            if (tok == TK_LPAREN && sidx >= 0 && sym_arr_inner_hi[sidx] != 0) {
+                next_token();
+                n_kind[n] = A_INDEX2;
+                n_arg2[n] = parse_expression_ast();
+                expect(TK_RPAREN);
             }
+            return n;
         }
-    } else {
-        error("expected expression");
+
+        if (tok == TK_DOT) {
+            /* Dotted name: Pkg.func or Pkg.Sub.func, possibly with parens. */
+            next_token();
+            char sub[MAX_TOK];
+            int sub_len = tok_len;
+            memcpy(sub, tok_val, tok_len);
+            next_token();
+            while (tok == TK_DOT) {
+                next_token();
+                sub_len = tok_len;
+                memcpy(sub, tok_val, tok_len);
+                next_token();
+            }
+            n = new_node(A_DOTTED);
+            n_str_off[n] = pool_str(saved, saved_len);
+            n_str_len[n] = saved_len;
+            n_arg2[n]    = pool_str(sub, sub_len);
+            n_int[n]     = sub_len;            /* sub-name length */
+            if (tok == TK_LPAREN) {
+                next_token();
+                if (tok != TK_RPAREN) {
+                    int first = parse_expression_ast();
+                    n_first[n] = first;
+                    int prev = first;
+                    while (tok == TK_COMMA) {
+                        next_token();
+                        int arg = parse_expression_ast();
+                        n_next[prev] = arg;
+                        prev = arg;
+                    }
+                }
+                expect(TK_RPAREN);
+            }
+            return n;
+        }
+
+        /* Simple variable, or parameterless function call. */
+        n = new_node(A_IDENT);
+        n_str_off[n] = pool_str(saved, saved_len);
+        n_str_len[n] = saved_len;
+        n_int[n] = sidx;
+        return n;
     }
+    error("expected expression");
+    return 0;
 }
 
-static void parse_factor(void) {
-    parse_primary();
+static int parse_factor_ast(void) {
+    int lhs = parse_primary_ast();
     while (tok == TK_STAR || tok == TK_SLASH || tok == TK_MOD) {
-        if (tok == TK_STAR) emit(" * ");
-        else if (tok == TK_SLASH) emit(" / ");
-        else emit(" % ");
+        int op;
+        if (tok == TK_STAR)       op = OP_MUL;
+        else if (tok == TK_SLASH) op = OP_DIV;
+        else                      op = OP_MOD;
         next_token();
-        parse_primary();
+        int rhs = parse_primary_ast();
+        int n = new_node(A_BINARY);
+        n_op[n] = op;
+        n_left[n] = lhs;
+        n_right[n] = rhs;
+        lhs = n;
     }
+    return lhs;
 }
 
-static void parse_term(void) {
-    parse_factor();
+static int parse_term_ast(void) {
+    int lhs = parse_factor_ast();
     while (tok == TK_PLUS || tok == TK_MINUS || tok == TK_AMP) {
-        if (tok == TK_AMP) emit(" + "); /* simplified concatenation */
-        else if (tok == TK_PLUS) emit(" + ");
-        else emit(" - ");
+        int op;
+        if (tok == TK_PLUS)       op = OP_ADD;
+        else if (tok == TK_MINUS) op = OP_SUB;
+        else                      op = OP_ADD; /* `&` → simplified concat */
         next_token();
-        parse_factor();
+        int rhs = parse_factor_ast();
+        int n = new_node(A_BINARY);
+        n_op[n] = op;
+        n_left[n] = lhs;
+        n_right[n] = rhs;
+        lhs = n;
     }
+    return lhs;
 }
 
-static void parse_comparison(void) {
-    parse_term();
-    if (tok == TK_EQ)      { emit(" == "); next_token(); parse_term(); }
-    else if (tok == TK_NEQ) { emit(" != "); next_token(); parse_term(); }
-    else if (tok == TK_LT)  { emit(" < ");  next_token(); parse_term(); }
-    else if (tok == TK_GT)  { emit(" > ");  next_token(); parse_term(); }
-    else if (tok == TK_LE)  { emit(" <= "); next_token(); parse_term(); }
-    else if (tok == TK_GE)  { emit(" >= "); next_token(); parse_term(); }
+static int parse_comparison_ast(void) {
+    int lhs = parse_term_ast();
+    int op = 0;
+    if      (tok == TK_EQ)  op = OP_EQ;
+    else if (tok == TK_NEQ) op = OP_NEQ;
+    else if (tok == TK_LT)  op = OP_LT;
+    else if (tok == TK_GT)  op = OP_GT;
+    else if (tok == TK_LE)  op = OP_LE;
+    else if (tok == TK_GE)  op = OP_GE;
+    if (op != 0) {
+        next_token();
+        int rhs = parse_term_ast();
+        int n = new_node(A_BINARY);
+        n_op[n] = op;
+        n_left[n] = lhs;
+        n_right[n] = rhs;
+        return n;
+    }
+    return lhs;
 }
 
-static void parse_expression(void) {
-    parse_comparison();
+static int parse_expression_ast(void) {
+    int lhs = parse_comparison_ast();
     while (tok == TK_AND || tok == TK_OR) {
+        int op;
         if (tok == TK_AND) {
-            emit(" && "); next_token();
-            if (tok == TK_THEN) next_token(); /* and then */
+            op = OP_AND;
+            next_token();
+            if (tok == TK_THEN) next_token(); /* `and then` */
         } else {
-            emit(" || "); next_token();
-            if (tok == TK_ELSE) next_token(); /* or else */
+            op = OP_OR;
+            next_token();
+            if (tok == TK_ELSE) next_token(); /* `or else` */
         }
-        parse_comparison();
+        int rhs = parse_comparison_ast();
+        int n = new_node(A_BINARY);
+        n_op[n] = op;
+        n_left[n] = lhs;
+        n_right[n] = rhs;
+        lhs = n;
     }
+    return lhs;
+}
+
+/* Emit a name from the AST string pool in lowercase. */
+static void emit_pool_lower(int off, int len) {
+    for (int i = 0; i < len; i++)
+        fputc(tolower((unsigned char)npool[off + i]), out_file);
+}
+
+static void emit_expression_ast(int n) {
+    if (n == 0) return;
+    int kind = n_kind[n];
+    if (kind == A_INT_LIT) {
+        emit_int(n_int[n]);
+    } else if (kind == A_CHAR_LIT) {
+        char c = (char)n_int[n];
+        emit("'");
+        if (c == '\'') emit("\\'");
+        else if (c == '\\') emit("\\\\");
+        else emit_char(c);
+        emit("'");
+    } else if (kind == A_STR_LIT) {
+        emit("\"");
+        for (int i = 0; i < n_str_len[n]; i++) {
+            char c = npool[n_str_off[n] + i];
+            if (c == '"') emit("\\\"");
+            else if (c == '\\') emit("\\\\");
+            else if (c == '\n') emit("\\n");
+            else emit_char(c);
+        }
+        emit("\"");
+    } else if (kind == A_BOOL_LIT) {
+        emit(n_int[n] ? "1" : "0");
+    } else if (kind == A_IDENT) {
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        int sidx = n_int[n];
+        if (sidx >= 0 && sym_kind[sidx] == SK_FUNC) emit("()");
+    } else if (kind == A_UNARY) {
+        emit(n_op[n] == OP_NEG ? "-" : "!");
+        emit_expression_ast(n_left[n]);
+    } else if (kind == A_BINARY) {
+        /* Wrap binary subtrees in parens so source-explicit groupings
+           survive the AST round-trip and C-precedence ambiguities are
+           impossible. The output is verbose but unambiguously correct. */
+        emit("(");
+        emit_expression_ast(n_left[n]);
+        switch (n_op[n]) {
+        case OP_ADD: emit(" + "); break;
+        case OP_SUB: emit(" - "); break;
+        case OP_MUL: emit(" * "); break;
+        case OP_DIV: emit(" / "); break;
+        case OP_MOD: emit(" % "); break;
+        case OP_EQ:  emit(" == "); break;
+        case OP_NEQ: emit(" != "); break;
+        case OP_LT:  emit(" < ");  break;
+        case OP_GT:  emit(" > ");  break;
+        case OP_LE:  emit(" <= "); break;
+        case OP_GE:  emit(" >= "); break;
+        case OP_AND: emit(" && "); break;
+        case OP_OR:  emit(" || "); break;
+        }
+        emit_expression_ast(n_right[n]);
+        emit(")");
+    } else if (kind == A_INDEX) {
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit("[");
+        emit_expression_ast(n_right[n]);
+        int sidx = n_int[n];
+        if (sidx >= 0) { emit(" - "); emit_int(sym_arr_lo[sidx]); }
+        else emit(" - 1");
+        emit("]");
+    } else if (kind == A_INDEX2) {
+        int sidx = n_int[n];
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit("[");
+        emit_expression_ast(n_right[n]);
+        emit(" - "); emit_int(sym_arr_lo[sidx]);
+        emit("][");
+        emit_expression_ast(n_arg2[n]);
+        emit(" - "); emit_int(sym_arr_inner_lo[sidx]);
+        emit("]");
+    } else if (kind == A_CALL) {
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit("(");
+        int a = n_first[n];
+        int first = 1;
+        while (a != 0) {
+            if (!first) emit(", ");
+            first = 0;
+            emit_expression_ast(a);
+            a = n_next[a];
+        }
+        emit(")");
+    } else if (kind == A_ATTR_TYPE) {
+        if (n_op[n] == ATTR_IMAGE) {
+            emit("int_to_str(");
+            emit_expression_ast(n_left[n]);
+            emit(")");
+        } else if (n_op[n] == ATTR_POS) {
+            emit("((int)(");
+            emit_expression_ast(n_left[n]);
+            emit("))");
+        } else if (n_op[n] == ATTR_VAL) {
+            emit("((char)(");
+            emit_expression_ast(n_left[n]);
+            emit("))");
+        }
+    } else if (kind == A_ATTR_VAR) {
+        if (n_op[n] == ATTR_LENGTH || n_op[n] == ATTR_LAST) {
+            emit("(int)strlen(");
+            emit_pool_lower(n_str_off[n], n_str_len[n]);
+            emit(")");
+        } else if (n_op[n] == ATTR_FIRST) {
+            emit("1");
+        }
+    } else if (kind == A_DOTTED) {
+        int sub_off = n_arg2[n];
+        int sub_len = n_int[n];
+        if (sub_len == 14 && strncasecmp(npool + sub_off, "Argument_Count", 14) == 0) {
+            emit("(argc - 1)");
+        } else if (sub_len == 8 && strncasecmp(npool + sub_off, "Argument", 8) == 0) {
+            emit("argv[");
+            emit_expression_ast(n_first[n]);
+            emit("]");
+        } else if (sub_len == 11 && strncasecmp(npool + sub_off, "End_Of_File", 11) == 0) {
+            emit("feof(");
+            emit_expression_ast(n_first[n]);
+            emit(")");
+        } else if (sub_len == 8 && strncasecmp(npool + sub_off, "Get_Line", 8) == 0) {
+            emit("ada_get_line(");
+            emit_expression_ast(n_first[n]);
+            emit(")");
+        } else {
+            emit_pool_lower(n_str_off[n], n_str_len[n]);
+            emit("_");
+            emit_pool_lower(sub_off, sub_len);
+            if (n_first[n] != 0) {
+                emit("(");
+                int a = n_first[n];
+                int first = 1;
+                while (a != 0) {
+                    if (!first) emit(", ");
+                    first = 0;
+                    emit_expression_ast(a);
+                    a = n_next[a];
+                }
+                emit(")");
+            }
+        }
+    }
+}
+
+/* Public expression-parse wrapper: build AST, emit, discard the nodes.
+   All external callers in parse_statement / parse_declarations still
+   use this entry point — only the internal recursive structure has
+   changed. */
+static void parse_expression(void) {
+    int n = parse_expression_ast();
+    emit_expression_ast(n);
+    reset_ast();
 }
 
 /* ---- Statement parser ---- */
