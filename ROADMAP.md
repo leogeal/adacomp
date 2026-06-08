@@ -252,3 +252,51 @@ checker, three backends, an LSP, and a fuzzer — all walking the same
 data structure.
 
 Every later phase in this document is gated on having one.
+
+## Status
+
+Tactical view of what's done, in progress, and next. Update when
+landing changes; the dated commits in `git log` are the source of
+truth for "when".
+
+### Phase 0 — Today
+
+Done. Self-hosting verified; bootstrap, stage1, and stage2 produce
+identical C output on `make verify`.
+
+### Phase 1 — Foundation
+
+In progress.
+
+- [x] **Step 1.** AST infrastructure and expression-tree parsing in
+  `bootstrap/adacomp.c`. Walker `emit_expression_ast` reproduces the
+  same C output (modulo aggressive parens on binary nodes). Self-
+  hosting still verifies.
+- [ ] **Step 2.** Mirror the AST conversion in `src/adacomp.adb` so
+  the Ada self-host walks the same data structure. *Next concrete
+  commit.*
+- [ ] **Step 3.** Extend the AST to statements (if / while / for /
+  return / exit / assignment / call) in both files.
+- [ ] **Step 4.** Extend the AST to declarations (variable, procedure,
+  function, type) in both files.
+- [ ] Replace fixed-size buffers (source, token, name pool, symbol
+  table) with dynamic growth.
+- [ ] Real diagnostics: source locations on every token, error
+  recovery, multi-error reports.
+- [ ] Test infrastructure: per-feature `.adb` fixtures with expected
+  C output / runtime output / expected diagnostics.
+- [ ] CI: matrix build on every push.
+- [ ] Documented internal IR (one-page schema).
+
+### Phases 2–7
+
+Not started. Touched only when Phase 1 is done.
+
+### Cross-cutting
+
+- [ ] **ACATS** — not yet running. Pick this up at Phase 3 once
+  there's enough language coverage for the runs to be meaningful.
+- [ ] **Fuzzing** — defer until dynamic buffers land (Phase 1); a
+  fuzzer hitting fixed 200KB source buffers learns mostly nothing.
+- [x] **Self-hosting preserved** — currently true at every commit;
+  intent is to keep it that way through Phase 1.
