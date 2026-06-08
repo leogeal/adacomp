@@ -1,0 +1,7 @@
+# Build outputs (bootstrap binary, stage1/stage2 binaries, generated C,
+# sample test binaries, and any intermediate verify_*.c files).
+build/
+
+# Per-user Claude Code permission grants. The shared `settings.json` is
+# committed; `settings.local.json` is machine-specific and should not be.
+.claude/settings.local.json
