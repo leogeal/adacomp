@@ -14,7 +14,18 @@
       "Read(//tmp/**)",
       "Bash(./build/hello)",
       "Bash(./build/factorial)",
-      "Bash(gh auth *)"
+      "Bash(gh auth *)",
+      "Bash(./build/bootstrap src/adacomp.adb /tmp/dbg.c)",
+      "Bash(make stage1 *)",
+      "Bash(grep -E \"void add_sym_named|void emit_lower|int name_eq|return 0;$\" /tmp/dbg.c)",
+      "Bash(make stage2 *)",
+      "Bash(make verify *)",
+      "Bash(make clean *)",
+      "Bash(./build/stage2 test/hello.adb /tmp/hello2.c)",
+      "Bash(/tmp/hello2)",
+      "Bash(./build/stage2 test/factorial.adb /tmp/fact2.c)",
+      "Bash(/tmp/fact2)",
+      "Bash(git add *)"
     ]
   }
 }

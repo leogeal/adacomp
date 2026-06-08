@@ -1,8 +1,10 @@
 -- adacomp.adb - Minimal self-hosting Ada-to-C compiler
 -- Supports the subset of Ada needed to compile itself.
 -- Usage: adacomp <input.adb> <output.c>
--- Features: procedures, functions, if/elsif/else, while/for loops,
---   Integer/Character/Boolean types, 1D arrays, basic I/O, file I/O.
+-- Features: procedures, functions, if/elsif/else, while/for[/reverse] loops,
+--   Integer/Character/Boolean/String types, 1D and nested arrays,
+--   forward declarations, attributes (Image, Pos, Val, Length, First, Last),
+--   basic I/O and file I/O.
 
 with Ada.Text_IO;
 with Ada.Command_Line;
@@ -73,6 +75,11 @@ procedure Adacomp is
    TK_BOOLEAN   : constant Integer := 65;
    TK_TRUE      : constant Integer := 66;
    TK_FALSE     : constant Integer := 67;
+   TK_DECLARE   : constant Integer := 68;
+   TK_RAISE     : constant Integer := 69;
+   TK_STRING    : constant Integer := 70;
+   TK_REVERSE   : constant Integer := 71;
+   TK_TICK      : constant Integer := 72;
 
    -- Current token
    type Tok_Buffer is array (1 .. 4096) of Character;
@@ -94,33 +101,39 @@ procedure Adacomp is
    TY_CHARACTER : constant Integer := 2;
    TY_BOOLEAN   : constant Integer := 3;
    TY_ARRAY     : constant Integer := 4;
+   TY_STRING    : constant Integer := 5;
 
    -- Symbol table (flat arrays)
-   type Name_Store is array (1 .. 2000) of Character;
    type Int_Store is array (1 .. 2000) of Integer;
    -- Symbol names stored as offset+length into a name pool
    type Name_Pool_Buf is array (1 .. 64000) of Character;
-   Name_Pool   : Name_Pool_Buf;
-   Name_Pool_Len : Integer := 0;
-   Sym_Name_Off : Int_Store;
-   Sym_Name_Len : Int_Store;
-   Sym_Kind     : Int_Store;
-   Sym_Type     : Int_Store;
-   Sym_Arr_Lo   : Int_Store;
-   Sym_Arr_Hi   : Int_Store;
-   Sym_Arr_El   : Int_Store;
-   Sym_Count    : Integer := 0;
+   Name_Pool         : Name_Pool_Buf;
+   Name_Pool_Len     : Integer := 0;
+   Sym_Name_Off      : Int_Store;
+   Sym_Name_Len      : Int_Store;
+   Sym_Kind          : Int_Store;
+   Sym_Type          : Int_Store;
+   Sym_Arr_Lo        : Int_Store;
+   Sym_Arr_Hi        : Int_Store;
+   Sym_Arr_El        : Int_Store;
+   Sym_Arr_Inner_Lo  : Int_Store;
+   Sym_Arr_Inner_Hi  : Int_Store;
+   Sym_Count         : Integer := 0;
 
    -- Scope stack
    type Scope_Buf is array (1 .. 64) of Integer;
    Scope_Saved : Scope_Buf;
    Scope_Depth : Integer := 0;
 
-   -- Output: we write to a file using Ada.Text_IO
+   -- Output
    Out_File : Ada.Text_IO.File_Type;
 
    -- Indentation
    Indent_Level : Integer := 0;
+
+   -- True while emitting the outer program's body (so a bare `return;`
+   -- becomes `return 0;` in C's int main).
+   In_Main_Proc : Integer := 0;
 
    -- Helper: lowercase character
    function To_Lower (C : Character) return Character is
@@ -131,25 +144,21 @@ procedure Adacomp is
       return C;
    end To_Lower;
 
-   -- Helper: is alphabetic or underscore
    function Is_Alpha (C : Character) return Boolean is
    begin
       return (C >= 'a' and C <= 'z') or (C >= 'A' and C <= 'Z') or C = '_';
    end Is_Alpha;
 
-   -- Helper: is digit
    function Is_Digit (C : Character) return Boolean is
    begin
       return C >= '0' and C <= '9';
    end Is_Digit;
 
-   -- Helper: is alphanumeric or underscore
    function Is_Alnum (C : Character) return Boolean is
    begin
       return Is_Alpha (C) or Is_Digit (C);
    end Is_Alnum;
 
-   -- Error reporting
    procedure Error (Msg : String) is
    begin
       Ada.Text_IO.Put ("Error at line ");
@@ -159,7 +168,6 @@ procedure Adacomp is
       raise Program_Error;
    end Error;
 
-   -- Read source file into Src buffer (character by character)
    procedure Read_Source (Name : String) is
       F  : Ada.Text_IO.File_Type;
       Ch : Character;
@@ -172,13 +180,11 @@ procedure Adacomp is
          Src (Src_Len) := Ch;
       end loop;
       Ada.Text_IO.Close (F);
-      -- Compensate for possible trailing garbage char from fgetc/feof
       if Src_Len > 0 and then Character'Pos (Src (Src_Len)) > 127 then
          Src_Len := Src_Len - 1;
       end if;
    end Read_Source;
 
-   -- Peek at current source character
    function Peek return Character is
    begin
       if Src_Pos > Src_Len then
@@ -187,7 +193,6 @@ procedure Adacomp is
       return Src (Src_Pos);
    end Peek;
 
-   -- Advance source position
    procedure Advance is
    begin
       if Src_Pos <= Src_Len then
@@ -198,7 +203,6 @@ procedure Adacomp is
       end if;
    end Advance;
 
-   -- Skip whitespace and comments
    procedure Skip_Space is
    begin
       loop
@@ -218,7 +222,6 @@ procedure Adacomp is
       end loop;
    end Skip_Space;
 
-   -- Compare token value (case insensitive)
    function Tok_Eq_CI (S : String) return Boolean is
    begin
       if Tok_Len /= S'Length then
@@ -232,7 +235,6 @@ procedure Adacomp is
       return True;
    end Tok_Eq_CI;
 
-   -- Check if identifier is a keyword
    function Check_Keyword return Integer is
    begin
       if Tok_Eq_CI ("with") then return TK_WITH; end if;
@@ -250,6 +252,7 @@ procedure Adacomp is
       if Tok_Eq_CI ("loop") then return TK_LOOP; end if;
       if Tok_Eq_CI ("for") then return TK_FOR; end if;
       if Tok_Eq_CI ("in") then return TK_IN; end if;
+      if Tok_Eq_CI ("reverse") then return TK_REVERSE; end if;
       if Tok_Eq_CI ("return") then return TK_RETURN; end if;
       if Tok_Eq_CI ("type") then return TK_TYPE; end if;
       if Tok_Eq_CI ("array") then return TK_ARRAY; end if;
@@ -262,30 +265,22 @@ procedure Adacomp is
       if Tok_Eq_CI ("constant") then return TK_CONSTANT; end if;
       if Tok_Eq_CI ("exit") then return TK_EXIT; end if;
       if Tok_Eq_CI ("when") then return TK_WHEN; end if;
+      if Tok_Eq_CI ("declare") then return TK_DECLARE; end if;
+      if Tok_Eq_CI ("raise") then return TK_RAISE; end if;
       if Tok_Eq_CI ("Integer") then return TK_INTEGER; end if;
       if Tok_Eq_CI ("Natural") then return TK_INTEGER; end if;
       if Tok_Eq_CI ("Positive") then return TK_INTEGER; end if;
       if Tok_Eq_CI ("Character") then return TK_CHARACTER; end if;
       if Tok_Eq_CI ("Boolean") then return TK_BOOLEAN; end if;
+      if Tok_Eq_CI ("String") then return TK_STRING; end if;
       if Tok_Eq_CI ("True") then return TK_TRUE; end if;
       if Tok_Eq_CI ("False") then return TK_FALSE; end if;
       return TK_IDENT;
    end Check_Keyword;
 
-   -- Detect attribute tick vs character literal
-   function Is_Attr_Tick return Boolean is
-   begin
-      if Src_Pos + 2 <= Src_Len and then Peek = ''' then
-         if Is_Alpha (Src (Src_Pos + 1)) then
-            if Src (Src_Pos + 2) /= ''' then
-               return True;
-            end if;
-         end if;
-      end if;
-      return False;
-   end Is_Attr_Tick;
-
-   -- Get next token
+   -- Get next token. The apostrophe after an identifier (e.g. `S'Length`,
+   -- `Integer'Image`) is intentionally NOT consumed here — the parser
+   -- receives a TK_TICK next and dispatches based on the prefix.
    procedure Next_Token is
    begin
       Skip_Space;
@@ -305,53 +300,6 @@ procedure Adacomp is
             Advance;
          end loop;
          Tok := Check_Keyword;
-         -- Handle attributes (Type'Attr)
-         if Is_Attr_Tick then
-            Advance;
-            -- Read attribute name
-            Tok_Len := 0;
-            while Src_Pos <= Src_Len and then Is_Alnum (Peek) loop
-               Tok_Len := Tok_Len + 1;
-               Tok_Val (Tok_Len) := Peek;
-               Advance;
-            end loop;
-            if Tok_Eq_CI ("Image") then
-               Tok := TK_IDENT;
-               Tok_Val (1) := '_'; Tok_Val (2) := '_';
-               Tok_Val (3) := 'i'; Tok_Val (4) := 'm';
-               Tok_Val (5) := 'g'; Tok_Len := 5;
-            elsif Tok_Eq_CI ("Pos") then
-               Tok := TK_IDENT;
-               Tok_Val (1) := '_'; Tok_Val (2) := '_';
-               Tok_Val (3) := 'p'; Tok_Val (4) := 'o';
-               Tok_Val (5) := 's'; Tok_Len := 5;
-            elsif Tok_Eq_CI ("Val") then
-               Tok := TK_IDENT;
-               Tok_Val (1) := '_'; Tok_Val (2) := '_';
-               Tok_Val (3) := 'v'; Tok_Val (4) := 'a';
-               Tok_Val (5) := 'l'; Tok_Len := 5;
-            elsif Tok_Eq_CI ("Length") then
-               Tok := TK_IDENT;
-               Tok_Val (1) := '_'; Tok_Val (2) := '_';
-               Tok_Val (3) := 'l'; Tok_Val (4) := 'e';
-               Tok_Val (5) := 'n'; Tok_Len := 5;
-            elsif Tok_Eq_CI ("First") then
-               Tok := TK_IDENT;
-               Tok_Val (1) := '_'; Tok_Val (2) := '_';
-               Tok_Val (3) := 'f'; Tok_Val (4) := 's';
-               Tok_Val (5) := 't'; Tok_Len := 5;
-            elsif Tok_Eq_CI ("Last") then
-               Tok := TK_IDENT;
-               Tok_Val (1) := '_'; Tok_Val (2) := '_';
-               Tok_Val (3) := 'l'; Tok_Val (4) := 's';
-               Tok_Val (5) := 't'; Tok_Len := 5;
-            elsif Tok_Eq_CI ("Range") then
-               Tok := TK_IDENT;
-               Tok_Val (1) := '_'; Tok_Val (2) := '_';
-               Tok_Val (3) := 'r'; Tok_Val (4) := 'n';
-               Tok_Val (5) := 'g'; Tok_Len := 5;
-            end if;
-         end if;
          return;
       end if;
 
@@ -367,22 +315,33 @@ procedure Adacomp is
          return;
       end if;
 
-      -- String literals
+      -- String literals. Ada doubles `"` to embed a literal quote inside a
+      -- string ("" -> "), so each `"` we encounter must be checked against
+      -- its follower before being treated as the closer.
       if Peek = '"' then
          Advance;
-         while Src_Pos <= Src_Len and then Peek /= '"' loop
-            Tok_Len := Tok_Len + 1;
-            Tok_Val (Tok_Len) := Peek;
-            Advance;
+         while Src_Pos <= Src_Len loop
+            if Peek = '"' then
+               if Src_Pos < Src_Len and then Src (Src_Pos + 1) = '"' then
+                  Tok_Len := Tok_Len + 1;
+                  Tok_Val (Tok_Len) := '"';
+                  Advance;
+                  Advance;
+               else
+                  Advance;
+                  exit;
+               end if;
+            else
+               Tok_Len := Tok_Len + 1;
+               Tok_Val (Tok_Len) := Peek;
+               Advance;
+            end if;
          end loop;
-         if Peek = '"' then
-            Advance;
-         end if;
          Tok := TK_STR_LIT;
          return;
       end if;
 
-      -- Character literals
+      -- Character literals: '<c>'
       if Peek = ''' and then Src_Pos + 2 <= Src_Len and then Src (Src_Pos + 2) = ''' then
          Advance;
          Tok_Len := 1;
@@ -438,13 +397,13 @@ procedure Adacomp is
          elsif C = '*' then Tok := TK_STAR;
          elsif C = '=' then Tok := TK_EQ;
          elsif C = '&' then Tok := TK_AMP;
+         elsif C = ''' then Tok := TK_TICK;
          else
             Error ("unexpected character");
          end if;
       end;
    end Next_Token;
 
-   -- Expect a specific token kind
    procedure Expect (Expected : Integer) is
    begin
       if Tok /= Expected then
@@ -453,7 +412,125 @@ procedure Adacomp is
       Next_Token;
    end Expect;
 
-   -- Emit to output file
+   -- Look ahead from the current position to determine whether a top-level
+   -- ',' appears before the matching ')'. Saves/restores all lex state.
+   function Has_Arg_Separator_Ahead return Boolean is
+      Save_Src_Pos : Integer;
+      Save_Line    : Integer;
+      Save_Tok     : Integer;
+      Save_Tok_Len : Integer;
+      Save_Tok_Int : Integer;
+      Save_Tok_Val : Tok_Buffer;
+      Depth        : Integer := 0;
+      Found        : Boolean := False;
+   begin
+      Save_Src_Pos := Src_Pos;
+      Save_Line    := Line_Num;
+      Save_Tok     := Tok;
+      Save_Tok_Len := Tok_Len;
+      Save_Tok_Int := Tok_Int;
+      for I in 1 .. Tok_Len loop
+         Save_Tok_Val (I) := Tok_Val (I);
+      end loop;
+
+      while Tok /= TK_EOF loop
+         if Tok = TK_LPAREN then
+            Depth := Depth + 1;
+         elsif Tok = TK_RPAREN then
+            if Depth = 0 then exit; end if;
+            Depth := Depth - 1;
+         elsif Tok = TK_COMMA and Depth = 0 then
+            Found := True;
+            exit;
+         end if;
+         Next_Token;
+      end loop;
+
+      Src_Pos  := Save_Src_Pos;
+      Line_Num := Save_Line;
+      Tok      := Save_Tok;
+      Tok_Len  := Save_Tok_Len;
+      Tok_Int  := Save_Tok_Int;
+      for I in 1 .. Save_Tok_Len loop
+         Tok_Val (I) := Save_Tok_Val (I);
+      end loop;
+      return Found;
+   end Has_Arg_Separator_Ahead;
+
+   -- Given we're positioned just past `(` of a 2-arg call (and we already
+   -- confirmed a top-level comma is present), look ahead to determine
+   -- whether the second argument is character-typed. Saves/restores state.
+   function Find_Sym (Buf : Tok_Buffer; BLen : Integer) return Integer;
+
+   function Second_Arg_Is_Char return Boolean is
+      Save_Src_Pos : Integer;
+      Save_Line    : Integer;
+      Save_Tok     : Integer;
+      Save_Tok_Len : Integer;
+      Save_Tok_Int : Integer;
+      Save_Tok_Val : Tok_Buffer;
+      Depth        : Integer := 0;
+      Reached      : Boolean := False;
+      Is_Char      : Boolean := False;
+      Idx          : Integer;
+   begin
+      Save_Src_Pos := Src_Pos;
+      Save_Line    := Line_Num;
+      Save_Tok     := Tok;
+      Save_Tok_Len := Tok_Len;
+      Save_Tok_Int := Tok_Int;
+      for I in 1 .. Tok_Len loop
+         Save_Tok_Val (I) := Tok_Val (I);
+      end loop;
+
+      while Tok /= TK_EOF loop
+         if Tok = TK_LPAREN then
+            Depth := Depth + 1;
+            Next_Token;
+         elsif Tok = TK_RPAREN then
+            if Depth = 0 then exit; end if;
+            Depth := Depth - 1;
+            Next_Token;
+         elsif Tok = TK_COMMA and Depth = 0 then
+            Next_Token;
+            Reached := True;
+            exit;
+         else
+            Next_Token;
+         end if;
+      end loop;
+
+      if Reached then
+         if Tok = TK_CHAR_LIT then
+            Is_Char := True;
+         elsif Tok = TK_IDENT then
+            Idx := Find_Sym (Tok_Val, Tok_Len);
+            if Idx > 0 then
+               if Sym_Type (Idx) = TY_CHARACTER then
+                  Is_Char := True;
+               elsif Sym_Type (Idx) = TY_ARRAY
+                     and then Sym_Arr_El (Idx) = TY_CHARACTER then
+                  Next_Token;
+                  if Tok = TK_LPAREN then
+                     Is_Char := True;
+                  end if;
+               end if;
+            end if;
+         end if;
+      end if;
+
+      Src_Pos  := Save_Src_Pos;
+      Line_Num := Save_Line;
+      Tok      := Save_Tok;
+      Tok_Len  := Save_Tok_Len;
+      Tok_Int  := Save_Tok_Int;
+      for I in 1 .. Save_Tok_Len loop
+         Tok_Val (I) := Save_Tok_Val (I);
+      end loop;
+      return Is_Char;
+   end Second_Arg_Is_Char;
+
+   -- Emitter helpers
    procedure Emit (S : String) is
    begin
       Ada.Text_IO.Put (Out_File, S);
@@ -504,7 +581,6 @@ procedure Adacomp is
       end loop;
    end Emit_Int;
 
-   -- Emit token value as-is
    procedure Emit_Tok is
    begin
       for I in 1 .. Tok_Len loop
@@ -512,15 +588,6 @@ procedure Adacomp is
       end loop;
    end Emit_Tok;
 
-   -- Emit token value in lowercase
-   procedure Emit_Tok_Lower is
-   begin
-      for I in 1 .. Tok_Len loop
-         Emit_Ch (To_Lower (Tok_Val (I)));
-      end loop;
-   end Emit_Tok_Lower;
-
-   -- Emit a saved name in lowercase
    procedure Emit_Lower (Buf : Tok_Buffer; Len : Integer) is
    begin
       for I in 1 .. Len loop
@@ -528,7 +595,7 @@ procedure Adacomp is
       end loop;
    end Emit_Lower;
 
-   -- Symbol table: compare name from pool
+   -- Symbol table
    function Pool_Eq (Off : Integer; Len : Integer; Buf : Tok_Buffer; BLen : Integer) return Boolean is
    begin
       if Len /= BLen then
@@ -542,7 +609,6 @@ procedure Adacomp is
       return True;
    end Pool_Eq;
 
-   -- Find symbol by name
    function Find_Sym (Buf : Tok_Buffer; BLen : Integer) return Integer is
    begin
       for I in reverse 1 .. Sym_Count loop
@@ -553,7 +619,6 @@ procedure Adacomp is
       return 0;
    end Find_Sym;
 
-   -- Add symbol with current token as name
    procedure Add_Sym (Kind : Integer; Typ : Integer) is
    begin
       Sym_Count := Sym_Count + 1;
@@ -565,12 +630,18 @@ procedure Adacomp is
       end loop;
       Sym_Kind (Sym_Count) := Kind;
       Sym_Type (Sym_Count) := Typ;
-      Sym_Arr_Lo (Sym_Count) := 0;
+      -- Ada Strings are 1-indexed by default.
+      if Typ = TY_STRING then
+         Sym_Arr_Lo (Sym_Count) := 1;
+      else
+         Sym_Arr_Lo (Sym_Count) := 0;
+      end if;
       Sym_Arr_Hi (Sym_Count) := 0;
       Sym_Arr_El (Sym_Count) := 0;
+      Sym_Arr_Inner_Lo (Sym_Count) := 0;
+      Sym_Arr_Inner_Hi (Sym_Count) := 0;
    end Add_Sym;
 
-   -- Add symbol with explicit name
    procedure Add_Sym_Named (Buf : Tok_Buffer; BLen : Integer; Kind : Integer; Typ : Integer) is
    begin
       Sym_Count := Sym_Count + 1;
@@ -582,9 +653,15 @@ procedure Adacomp is
       end loop;
       Sym_Kind (Sym_Count) := Kind;
       Sym_Type (Sym_Count) := Typ;
-      Sym_Arr_Lo (Sym_Count) := 0;
+      if Typ = TY_STRING then
+         Sym_Arr_Lo (Sym_Count) := 1;
+      else
+         Sym_Arr_Lo (Sym_Count) := 0;
+      end if;
       Sym_Arr_Hi (Sym_Count) := 0;
       Sym_Arr_El (Sym_Count) := 0;
+      Sym_Arr_Inner_Lo (Sym_Count) := 0;
+      Sym_Arr_Inner_Hi (Sym_Count) := 0;
    end Add_Sym_Named;
 
    procedure Push_Scope is
@@ -616,6 +693,9 @@ procedure Adacomp is
       elsif Tok = TK_BOOLEAN then
          Next_Token;
          return TY_BOOLEAN;
+      elsif Tok = TK_STRING then
+         Next_Token;
+         return TY_STRING;
       elsif Tok = TK_IDENT then
          declare
             Idx : Integer;
@@ -628,7 +708,6 @@ procedure Adacomp is
          end;
          return TY_INTEGER;
       else
-         -- Skip dotted type names (Ada.Text_IO.File_Type etc)
          while Tok = TK_DOT loop
             Next_Token;
             if Tok = TK_IDENT or Tok = TK_INTEGER or Tok = TK_CHARACTER then
@@ -639,7 +718,6 @@ procedure Adacomp is
       end if;
    end Parse_Type_Ref;
 
-   -- Emit C type
    procedure Emit_C_Type (Typ : Integer) is
    begin
       if Typ = TY_INTEGER then
@@ -648,12 +726,13 @@ procedure Adacomp is
          Emit ("char");
       elsif Typ = TY_BOOLEAN then
          Emit ("int");
+      elsif Typ = TY_STRING then
+         Emit ("const char *");
       else
          Emit ("int");
       end if;
    end Emit_C_Type;
 
-   -- Compare saved name case-insensitively with string
    function Name_Eq (Buf : Tok_Buffer; BLen : Integer; S : String) return Boolean is
    begin
       if BLen /= S'Length then
@@ -680,9 +759,9 @@ procedure Adacomp is
       elsif Tok = TK_CHAR_LIT then
          Emit ("'");
          if Tok_Val (1) = ''' then
-            Emit ("\\'");
+            Emit ("\'");
          elsif Tok_Val (1) = '\' then
-            Emit ("\\\\");
+            Emit ("\\");
          else
             Emit_Ch (Tok_Val (1));
          end if;
@@ -722,6 +801,37 @@ procedure Adacomp is
          Emit ("-"); Next_Token;
          Parse_Primary;
 
+      elsif Tok = TK_INTEGER or Tok = TK_CHARACTER or Tok = TK_BOOLEAN then
+         -- Type-name attribute: Integer'Image (X), Character'Pos/Val (X)
+         Next_Token;
+         if Tok /= TK_TICK then Error ("expected ' after type name"); end if;
+         Next_Token;
+         declare
+            Attr : Tok_Buffer;
+            Attr_Len : Integer;
+         begin
+            Attr_Len := Tok_Len;
+            for I in 1 .. Tok_Len loop
+               Attr (I) := Tok_Val (I);
+            end loop;
+            Next_Token;
+            if Name_Eq (Attr, Attr_Len, "Image") then
+               Emit ("int_to_str(");
+               Expect (TK_LPAREN); Parse_Expression;
+               Emit (")"); Expect (TK_RPAREN);
+            elsif Name_Eq (Attr, Attr_Len, "Pos") then
+               Emit ("((int)(");
+               Expect (TK_LPAREN); Parse_Expression;
+               Emit ("))"); Expect (TK_RPAREN);
+            elsif Name_Eq (Attr, Attr_Len, "Val") then
+               Emit ("((char)(");
+               Expect (TK_LPAREN); Parse_Expression;
+               Emit ("))"); Expect (TK_RPAREN);
+            else
+               Error ("unsupported type-name attribute");
+            end if;
+         end;
+
       elsif Tok = TK_IDENT then
          Saved_Len := Tok_Len;
          for I in 1 .. Tok_Len loop
@@ -730,27 +840,34 @@ procedure Adacomp is
          Sym_Idx := Find_Sym (Tok_Val, Tok_Len);
          Next_Token;
 
-         -- Handle special attribute tokens
-         if Name_Eq (Saved, Saved_Len, "__img") then
-            Emit ("int_to_str(");
-            Expect (TK_LPAREN);
-            Parse_Expression;
-            Emit (")");
-            Expect (TK_RPAREN);
-         elsif Name_Eq (Saved, Saved_Len, "__pos") then
-            Emit ("((int)(");
-            Expect (TK_LPAREN);
-            Parse_Expression;
-            Emit ("))");
-            Expect (TK_RPAREN);
-         elsif Name_Eq (Saved, Saved_Len, "__val") then
-            Emit ("((char)(");
-            Expect (TK_LPAREN);
-            Parse_Expression;
-            Emit ("))");
-            Expect (TK_RPAREN);
+         if Tok = TK_TICK then
+            -- Variable-prefix attribute: S'Length, S'First, S'Last
+            Next_Token;
+            declare
+               Attr : Tok_Buffer;
+               Attr_Len : Integer;
+            begin
+               Attr_Len := Tok_Len;
+               for I in 1 .. Tok_Len loop
+                  Attr (I) := Tok_Val (I);
+               end loop;
+               Next_Token;
+               if Name_Eq (Attr, Attr_Len, "Length") then
+                  Emit ("(int)strlen(");
+                  Emit_Lower (Saved, Saved_Len);
+                  Emit (")");
+               elsif Name_Eq (Attr, Attr_Len, "First") then
+                  Emit ("1");
+               elsif Name_Eq (Attr, Attr_Len, "Last") then
+                  Emit ("(int)strlen(");
+                  Emit_Lower (Saved, Saved_Len);
+                  Emit (")");
+               else
+                  Error ("unsupported variable attribute");
+               end if;
+            end;
+
          elsif Tok = TK_LPAREN then
-            -- Function call or array index
             if Sym_Idx > 0 and then (Sym_Kind (Sym_Idx) = SK_PROC or Sym_Kind (Sym_Idx) = SK_FUNC) then
                Emit_Lower (Saved, Saved_Len);
                Emit ("(");
@@ -765,6 +882,7 @@ procedure Adacomp is
                Emit (")");
                Expect (TK_RPAREN);
             else
+               -- Array indexing, possibly chained for 2D
                Emit_Lower (Saved, Saved_Len);
                Emit ("[");
                Next_Token;
@@ -777,9 +895,20 @@ procedure Adacomp is
                end if;
                Emit ("]");
                Expect (TK_RPAREN);
+               if Tok = TK_LPAREN and Sym_Idx > 0
+                  and then Sym_Arr_Inner_Hi (Sym_Idx) /= 0
+               then
+                  Next_Token;
+                  Emit ("[");
+                  Parse_Expression;
+                  Emit (" - ");
+                  Emit_Int (Sym_Arr_Inner_Lo (Sym_Idx));
+                  Emit ("]");
+                  Expect (TK_RPAREN);
+               end if;
             end if;
+
          elsif Tok = TK_DOT then
-            -- Dotted name
             Next_Token;
             declare
                Sub : Tok_Buffer;
@@ -798,7 +927,6 @@ procedure Adacomp is
                   end loop;
                   Next_Token;
                end loop;
-               -- Map known stdlib
                if Name_Eq (Sub, Sub_Len, "Argument_Count") then
                   Emit ("(argc - 1)");
                elsif Name_Eq (Sub, Sub_Len, "Argument") then
@@ -833,7 +961,11 @@ procedure Adacomp is
                end if;
             end;
          else
+            -- Simple variable, or parameterless function call.
             Emit_Lower (Saved, Saved_Len);
+            if Sym_Idx > 0 and then Sym_Kind (Sym_Idx) = SK_FUNC then
+               Emit ("()");
+            end if;
          end if;
 
       else
@@ -841,7 +973,6 @@ procedure Adacomp is
       end if;
    end Parse_Primary;
 
-   -- Parse multiplicative
    procedure Parse_Factor is
    begin
       Parse_Primary;
@@ -851,14 +982,13 @@ procedure Adacomp is
          elsif Tok = TK_SLASH then
             Emit (" / ");
          else
-            Emit (" %% ");
+            Emit (" % ");
          end if;
          Next_Token;
          Parse_Primary;
       end loop;
    end Parse_Factor;
 
-   -- Parse additive
    procedure Parse_Term is
    begin
       Parse_Factor;
@@ -875,7 +1005,6 @@ procedure Adacomp is
       end loop;
    end Parse_Term;
 
-   -- Parse comparison
    procedure Parse_Comparison is
    begin
       Parse_Term;
@@ -894,7 +1023,6 @@ procedure Adacomp is
       end if;
    end Parse_Comparison;
 
-   -- Parse full expression
    procedure Parse_Expression is
    begin
       Parse_Comparison;
@@ -910,7 +1038,6 @@ procedure Adacomp is
       end loop;
    end Parse_Expression;
 
-   -- Parse single statement
    procedure Parse_Statement is
       Saved : Tok_Buffer;
       Saved_Len : Integer;
@@ -927,8 +1054,21 @@ procedure Adacomp is
          Next_Token;
          if Tok /= TK_SEMI then
             Emit (" "); Parse_Expression;
+         elsif In_Main_Proc = 1 then
+            Emit (" 0");
          end if;
          Emit_Ln (";"); Expect (TK_SEMI);
+
+      elsif Tok = TK_RAISE then
+         Next_Token;
+         Emit_Indent;
+         Emit ("{ fprintf(stderr, ""Exception raised at line %d\n"", ");
+         Emit_Int (Line_Num);
+         Emit_Ln ("); exit(1); }");
+         while Tok /= TK_SEMI and Tok /= TK_EOF loop
+            Next_Token;
+         end loop;
+         Expect (TK_SEMI);
 
       elsif Tok = TK_EXIT then
          Next_Token;
@@ -993,25 +1133,74 @@ procedure Adacomp is
          end loop;
          Next_Token;
          Expect (TK_IN);
-         Emit_Indent;
-         Emit ("for (int ");
-         Emit_Lower (Saved, Saved_Len);
-         Emit (" = ");
-         Parse_Expression;
-         Expect (TK_DOTDOT);
-         Emit ("; ");
-         Emit_Lower (Saved, Saved_Len);
-         Emit (" <= ");
-         Parse_Expression;
-         Emit ("; ");
-         Emit_Lower (Saved, Saved_Len);
-         Emit_Ln ("++) {");
-         Expect (TK_LOOP);
+         declare
+            Is_Reverse : Boolean := False;
+         begin
+            if Tok = TK_REVERSE then
+               Is_Reverse := True;
+               Next_Token;
+            end if;
+            Emit_Indent;
+            if Is_Reverse then
+               -- Wrap in a block so __lo/__hi temps scope-shadow when nested.
+               Emit ("{ int __lo = ");
+               Parse_Expression;
+               Expect (TK_DOTDOT);
+               Emit ("; int __hi = ");
+               Parse_Expression;
+               Emit ("; for (int ");
+               Emit_Lower (Saved, Saved_Len);
+               Emit (" = __hi; ");
+               Emit_Lower (Saved, Saved_Len);
+               Emit (" >= __lo; ");
+               Emit_Lower (Saved, Saved_Len);
+               Emit_Ln ("--) {");
+            else
+               Emit ("for (int ");
+               Emit_Lower (Saved, Saved_Len);
+               Emit (" = ");
+               Parse_Expression;
+               Expect (TK_DOTDOT);
+               Emit ("; ");
+               Emit_Lower (Saved, Saved_Len);
+               Emit (" <= ");
+               Parse_Expression;
+               Emit ("; ");
+               Emit_Lower (Saved, Saved_Len);
+               Emit_Ln ("++) {");
+            end if;
+            Expect (TK_LOOP);
+            Indent_Level := Indent_Level + 1;
+            Parse_Statements;
+            Indent_Level := Indent_Level - 1;
+            Emit_Indent;
+            if Is_Reverse then
+               Emit_Ln ("} }");
+            else
+               Emit_Ln ("}");
+            end if;
+            Expect (TK_END); Expect (TK_LOOP); Expect (TK_SEMI);
+         end;
+
+      elsif Tok = TK_DECLARE then
+         Next_Token;
+         Emit_Indent; Emit_Ln ("{");
+         Indent_Level := Indent_Level + 1;
+         Parse_Declarations;
+         Expect (TK_BEGIN);
+         Parse_Statements;
+         Indent_Level := Indent_Level - 1;
+         Emit_Indent; Emit_Ln ("}");
+         Expect (TK_END); Expect (TK_SEMI);
+
+      elsif Tok = TK_BEGIN then
+         Next_Token;
+         Emit_Indent; Emit_Ln ("{");
          Indent_Level := Indent_Level + 1;
          Parse_Statements;
          Indent_Level := Indent_Level - 1;
          Emit_Indent; Emit_Ln ("}");
-         Expect (TK_END); Expect (TK_LOOP); Expect (TK_SEMI);
+         Expect (TK_END); Expect (TK_SEMI);
 
       elsif Tok = TK_IDENT then
          Saved_Len := Tok_Len;
@@ -1021,17 +1210,7 @@ procedure Adacomp is
          Sym_Idx := Find_Sym (Tok_Val, Tok_Len);
          Next_Token;
 
-         -- Handle "raise"
-         if Name_Eq (Saved, Saved_Len, "raise") then
-            Emit_Indent;
-            Emit ("{ fprintf(stderr, ""Exception\\n""); exit(1); }");
-            Emit_Ln ("");
-            while Tok /= TK_SEMI and Tok /= TK_EOF loop
-               Next_Token;
-            end loop;
-            Expect (TK_SEMI);
-
-         elsif Tok = TK_ASSIGN then
+         if Tok = TK_ASSIGN then
             Emit_Indent;
             Emit_Lower (Saved, Saved_Len);
             Emit (" = "); Next_Token;
@@ -1053,7 +1232,10 @@ procedure Adacomp is
                end if;
                Emit_Ln (");");
                Expect (TK_RPAREN); Expect (TK_SEMI);
-            elsif Sym_Idx > 0 and then Sym_Type (Sym_Idx) = TY_ARRAY then
+            elsif Sym_Idx > 0
+                  and then (Sym_Kind (Sym_Idx) = SK_VAR or Sym_Kind (Sym_Idx) = SK_PARAM)
+                  and then Sym_Type (Sym_Idx) = TY_ARRAY
+            then
                Emit_Indent;
                Emit_Lower (Saved, Saved_Len);
                Emit ("[");
@@ -1062,12 +1244,21 @@ procedure Adacomp is
                Emit_Int (Sym_Arr_Lo (Sym_Idx));
                Emit ("]");
                Expect (TK_RPAREN);
+               if Tok = TK_LPAREN and Sym_Arr_Inner_Hi (Sym_Idx) /= 0 then
+                  Next_Token;
+                  Emit ("[");
+                  Parse_Expression;
+                  Emit (" - ");
+                  Emit_Int (Sym_Arr_Inner_Lo (Sym_Idx));
+                  Emit ("]");
+                  Expect (TK_RPAREN);
+               end if;
                Expect (TK_ASSIGN);
-               Emit (" = "); Next_Token;
+               Emit (" = ");
                Parse_Expression;
                Emit_Ln (";"); Expect (TK_SEMI);
             else
-               -- Assume procedure/function call
+               -- Treat as call
                Emit_Indent;
                Emit_Lower (Saved, Saved_Len);
                Emit ("(");
@@ -1099,17 +1290,46 @@ procedure Adacomp is
             end loop;
             Emit_Indent;
             if Name_Eq (Sub, Sub_Len, "Put_Line") then
-               Emit ("ada_put_line(");
-               Expect (TK_LPAREN); Parse_Expression;
+               Expect (TK_LPAREN);
+               if Has_Arg_Separator_Ahead then
+                  Emit ("ada_fput_line(");
+                  Parse_Expression;
+                  Expect (TK_COMMA); Emit (", ");
+                  Parse_Expression;
+               else
+                  Emit ("ada_put_line(");
+                  Parse_Expression;
+               end if;
                Emit_Ln (");"); Expect (TK_RPAREN);
             elsif Name_Eq (Sub, Sub_Len, "Put") then
-               Emit ("ada_put_str(");
-               Expect (TK_LPAREN); Parse_Expression;
+               Expect (TK_LPAREN);
+               if Has_Arg_Separator_Ahead then
+                  if Second_Arg_Is_Char then
+                     Emit ("ada_fput_char(");
+                  else
+                     Emit ("ada_fput_str(");
+                  end if;
+                  Parse_Expression;
+                  Expect (TK_COMMA); Emit (", ");
+                  Parse_Expression;
+               else
+                  Emit ("ada_put_str(");
+                  Parse_Expression;
+               end if;
                Emit_Ln (");"); Expect (TK_RPAREN);
             elsif Name_Eq (Sub, Sub_Len, "New_Line") then
-               Emit_Ln ("ada_new_line();");
                if Tok = TK_LPAREN then
-                  Next_Token; Expect (TK_RPAREN);
+                  Expect (TK_LPAREN);
+                  if Tok /= TK_RPAREN then
+                     Emit ("ada_fput_newline(");
+                     Parse_Expression;
+                     Emit_Ln (");");
+                  else
+                     Emit_Ln ("ada_new_line();");
+                  end if;
+                  Expect (TK_RPAREN);
+               else
+                  Emit_Ln ("ada_new_line();");
                end if;
             elsif Name_Eq (Sub, Sub_Len, "Open") then
                Expect (TK_LPAREN);
@@ -1145,6 +1365,15 @@ procedure Adacomp is
                Emit ("ada_get_line(");
                Expect (TK_LPAREN); Parse_Expression;
                Emit_Ln (");"); Expect (TK_RPAREN);
+            elsif Name_Eq (Sub, Sub_Len, "Get") then
+               Expect (TK_LPAREN);
+               Emit ("{int __gc = fgetc(");
+               Parse_Expression;
+               Emit ("); if (__gc != EOF) ");
+               Expect (TK_COMMA);
+               Parse_Expression;
+               Emit_Ln (" = (char)__gc;}");
+               Expect (TK_RPAREN);
             else
                Emit_Lower (Saved, Saved_Len);
                Emit ("_");
@@ -1180,13 +1409,11 @@ procedure Adacomp is
       end if;
    end Parse_Statement;
 
-   -- Parse statement sequence
    procedure Parse_Statements is
    begin
       while Tok /= TK_END and Tok /= TK_ELSIF and
-            Tok /= TK_ELSE and Tok /= TK_EOF
+            Tok /= TK_ELSE and Tok /= TK_EOF and Tok /= TK_WHEN
       loop
-         -- Skip exception handlers
          if Tok = TK_IDENT and then Tok_Eq_CI ("exception") then
             Next_Token;
             while Tok /= TK_END and Tok /= TK_EOF loop
@@ -1198,12 +1425,12 @@ procedure Adacomp is
       end loop;
    end Parse_Statements;
 
-   -- Parse declarations
    procedure Parse_Declarations is
       Var_Name : Tok_Buffer;
       Var_Len  : Integer;
       Typ      : Integer;
       Is_Const : Boolean;
+      Handled  : Boolean;
    begin
       while Tok /= TK_BEGIN and Tok /= TK_EOF loop
          if Tok = TK_TYPE then
@@ -1219,16 +1446,11 @@ procedure Adacomp is
                   Hi : Integer := 0;
                   El : Integer;
                begin
-                  if Tok = TK_INT_LIT then
-                     Lo := Tok_Int;
-                  end if;
+                  if Tok = TK_INT_LIT then Lo := Tok_Int; end if;
                   Next_Token;
                   Expect (TK_DOTDOT);
-                  if Tok = TK_INT_LIT then
-                     Hi := Tok_Int;
-                  end if;
+                  if Tok = TK_INT_LIT then Hi := Tok_Int; end if;
                   Next_Token;
-                  -- Handle 2D arrays: skip extra dimensions
                   if Tok = TK_COMMA then
                      Next_Token;
                      if Tok = TK_INT_LIT then Next_Token; end if;
@@ -1254,6 +1476,7 @@ procedure Adacomp is
             declare
                P_Name : Tok_Buffer;
                P_Len  : Integer;
+               Is_Fwd : Boolean := False;
             begin
                P_Len := Tok_Len;
                for I in 1 .. Tok_Len loop
@@ -1271,6 +1494,7 @@ procedure Adacomp is
                      First : Boolean := True;
                      Parm : Tok_Buffer;
                      Parm_Len : Integer;
+                     Arr_Idx : Integer;
                   begin
                      while Tok /= TK_RPAREN and Tok /= TK_EOF loop
                         if not First then Emit (", "); end if;
@@ -1282,29 +1506,60 @@ procedure Adacomp is
                         Add_Sym (SK_PARAM, TY_INTEGER);
                         Next_Token;
                         Expect (TK_COLON);
-                        Typ := Parse_Type_Ref;
-                        Sym_Type (Sym_Count) := Typ;
-                        Emit_C_Type (Typ);
-                        Emit (" ");
-                        Emit_Lower (Parm, Parm_Len);
+                        Arr_Idx := 0;
+                        if Tok = TK_IDENT then
+                           Arr_Idx := Find_Sym (Tok_Val, Tok_Len);
+                           if Arr_Idx > 0 and then
+                              (Sym_Kind (Arr_Idx) /= SK_TYPE or Sym_Type (Arr_Idx) /= TY_ARRAY)
+                           then
+                              Arr_Idx := 0;
+                           end if;
+                        end if;
+                        if Arr_Idx > 0 then
+                           Sym_Type (Sym_Count) := TY_ARRAY;
+                           Sym_Arr_Lo (Sym_Count) := Sym_Arr_Lo (Arr_Idx);
+                           Sym_Arr_Hi (Sym_Count) := Sym_Arr_Hi (Arr_Idx);
+                           Sym_Arr_El (Sym_Count) := Sym_Arr_El (Arr_Idx);
+                           Emit_C_Type (Sym_Arr_El (Arr_Idx));
+                           Emit (" *");
+                           Emit_Lower (Parm, Parm_Len);
+                           Next_Token;
+                        else
+                           Typ := Parse_Type_Ref;
+                           Sym_Type (Sym_Count) := Typ;
+                           if Typ = TY_STRING then
+                              Sym_Arr_Lo (Sym_Count) := 1;
+                           end if;
+                           Emit_C_Type (Typ);
+                           Emit (" ");
+                           Emit_Lower (Parm, Parm_Len);
+                        end if;
                         if Tok = TK_SEMI then Next_Token; end if;
                      end loop;
                      Expect (TK_RPAREN);
                   end;
                end if;
-               Emit_Ln (") {");
-               Expect (TK_IS);
-               Indent_Level := Indent_Level + 1;
-               Parse_Declarations;
-               Expect (TK_BEGIN);
-               Parse_Statements;
-               Indent_Level := Indent_Level - 1;
-               Emit_Ln ("}");
-               Emit_Ln ("");
-               Expect (TK_END);
-               if Tok = TK_IDENT then Next_Token; end if;
-               Expect (TK_SEMI);
-               Pop_Scope;
+               if Tok = TK_SEMI then
+                  Is_Fwd := True;
+                  Emit_Ln (");");
+                  Next_Token;
+                  Pop_Scope;
+               end if;
+               if not Is_Fwd then
+                  Emit_Ln (") {");
+                  Expect (TK_IS);
+                  Indent_Level := Indent_Level + 1;
+                  Parse_Declarations;
+                  Expect (TK_BEGIN);
+                  Parse_Statements;
+                  Indent_Level := Indent_Level - 1;
+                  Emit_Ln ("}");
+                  Emit_Ln ("");
+                  Expect (TK_END);
+                  if Tok = TK_IDENT then Next_Token; end if;
+                  Expect (TK_SEMI);
+                  Pop_Scope;
+               end if;
             end;
 
          elsif Tok = TK_FUNCTION then
@@ -1316,7 +1571,10 @@ procedure Adacomp is
                P_Names : array (1 .. 20) of Tok_Buffer;
                P_Lens  : array (1 .. 20) of Integer;
                P_Types : array (1 .. 20) of Integer;
+               P_El    : array (1 .. 20) of Integer;
                P_Count : Integer := 0;
+               Is_Fwd  : Boolean := False;
+               Arr_Idx : Integer;
             begin
                F_Len := Tok_Len;
                for I in 1 .. Tok_Len loop
@@ -1336,8 +1594,31 @@ procedure Adacomp is
                      Add_Sym (SK_PARAM, TY_INTEGER);
                      Next_Token;
                      Expect (TK_COLON);
-                     P_Types (P_Count) := Parse_Type_Ref;
-                     Sym_Type (Sym_Count) := P_Types (P_Count);
+                     Arr_Idx := 0;
+                     if Tok = TK_IDENT then
+                        Arr_Idx := Find_Sym (Tok_Val, Tok_Len);
+                        if Arr_Idx > 0 and then
+                           (Sym_Kind (Arr_Idx) /= SK_TYPE or Sym_Type (Arr_Idx) /= TY_ARRAY)
+                        then
+                           Arr_Idx := 0;
+                        end if;
+                     end if;
+                     if Arr_Idx > 0 then
+                        P_Types (P_Count) := TY_ARRAY;
+                        P_El (P_Count) := Sym_Arr_El (Arr_Idx);
+                        Sym_Type (Sym_Count) := TY_ARRAY;
+                        Sym_Arr_Lo (Sym_Count) := Sym_Arr_Lo (Arr_Idx);
+                        Sym_Arr_Hi (Sym_Count) := Sym_Arr_Hi (Arr_Idx);
+                        Sym_Arr_El (Sym_Count) := Sym_Arr_El (Arr_Idx);
+                        Next_Token;
+                     else
+                        P_Types (P_Count) := Parse_Type_Ref;
+                        P_El (P_Count) := 0;
+                        Sym_Type (Sym_Count) := P_Types (P_Count);
+                        if P_Types (P_Count) = TY_STRING then
+                           Sym_Arr_Lo (Sym_Count) := 1;
+                        end if;
+                     end if;
                      if Tok = TK_SEMI then Next_Token; end if;
                   end loop;
                   Expect (TK_RPAREN);
@@ -1350,24 +1631,37 @@ procedure Adacomp is
                Emit ("(");
                for I in 1 .. P_Count loop
                   if I > 1 then Emit (", "); end if;
-                  Emit_C_Type (P_Types (I));
-                  Emit (" ");
+                  if P_Types (I) = TY_ARRAY then
+                     Emit_C_Type (P_El (I));
+                     Emit (" *");
+                  else
+                     Emit_C_Type (P_Types (I));
+                     Emit (" ");
+                  end if;
                   Emit_Lower (P_Names (I), P_Lens (I));
                end loop;
                if P_Count = 0 then Emit ("void"); end if;
-               Emit_Ln (") {");
-               Expect (TK_IS);
-               Indent_Level := Indent_Level + 1;
-               Parse_Declarations;
-               Expect (TK_BEGIN);
-               Parse_Statements;
-               Indent_Level := Indent_Level - 1;
-               Emit_Ln ("}");
-               Emit_Ln ("");
-               Expect (TK_END);
-               if Tok = TK_IDENT then Next_Token; end if;
-               Expect (TK_SEMI);
-               Pop_Scope;
+               if Tok = TK_SEMI then
+                  Is_Fwd := True;
+                  Emit_Ln (");");
+                  Next_Token;
+                  Pop_Scope;
+               end if;
+               if not Is_Fwd then
+                  Emit_Ln (") {");
+                  Expect (TK_IS);
+                  Indent_Level := Indent_Level + 1;
+                  Parse_Declarations;
+                  Expect (TK_BEGIN);
+                  Parse_Statements;
+                  Indent_Level := Indent_Level - 1;
+                  Emit_Ln ("}");
+                  Emit_Ln ("");
+                  Expect (TK_END);
+                  if Tok = TK_IDENT then Next_Token; end if;
+                  Expect (TK_SEMI);
+                  Pop_Scope;
+               end if;
             end;
 
          elsif Tok = TK_IDENT then
@@ -1382,8 +1676,82 @@ procedure Adacomp is
                Is_Const := True;
                Next_Token;
             end if;
-            -- Check for known type
-            if Tok = TK_IDENT then
+            Handled := False;
+
+            -- Anonymous inline array: Name : array (lo..hi) of T;
+            if Tok = TK_ARRAY then
+               Next_Token;
+               Expect (TK_LPAREN);
+               declare
+                  Lo : Integer := 0;
+                  Hi : Integer := 0;
+                  El_Type : Integer := TY_INTEGER;
+                  Inner_Lo : Integer := 0;
+                  Inner_Hi : Integer := 0;
+                  Is_Nested : Boolean := False;
+                  Tidx : Integer;
+               begin
+                  if Tok = TK_INT_LIT then Lo := Tok_Int; end if;
+                  Next_Token;
+                  Expect (TK_DOTDOT);
+                  if Tok = TK_INT_LIT then Hi := Tok_Int; end if;
+                  Next_Token;
+                  Expect (TK_RPAREN);
+                  Expect (TK_OF);
+                  if Tok = TK_IDENT then
+                     Tidx := Find_Sym (Tok_Val, Tok_Len);
+                     if Tidx > 0 and then Sym_Kind (Tidx) = SK_TYPE and then Sym_Type (Tidx) = TY_ARRAY then
+                        Is_Nested := True;
+                        Inner_Lo := Sym_Arr_Lo (Tidx);
+                        Inner_Hi := Sym_Arr_Hi (Tidx);
+                        El_Type := Sym_Arr_El (Tidx);
+                        Next_Token;
+                     else
+                        El_Type := Parse_Type_Ref;
+                     end if;
+                  else
+                     El_Type := Parse_Type_Ref;
+                  end if;
+                  if Is_Const then
+                     Add_Sym_Named (Var_Name, Var_Len, SK_CONST, TY_ARRAY);
+                  else
+                     Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_ARRAY);
+                  end if;
+                  Sym_Arr_Lo (Sym_Count) := Lo;
+                  Sym_Arr_Hi (Sym_Count) := Hi;
+                  Sym_Arr_El (Sym_Count) := El_Type;
+                  if Is_Nested then
+                     Sym_Arr_Inner_Lo (Sym_Count) := Inner_Lo;
+                     Sym_Arr_Inner_Hi (Sym_Count) := Inner_Hi;
+                  end if;
+                  Emit_Indent;
+                  if Is_Const then Emit ("const "); end if;
+                  Emit_C_Type (El_Type);
+                  Emit (" ");
+                  Emit_Lower (Var_Name, Var_Len);
+                  Emit ("[");
+                  Emit_Int (Hi - Lo + 1);
+                  Emit ("]");
+                  if Is_Nested then
+                     Emit ("[");
+                     Emit_Int (Inner_Hi - Inner_Lo + 1);
+                     Emit ("]");
+                  end if;
+                  if Tok = TK_ASSIGN then
+                     Next_Token;
+                     Emit (" = {0}");
+                     while Tok /= TK_SEMI and Tok /= TK_EOF loop
+                        Next_Token;
+                     end loop;
+                  end if;
+                  Emit_Ln (";");
+                  Expect (TK_SEMI);
+                  Handled := True;
+               end;
+            end if;
+
+            -- Named array type variable
+            if not Handled and Tok = TK_IDENT then
                declare
                   Tidx : Integer;
                begin
@@ -1414,14 +1782,19 @@ procedure Adacomp is
                      end if;
                      Emit_Ln (";");
                      Expect (TK_SEMI);
-                     return;
+                     Handled := True;
                   end if;
                end;
             end if;
-            -- Check for dotted type (Ada.Text_IO.File_Type etc)
-            if Tok = TK_IDENT and then Tok_Eq_CI ("String") then
+
+            -- String type variable
+            if not Handled and Tok = TK_STRING then
                Next_Token;
-               Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_INTEGER);
+               if Is_Const then
+                  Add_Sym_Named (Var_Name, Var_Len, SK_CONST, TY_STRING);
+               else
+                  Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_STRING);
+               end if;
                Emit_Indent;
                Emit ("const char *");
                Emit_Lower (Var_Name, Var_Len);
@@ -1433,17 +1806,24 @@ procedure Adacomp is
                end if;
                Emit_Ln (";");
                Expect (TK_SEMI);
-               return;
+               Handled := True;
             end if;
-            -- Handle Ada.XXX.YYY type names
-            if Tok = TK_IDENT then
+
+            -- Dotted type (e.g. Ada.Text_IO.File_Type) or other ident-typed
+            if not Handled and Tok = TK_IDENT then
                declare
                   Is_File_Type : Boolean := False;
+                  First_Ident : Tok_Buffer;
+                  First_Len : Integer;
+                  Tidx : Integer;
+                  Typ2 : Integer := TY_INTEGER;
                begin
-                  -- Peek ahead for dots
-                  Typ := Parse_Type_Ref;
+                  First_Len := Tok_Len;
+                  for I in 1 .. Tok_Len loop
+                     First_Ident (I) := Tok_Val (I);
+                  end loop;
+                  Next_Token;
                   if Tok = TK_DOT then
-                     Is_File_Type := True;
                      while Tok = TK_DOT loop
                         Next_Token;
                         if Tok = TK_IDENT or Tok = TK_INTEGER or Tok = TK_CHARACTER then
@@ -1453,64 +1833,99 @@ procedure Adacomp is
                            Next_Token;
                         end if;
                      end loop;
-                  end if;
-                  if Is_File_Type then
-                     Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_INTEGER);
-                     Emit_Indent;
-                     Emit ("FILE *");
-                     Emit_Lower (Var_Name, Var_Len);
-                     Emit (" = NULL");
-                     Emit_Ln (";");
-                     if Tok = TK_ASSIGN then
-                        Next_Token;
-                        while Tok /= TK_SEMI and Tok /= TK_EOF loop
+                     if Is_File_Type then
+                        if Is_Const then
+                           Add_Sym_Named (Var_Name, Var_Len, SK_CONST, TY_INTEGER);
+                        else
+                           Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_INTEGER);
+                        end if;
+                        Emit_Indent;
+                        Emit ("FILE *");
+                        Emit_Lower (Var_Name, Var_Len);
+                        Emit (" = NULL");
+                        Emit_Ln (";");
+                        if Tok = TK_ASSIGN then
                            Next_Token;
-                        end loop;
+                           while Tok /= TK_SEMI and Tok /= TK_EOF loop
+                              Next_Token;
+                           end loop;
+                        end if;
+                        Expect (TK_SEMI);
+                        Handled := True;
+                     else
+                        -- Non-file dotted type: treat as int
+                        if Is_Const then
+                           Add_Sym_Named (Var_Name, Var_Len, SK_CONST, TY_INTEGER);
+                        else
+                           Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_INTEGER);
+                        end if;
+                        Emit_Indent;
+                        if Is_Const then Emit ("const "); end if;
+                        Emit ("int ");
+                        Emit_Lower (Var_Name, Var_Len);
+                        if Tok = TK_ASSIGN then
+                           Emit (" = "); Next_Token;
+                           Parse_Expression;
+                        else
+                           Emit (" = 0");
+                        end if;
+                        Emit_Ln (";");
+                        Expect (TK_SEMI);
+                        Handled := True;
                      end if;
+                  else
+                     -- Not dotted: First_Ident is the type name
+                     Tidx := Find_Sym (First_Ident, First_Len);
+                     if Tidx > 0 and then Sym_Kind (Tidx) = SK_TYPE then
+                        Typ2 := Sym_Type (Tidx);
+                     end if;
+                     if Is_Const then
+                        Add_Sym_Named (Var_Name, Var_Len, SK_CONST, Typ2);
+                     else
+                        Add_Sym_Named (Var_Name, Var_Len, SK_VAR, Typ2);
+                     end if;
+                     Emit_Indent;
+                     if Is_Const then Emit ("const "); end if;
+                     Emit_C_Type (Typ2);
+                     Emit (" ");
+                     Emit_Lower (Var_Name, Var_Len);
+                     if Tok = TK_ASSIGN then
+                        Emit (" = "); Next_Token;
+                        Parse_Expression;
+                     else
+                        Emit (" = 0");
+                     end if;
+                     Emit_Ln (";");
                      Expect (TK_SEMI);
-                     return;
+                     Handled := True;
                   end if;
-                  -- Regular typed variable
-                  if Is_Const then
-                     Add_Sym_Named (Var_Name, Var_Len, SK_CONST, Typ);
-                  else
-                     Add_Sym_Named (Var_Name, Var_Len, SK_VAR, Typ);
-                  end if;
-                  Emit_Indent;
-                  if Is_Const then Emit ("const "); end if;
-                  Emit_C_Type (Typ);
-                  Emit (" ");
-                  Emit_Lower (Var_Name, Var_Len);
-                  if Tok = TK_ASSIGN then
-                     Emit (" = "); Next_Token;
-                     Parse_Expression;
-                  else
-                     Emit (" = 0");
-                  end if;
-                  Emit_Ln (";");
-                  Expect (TK_SEMI);
-                  return;
                end;
             end if;
-            Typ := Parse_Type_Ref;
-            if Is_Const then
-               Add_Sym_Named (Var_Name, Var_Len, SK_CONST, Typ);
-            else
-               Add_Sym_Named (Var_Name, Var_Len, SK_VAR, Typ);
+
+            -- Generic typed variable (Integer, Character, Boolean, etc.)
+            if not Handled then
+               Typ := Parse_Type_Ref;
+               if Is_Const then
+                  Add_Sym_Named (Var_Name, Var_Len, SK_CONST, Typ);
+               else
+                  Add_Sym_Named (Var_Name, Var_Len, SK_VAR, Typ);
+               end if;
+               Emit_Indent;
+               if Is_Const then Emit ("const "); end if;
+               Emit_C_Type (Typ);
+               Emit (" ");
+               Emit_Lower (Var_Name, Var_Len);
+               if Tok = TK_ASSIGN then
+                  Emit (" = "); Next_Token;
+                  Parse_Expression;
+               elsif Typ = TY_STRING then
+                  Emit (" = """"");
+               else
+                  Emit (" = 0");
+               end if;
+               Emit_Ln (";");
+               Expect (TK_SEMI);
             end if;
-            Emit_Indent;
-            if Is_Const then Emit ("const "); end if;
-            Emit_C_Type (Typ);
-            Emit (" ");
-            Emit_Lower (Var_Name, Var_Len);
-            if Tok = TK_ASSIGN then
-               Emit (" = "); Next_Token;
-               Parse_Expression;
-            else
-               Emit (" = 0");
-            end if;
-            Emit_Ln (";");
-            Expect (TK_SEMI);
 
          else
             return;
@@ -1518,7 +1933,6 @@ procedure Adacomp is
       end loop;
    end Parse_Declarations;
 
-   -- Parse context clauses (with/use)
    procedure Parse_Context is
    begin
       while Tok = TK_WITH or Tok = TK_USE loop
@@ -1530,7 +1944,6 @@ procedure Adacomp is
       end loop;
    end Parse_Context;
 
-   -- Parse main program
    procedure Parse_Program is
    begin
       Parse_Context;
@@ -1556,7 +1969,9 @@ procedure Adacomp is
       Emit_Ln ("int main(int argc, char **argv) {");
       Indent_Level := Indent_Level + 1;
       Expect (TK_BEGIN);
+      In_Main_Proc := 1;
       Parse_Statements;
+      In_Main_Proc := 0;
       Emit_Indent;
       Emit_Ln ("return 0;");
       Indent_Level := Indent_Level - 1;

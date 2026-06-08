@@ -37,7 +37,8 @@ enum {
     TK_NOT=54, TK_AND=55, TK_OR=56, TK_MOD=57, TK_NULL=58,
     TK_CONSTANT=59, TK_EXIT=60, TK_WHEN=61, TK_USE=62,
     TK_INTEGER=63, TK_CHARACTER=64, TK_BOOLEAN=65,
-    TK_TRUE=66, TK_FALSE=67, TK_DECLARE=68, TK_RAISE=69
+    TK_TRUE=66, TK_FALSE=67, TK_DECLARE=68, TK_RAISE=69,
+    TK_STRING=70, TK_REVERSE=71, TK_TICK=72
 };
 
 /* Current token */
@@ -50,7 +51,7 @@ static int tok_int = 0;
 enum { SK_VAR=1, SK_CONST=2, SK_PARAM=3, SK_PROC=4, SK_FUNC=5, SK_TYPE=6 };
 
 /* Type kinds */
-enum { TY_INTEGER=1, TY_CHARACTER=2, TY_BOOLEAN=3, TY_ARRAY=4 };
+enum { TY_INTEGER=1, TY_CHARACTER=2, TY_BOOLEAN=3, TY_ARRAY=4, TY_STRING=5 };
 
 /* Symbol table */
 static char sym_name[MAX_SYMS][MAX_NAME];
@@ -60,6 +61,8 @@ static int sym_type[MAX_SYMS];
 static int sym_arr_lo[MAX_SYMS];
 static int sym_arr_hi[MAX_SYMS];
 static int sym_arr_el[MAX_SYMS];
+static int sym_arr_inner_lo[MAX_SYMS];
+static int sym_arr_inner_hi[MAX_SYMS];
 static int sym_scope[MAX_SYMS];
 static int sym_count = 0;
 static int cur_scope = 0;
@@ -75,6 +78,10 @@ static int indent_level = 0;
 /* Main procedure name */
 static char main_name[MAX_NAME];
 static int main_name_len = 0;
+
+/* True while emitting statements for the outermost program procedure,
+   so a bare Ada `return;` translates to `return 0;` in C's int main. */
+static int in_main_proc = 0;
 
 /* ---- Helpers ---- */
 
@@ -154,6 +161,7 @@ static int check_keyword(void) {
     if (tok_eq_ci("loop")) return TK_LOOP;
     if (tok_eq_ci("for")) return TK_FOR;
     if (tok_eq_ci("in")) return TK_IN;
+    if (tok_eq_ci("reverse")) return TK_REVERSE;
     if (tok_eq_ci("return")) return TK_RETURN;
     if (tok_eq_ci("type")) return TK_TYPE;
     if (tok_eq_ci("array")) return TK_ARRAY;
@@ -180,7 +188,7 @@ static int check_keyword(void) {
     if (tok_eq_ci("raise")) return TK_RAISE;
     if (tok_eq_ci("Natural")) return TK_INTEGER;
     if (tok_eq_ci("Positive")) return TK_INTEGER;
-    if (tok_eq_ci("String")) return TK_INTEGER; /* treat as integer for simplicity */
+    if (tok_eq_ci("String")) return TK_STRING;
     if (tok_eq_ci("Program_Error")) return TK_IDENT;
     return TK_IDENT;
 }
@@ -214,54 +222,9 @@ static void next_token(void) {
         }
         tok_val[tok_len] = 0;
         tok = check_keyword();
-
-        /* Handle attributes: Integer'Image, Character'Pos, etc. */
-        if (is_attribute_tick()) {
-            advance(); /* skip tick */
-            /* Read attribute name */
-            char attr[64];
-            int alen = 0;
-            while (src_pos < src_len && (isalnum((unsigned char)peek()) || peek()=='_')) {
-                attr[alen++] = peek();
-                advance();
-            }
-            attr[alen] = 0;
-            /* Transform: for now, just keep the identifier, the attribute
-               will be handled in code generation */
-            /* Store attribute info in token */
-            if (strcasecmp(attr, "Image") == 0) {
-                /* Integer'Image(X) -> we'll handle in parser */
-                tok = TK_IDENT;
-                strcpy(tok_val, "__image");
-                tok_len = 7;
-            } else if (strcasecmp(attr, "Pos") == 0) {
-                tok = TK_IDENT;
-                strcpy(tok_val, "__pos");
-                tok_len = 5;
-            } else if (strcasecmp(attr, "Val") == 0) {
-                tok = TK_IDENT;
-                strcpy(tok_val, "__val");
-                tok_len = 5;
-            } else if (strcasecmp(attr, "Length") == 0) {
-                tok = TK_IDENT;
-                strcpy(tok_val, "__length");
-                tok_len = 8;
-            } else if (strcasecmp(attr, "First") == 0) {
-                tok = TK_IDENT;
-                strcpy(tok_val, "__first");
-                tok_len = 7;
-            } else if (strcasecmp(attr, "Last") == 0) {
-                tok = TK_IDENT;
-                strcpy(tok_val, "__last");
-                tok_len = 6;
-            } else if (strcasecmp(attr, "Range") == 0) {
-                tok = TK_IDENT;
-                strcpy(tok_val, "__range");
-                tok_len = 7;
-            } else {
-                /* Unknown attribute - keep original ident */
-            }
-        }
+        /* The apostrophe after an identifier (e.g. `S'Length`, `Integer'Image`)
+           is intentionally NOT consumed here — the parser receives a TK_TICK
+           next and dispatches based on the prefix, which we'd otherwise lose. */
         return;
     }
 
@@ -277,20 +240,26 @@ static void next_token(void) {
         return;
     }
 
-    /* String literals */
+    /* String literals. Ada doubles `"` to embed a literal quote inside a
+       string ("" -> "), so each `"` we encounter must be checked against
+       its follower before being treated as the closer. */
     if (peek() == '"') {
         advance();
-        while (src_pos < src_len && peek() != '"') {
-            tok_val[tok_len++] = peek();
-            advance();
-            /* Handle "" escape in Ada strings */
-            if (src_pos < src_len && peek() == '"' && src_pos+1 < src_len && src[src_pos+1] == '"') {
-                tok_val[tok_len++] = '"';
-                advance();
+        while (src_pos < src_len) {
+            if (peek() == '"') {
+                if (src_pos + 1 < src_len && src[src_pos + 1] == '"') {
+                    tok_val[tok_len++] = '"';
+                    advance();
+                    advance();
+                } else {
+                    advance();
+                    break;
+                }
+            } else {
+                tok_val[tok_len++] = peek();
                 advance();
             }
         }
-        if (peek() == '"') advance();
         tok_val[tok_len] = 0;
         tok = TK_STR_LIT;
         return;
@@ -342,6 +311,7 @@ static void next_token(void) {
         case '*': tok=TK_STAR; break;
         case '=': tok=TK_EQ; break;
         case '&': tok=TK_AMP; break;
+        case '\'': tok=TK_TICK; break;
         default:
             error("unexpected character");
         }
@@ -355,6 +325,104 @@ static void expect(int expected) {
         error("unexpected token");
     }
     next_token();
+}
+
+/* Forward decls needed by lookahead helpers below. */
+static int find_sym(const char *n, int nlen);
+
+/* Save and restore full lexer state for lookahead. */
+typedef struct { int src_pos, line, tok, tok_len, tok_int; char tok_val[MAX_TOK]; } LexState;
+static void save_lex(LexState *s) {
+    s->src_pos = src_pos; s->line = line_num;
+    s->tok = tok; s->tok_len = tok_len; s->tok_int = tok_int;
+    memcpy(s->tok_val, tok_val, tok_len);
+    s->tok_val[tok_len] = 0;
+}
+static void restore_lex(const LexState *s) {
+    src_pos = s->src_pos; line_num = s->line;
+    tok = s->tok; tok_len = s->tok_len; tok_int = s->tok_int;
+    memcpy(tok_val, s->tok_val, s->tok_len);
+    tok_val[s->tok_len] = 0;
+}
+
+/* Look ahead from the current position (just past a consumed '(')
+   to determine whether a top-level ',' appears before the matching ')'.
+   Saves and restores all lexer state. */
+static int has_arg_separator_ahead(void) {
+    int save_src_pos = src_pos;
+    int save_line = line_num;
+    int save_tok = tok;
+    int save_tok_len = tok_len;
+    int save_tok_int = tok_int;
+    char save_tok_val[MAX_TOK];
+    memcpy(save_tok_val, tok_val, tok_len);
+    save_tok_val[save_tok_len] = 0;
+
+    int depth = 0;
+    int found = 0;
+    while (tok != TK_EOF) {
+        if (tok == TK_LPAREN) depth++;
+        else if (tok == TK_RPAREN) {
+            if (depth == 0) break;
+            depth--;
+        } else if (tok == TK_COMMA && depth == 0) {
+            found = 1;
+            break;
+        }
+        next_token();
+    }
+
+    src_pos = save_src_pos;
+    line_num = save_line;
+    tok = save_tok;
+    tok_len = save_tok_len;
+    tok_int = save_tok_int;
+    memcpy(tok_val, save_tok_val, save_tok_len);
+    tok_val[save_tok_len] = 0;
+    return found;
+}
+
+/* Given we're positioned just past `(` of a 2-arg call (and we already
+   confirmed a top-level comma is present), look ahead to determine
+   whether the second argument is character-typed. Saves/restores state. */
+static int second_arg_is_char(void) {
+    LexState s;
+    save_lex(&s);
+    int depth = 0;
+    int reached_comma = 0;
+    while (tok != TK_EOF) {
+        if (tok == TK_LPAREN) { depth++; next_token(); continue; }
+        if (tok == TK_RPAREN) {
+            if (depth == 0) break;
+            depth--; next_token(); continue;
+        }
+        if (tok == TK_COMMA && depth == 0) {
+            next_token();
+            reached_comma = 1;
+            break;
+        }
+        next_token();
+    }
+    int is_char = 0;
+    if (reached_comma) {
+        if (tok == TK_CHAR_LIT) {
+            is_char = 1;
+        } else if (tok == TK_IDENT) {
+            int idx = find_sym(tok_val, tok_len);
+            if (idx >= 0) {
+                if (sym_type[idx] == TY_CHARACTER) {
+                    is_char = 1;
+                } else if (sym_type[idx] == TY_ARRAY &&
+                           sym_arr_el[idx] == TY_CHARACTER) {
+                    /* Array of Character indexed: Buf(I) yields a char. */
+                    next_token();
+                    if (tok == TK_LPAREN) is_char = 1;
+                }
+            }
+        }
+    }
+    restore_lex(&s);
+    return is_char;
 }
 
 /* ---- Emitter ---- */
@@ -389,9 +457,12 @@ static void add_sym(int kind, int typ) {
     sym_nlen[sym_count] = tok_len;
     sym_kind[sym_count] = kind;
     sym_type[sym_count] = typ;
-    sym_arr_lo[sym_count] = 0;
+    /* Ada Strings (and String params) are 1-indexed by default. */
+    sym_arr_lo[sym_count] = (typ == TY_STRING) ? 1 : 0;
     sym_arr_hi[sym_count] = 0;
     sym_arr_el[sym_count] = 0;
+    sym_arr_inner_lo[sym_count] = 0;
+    sym_arr_inner_hi[sym_count] = 0;
     sym_scope[sym_count] = cur_scope;
     sym_count++;
 }
@@ -416,6 +487,7 @@ static int parse_type_ref(void) {
     if (tok == TK_INTEGER) { next_token(); return TY_INTEGER; }
     if (tok == TK_CHARACTER) { next_token(); return TY_CHARACTER; }
     if (tok == TK_BOOLEAN) { next_token(); return TY_BOOLEAN; }
+    if (tok == TK_STRING) { next_token(); return TY_STRING; }
     if (tok == TK_IDENT) {
         int idx = find_sym(tok_val, tok_len);
         int is_file_type = 0;
@@ -446,6 +518,7 @@ static void emit_c_type(int typ) {
     case TY_INTEGER:   emit("int"); break;
     case TY_CHARACTER: emit("char"); break;
     case TY_BOOLEAN:   emit("int"); break;
+    case TY_STRING:    emit("const char *"); break;
     default:           emit("int"); break;
     }
 }
@@ -491,6 +564,31 @@ static void parse_primary(void) {
     } else if (tok == TK_MINUS) {
         emit("-"); next_token();
         parse_primary();
+    } else if ((tok == TK_INTEGER || tok == TK_CHARACTER || tok == TK_BOOLEAN)
+               && src_pos < src_len) {
+        /* Type-name attribute: Integer'Image (X), Character'Pos (X), Character'Val (X). */
+        next_token();
+        if (tok != TK_TICK) error("expected ' after type name");
+        next_token();
+        char attr[MAX_NAME];
+        int attr_len = tok_len;
+        memcpy(attr, tok_val, tok_len);
+        next_token();
+        if (attr_len == 5 && strncasecmp(attr, "Image", 5) == 0) {
+            emit("int_to_str(");
+            expect(TK_LPAREN); parse_expression();
+            emit(")"); expect(TK_RPAREN);
+        } else if (attr_len == 3 && strncasecmp(attr, "Pos", 3) == 0) {
+            emit("((int)(");
+            expect(TK_LPAREN); parse_expression();
+            emit("))"); expect(TK_RPAREN);
+        } else if (attr_len == 3 && strncasecmp(attr, "Val", 3) == 0) {
+            emit("((char)(");
+            expect(TK_LPAREN); parse_expression();
+            emit("))"); expect(TK_RPAREN);
+        } else {
+            error("unsupported type-name attribute");
+        }
     } else if (tok == TK_IDENT) {
         char saved[MAX_TOK];
         int saved_len = tok_len;
@@ -498,7 +596,30 @@ static void parse_primary(void) {
         int sidx = find_sym(tok_val, tok_len);
         next_token();
 
-        /* Handle __image, __pos, __val attributes */
+        /* Variable-prefix attribute: S'Length, S'First, S'Last */
+        if (tok == TK_TICK) {
+            next_token();
+            char attr[MAX_NAME];
+            int attr_len = tok_len;
+            memcpy(attr, tok_val, tok_len);
+            next_token();
+            if (attr_len == 6 && strncasecmp(attr, "Length", 6) == 0) {
+                emit("(int)strlen(");
+                emit_str_lower(saved, saved_len);
+                emit(")");
+            } else if (attr_len == 5 && strncasecmp(attr, "First", 5) == 0) {
+                emit("1");
+            } else if (attr_len == 4 && strncasecmp(attr, "Last", 4) == 0) {
+                emit("(int)strlen(");
+                emit_str_lower(saved, saved_len);
+                emit(")");
+            } else {
+                error("unsupported variable attribute");
+            }
+            return;
+        }
+
+        /* Handle __image, __pos, __val attributes (legacy, kept harmless) */
         if (saved_len == 7 && strncmp(saved, "__image", 7) == 0) {
             /* Integer'Image(X) -> int_to_str(X) */
             emit("int_to_str(");
@@ -547,6 +668,15 @@ static void parse_primary(void) {
                 else emit(" - 1");
                 emit("]");
                 expect(TK_RPAREN);
+                /* Chained index for 2D arrays: name(i)(j) -> name[i-lo][j-inner_lo] */
+                if (tok == TK_LPAREN && sidx >= 0 && sym_arr_inner_hi[sidx] != 0) {
+                    next_token();
+                    emit("[");
+                    parse_expression();
+                    emit(" - "); emit_int(sym_arr_inner_lo[sidx]);
+                    emit("]");
+                    expect(TK_RPAREN);
+                }
             }
         } else if (tok == TK_DOT) {
             /* Dotted name */
@@ -607,8 +737,13 @@ static void parse_primary(void) {
                 emit_str_lower(saved, saved_len);
             }
         } else {
-            /* Simple variable */
+            /* Simple variable, or parameterless function call.
+               Ada allows `X := Foo;` where Foo is a 0-arg function;
+               C needs the trailing `()`. */
             emit_str_lower(saved, saved_len);
+            if (sidx >= 0 && sym_kind[sidx] == SK_FUNC) {
+                emit("()");
+            }
         }
     } else {
         error("expected expression");
@@ -620,7 +755,7 @@ static void parse_factor(void) {
     while (tok == TK_STAR || tok == TK_SLASH || tok == TK_MOD) {
         if (tok == TK_STAR) emit(" * ");
         else if (tok == TK_SLASH) emit(" / ");
-        else emit(" %% ");
+        else emit(" % ");
         next_token();
         parse_primary();
     }
@@ -682,6 +817,7 @@ static void parse_statement(void) {
         emit_indent(); emit("return");
         next_token();
         if (tok != TK_SEMI) { emit(" "); parse_expression(); }
+        else if (in_main_proc) { emit(" 0"); }
         emit_line(";"); expect(TK_SEMI);
 
     } else if (tok == TK_RAISE) {
@@ -747,23 +883,44 @@ static void parse_statement(void) {
         next_token();
         expect(TK_IN);
 
+        int is_reverse = 0;
+        if (tok == TK_REVERSE) { is_reverse = 1; next_token(); }
+
         emit_indent();
-        emit("for (int ");
-        emit_str_lower(loop_var, lv_len);
-        emit(" = ");
-        parse_expression();
-        expect(TK_DOTDOT);
-        emit("; ");
-        emit_str_lower(loop_var, lv_len);
-        emit(" <= ");
-        parse_expression();
-        emit("; ");
-        emit_str_lower(loop_var, lv_len);
-        emit_line("++) {");
+        if (is_reverse) {
+            /* Wrap in a block so __lo/__hi temps can scope-shadow when nested. */
+            emit("{ int __lo = ");
+            parse_expression();
+            expect(TK_DOTDOT);
+            emit("; int __hi = ");
+            parse_expression();
+            emit("; for (int ");
+            emit_str_lower(loop_var, lv_len);
+            emit(" = __hi; ");
+            emit_str_lower(loop_var, lv_len);
+            emit(" >= __lo; ");
+            emit_str_lower(loop_var, lv_len);
+            emit_line("--) {");
+        } else {
+            emit("for (int ");
+            emit_str_lower(loop_var, lv_len);
+            emit(" = ");
+            parse_expression();
+            expect(TK_DOTDOT);
+            emit("; ");
+            emit_str_lower(loop_var, lv_len);
+            emit(" <= ");
+            parse_expression();
+            emit("; ");
+            emit_str_lower(loop_var, lv_len);
+            emit_line("++) {");
+        }
 
         expect(TK_LOOP);
         indent_level++; parse_statements(); indent_level--;
-        emit_indent(); emit_line("}");
+        emit_indent();
+        if (is_reverse) emit_line("} }");
+        else emit_line("}");
         expect(TK_END); expect(TK_LOOP); expect(TK_SEMI);
 
     } else if (tok == TK_DECLARE) {
@@ -832,6 +989,15 @@ static void parse_statement(void) {
                     else emit(" - 1");
                     emit("]");
                     expect(TK_RPAREN);
+                    /* Chained second index for 2D arrays */
+                    if (tok == TK_LPAREN && sym_arr_inner_hi[sidx] != 0) {
+                        next_token();
+                        emit("[");
+                        parse_expression();
+                        emit(" - "); emit_int(sym_arr_inner_lo[sidx]);
+                        emit("]");
+                        expect(TK_RPAREN);
+                    }
                     expect(TK_ASSIGN);
                     emit(" = ");
                     parse_expression();
@@ -867,24 +1033,29 @@ static void parse_statement(void) {
 
             if (name_eq_ci(sub, sub_len, "Put_Line")) {
                 expect(TK_LPAREN);
-                emit("ada_fput_line(");
-                parse_expression();
-                if (tok == TK_COMMA) {
-                    emit(", "); next_token();
+                if (has_arg_separator_ahead()) {
+                    emit("ada_fput_line(");
+                    parse_expression();
+                    expect(TK_COMMA); emit(", ");
                     parse_expression();
                 } else {
-                    /* Single arg: prepend stdout */
-                    /* Re-emit as ada_put_line */
-                    /* Actually: emit was already started. Let's use a
-                       different strategy: always use fput with stdout default */
+                    emit("ada_put_line(");
+                    parse_expression();
                 }
                 emit_line(");"); expect(TK_RPAREN);
             } else if (name_eq_ci(sub, sub_len, "Put")) {
                 expect(TK_LPAREN);
-                emit("ada_fput_str(");
-                parse_expression();
-                if (tok == TK_COMMA) {
-                    emit(", "); next_token();
+                if (has_arg_separator_ahead()) {
+                    if (second_arg_is_char()) {
+                        emit("ada_fput_char(");
+                    } else {
+                        emit("ada_fput_str(");
+                    }
+                    parse_expression();
+                    expect(TK_COMMA); emit(", ");
+                    parse_expression();
+                } else {
+                    emit("ada_put_str(");
                     parse_expression();
                 }
                 emit_line(");"); expect(TK_RPAREN);
@@ -1083,14 +1254,42 @@ static void parse_declarations(void) {
                     add_sym(SK_PARAM, TY_INTEGER);
                     next_token();
                     expect(TK_COLON);
-                    int typ = parse_type_ref();
-                    sym_type[sym_count-1] = typ;
-                    emit_c_type(typ);
-                    emit(" ");
-                    emit_str_lower(pn, pnl);
+                    /* Named array type as parameter: decays to pointer */
+                    int arr_idx = -1;
+                    if (tok == TK_IDENT) {
+                        int ti = find_sym(tok_val, tok_len);
+                        if (ti >= 0 && sym_kind[ti] == SK_TYPE && sym_type[ti] == TY_ARRAY) {
+                            arr_idx = ti;
+                        }
+                    }
+                    if (arr_idx >= 0) {
+                        sym_type[sym_count-1] = TY_ARRAY;
+                        sym_arr_lo[sym_count-1] = sym_arr_lo[arr_idx];
+                        sym_arr_hi[sym_count-1] = sym_arr_hi[arr_idx];
+                        sym_arr_el[sym_count-1] = sym_arr_el[arr_idx];
+                        emit_c_type(sym_arr_el[arr_idx]);
+                        emit(" *");
+                        emit_str_lower(pn, pnl);
+                        next_token();
+                    } else {
+                        int typ = parse_type_ref();
+                        sym_type[sym_count-1] = typ;
+                        if (typ == TY_STRING) sym_arr_lo[sym_count-1] = 1;
+                        emit_c_type(typ);
+                        emit(" ");
+                        emit_str_lower(pn, pnl);
+                    }
                     if (tok == TK_SEMI) next_token();
                 }
                 expect(TK_RPAREN);
+            }
+
+            /* Forward declaration: `procedure Name (...);` with no body */
+            if (tok == TK_SEMI) {
+                emit_line(");");
+                next_token();
+                pop_scope();
+                continue;
             }
 
             emit_line(") {");
@@ -1121,6 +1320,7 @@ static void parse_declarations(void) {
             char pnames[20][MAX_NAME];
             int plens[20];
             int ptypes[20];
+            int pel_type[20];   /* element type when ptypes[i]==TY_ARRAY, else 0 */
             int pcount = 0;
 
             if (tok == TK_LPAREN) {
@@ -1131,8 +1331,28 @@ static void parse_declarations(void) {
                     add_sym(SK_PARAM, TY_INTEGER);
                     next_token();
                     expect(TK_COLON);
-                    ptypes[pcount] = parse_type_ref();
-                    sym_type[sym_count-1] = ptypes[pcount];
+                    /* Named array type: pointer-decay parameter */
+                    int arr_idx = -1;
+                    if (tok == TK_IDENT) {
+                        int ti = find_sym(tok_val, tok_len);
+                        if (ti >= 0 && sym_kind[ti] == SK_TYPE && sym_type[ti] == TY_ARRAY) {
+                            arr_idx = ti;
+                        }
+                    }
+                    if (arr_idx >= 0) {
+                        ptypes[pcount] = TY_ARRAY;
+                        pel_type[pcount] = sym_arr_el[arr_idx];
+                        sym_type[sym_count-1] = TY_ARRAY;
+                        sym_arr_lo[sym_count-1] = sym_arr_lo[arr_idx];
+                        sym_arr_hi[sym_count-1] = sym_arr_hi[arr_idx];
+                        sym_arr_el[sym_count-1] = sym_arr_el[arr_idx];
+                        next_token();
+                    } else {
+                        ptypes[pcount] = parse_type_ref();
+                        pel_type[pcount] = 0;
+                        sym_type[sym_count-1] = ptypes[pcount];
+                        if (ptypes[pcount] == TY_STRING) sym_arr_lo[sym_count-1] = 1;
+                    }
                     pcount++;
                     if (tok == TK_SEMI) next_token();
                 }
@@ -1148,11 +1368,25 @@ static void parse_declarations(void) {
             emit("(");
             for (int i = 0; i < pcount; i++) {
                 if (i > 0) emit(", ");
-                emit_c_type(ptypes[i]);
-                emit(" ");
+                if (ptypes[i] == TY_ARRAY) {
+                    emit_c_type(pel_type[i]);
+                    emit(" *");
+                } else {
+                    emit_c_type(ptypes[i]);
+                    emit(" ");
+                }
                 emit_str_lower(pnames[i], plens[i]);
             }
             if (pcount == 0) emit("void");
+
+            /* Forward declaration: `function F (...) return T;` with no body */
+            if (tok == TK_SEMI) {
+                emit_line(");");
+                next_token();
+                pop_scope();
+                continue;
+            }
+
             emit_line(") {");
 
             expect(TK_IS);
@@ -1181,6 +1415,71 @@ static void parse_declarations(void) {
 
             int is_const = 0;
             if (tok == TK_CONSTANT) { is_const = 1; next_token(); }
+
+            /* Anonymous inline array: Name : array (lo .. hi) of T; */
+            if (tok == TK_ARRAY) {
+                next_token();
+                expect(TK_LPAREN);
+                int lo = tok_int; next_token();
+                expect(TK_DOTDOT);
+                int hi = tok_int; next_token();
+                expect(TK_RPAREN);
+                expect(TK_OF);
+
+                /* Element type may itself be a named array type */
+                int el_type = TY_INTEGER;
+                int inner_lo = 0, inner_hi = 0, inner_el = TY_INTEGER;
+                int is_nested = 0;
+                if (tok == TK_IDENT) {
+                    int tidx = find_sym(tok_val, tok_len);
+                    if (tidx >= 0 && sym_kind[tidx] == SK_TYPE && sym_type[tidx] == TY_ARRAY) {
+                        is_nested = 1;
+                        inner_lo = sym_arr_lo[tidx];
+                        inner_hi = sym_arr_hi[tidx];
+                        inner_el = sym_arr_el[tidx];
+                        el_type = inner_el;
+                        next_token();
+                    } else {
+                        el_type = parse_type_ref();
+                    }
+                } else {
+                    el_type = parse_type_ref();
+                }
+
+                if (is_const) add_sym(SK_CONST, TY_ARRAY);
+                else add_sym(SK_VAR, TY_ARRAY);
+                sym_arr_lo[sym_count-1] = lo;
+                sym_arr_hi[sym_count-1] = hi;
+                sym_arr_el[sym_count-1] = el_type;
+                if (is_nested) {
+                    sym_arr_inner_lo[sym_count-1] = inner_lo;
+                    sym_arr_inner_hi[sym_count-1] = inner_hi;
+                }
+                memcpy(sym_name[sym_count-1], vname, vlen);
+                sym_nlen[sym_count-1] = vlen;
+
+                emit_indent();
+                if (is_const) emit("const ");
+                emit_c_type(el_type);
+                emit(" ");
+                emit_str_lower(vname, vlen);
+                emit("[");
+                emit_int(hi - lo + 1);
+                emit("]");
+                if (is_nested) {
+                    emit("[");
+                    emit_int(inner_hi - inner_lo + 1);
+                    emit("]");
+                }
+                if (tok == TK_ASSIGN) {
+                    next_token();
+                    emit(" = {0}");
+                    while (tok != TK_SEMI && tok != TK_EOF) next_token();
+                }
+                emit_line(";");
+                expect(TK_SEMI);
+                continue;
+            }
 
             /* Check for array type */
             if (tok == TK_IDENT) {
@@ -1217,10 +1516,10 @@ static void parse_declarations(void) {
             }
 
             /* Check for String type with constraint */
-            if (tok == TK_IDENT && tok_eq_ci("String")) {
+            if (tok == TK_STRING) {
                 next_token();
-                if (is_const) add_sym(SK_CONST, TY_ARRAY);
-                else add_sym(SK_VAR, TY_ARRAY);
+                if (is_const) add_sym(SK_CONST, TY_STRING);
+                else add_sym(SK_VAR, TY_STRING);
                 memcpy(sym_name[sym_count-1], vname, vlen);
                 sym_nlen[sym_count-1] = vlen;
 
@@ -1349,6 +1648,8 @@ static void parse_declarations(void) {
             if (tok == TK_ASSIGN) {
                 emit(" = "); next_token();
                 parse_expression();
+            } else if (typ == TY_STRING) {
+                emit(" = \"\"");
             } else {
                 emit(" = 0");
             }
@@ -1403,7 +1704,9 @@ static void parse_program(void) {
     indent_level++;
 
     expect(TK_BEGIN);
+    in_main_proc = 1;
     parse_statements();
+    in_main_proc = 0;
 
     emit_indent(); emit_line("return 0;");
     indent_level--;
