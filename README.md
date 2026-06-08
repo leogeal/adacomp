@@ -109,3 +109,8 @@ hand.
   symbols). Self-compilation fits comfortably; larger inputs may not.
 - The emitted C is not pretty, but it is compiled with `-O2 -Wall` and
   is warning-clean for the self-hosting input.
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for a phased plan to grow this into a
+fully functional Ada compiler with multi-architecture support.
