@@ -279,11 +279,22 @@ In progress.
   external callers still use the public `Parse_Expression`, which is
   a build / emit / reset wrapper. Self-hosting verifies — stage1 and
   stage2 produce identical output.
-- [ ] **Step 3.** Extend the AST to statements (if / while / for /
-  return / exit / assignment / call) in both files. *Next concrete
-  commit.*
+- [x] **Step 3 (partial).** Leaf statements — null, return, raise,
+  exit, assignment, call, parameterless call, array assignment —
+  become AST nodes (`S_NULL` … `S_ARRAY_ASSIGN`) in both files. The
+  public `Parse_Statement` is now a build / walk / reset wrapper,
+  and `Parse_Statement_AST` returns the node id (or 0 for compound
+  and dotted paths, which still emit directly). Each statement is
+  processed independently so per-statement order is preserved.
+  Compound statements (`if`/`while`/`for`/`loop`/`declare`/`begin`)
+  and dotted package calls (`Ada.Text_IO.Put_Line`, …) are *not yet*
+  AST nodes — they couple to declarations (`declare` blocks embed
+  decls that direct-emit during parse) and will be reworked alongside
+  step 4. Self-hosting still verifies.
 - [ ] **Step 4.** Extend the AST to declarations (variable, procedure,
-  function, type) in both files.
+  function, type) in both files, then circle back to convert
+  compound and dotted statements into full AST nodes so the whole
+  compiler walks one tree. *Next concrete commit.*
 - [ ] Replace fixed-size buffers (source, token, name pool, symbol
   table) with dynamic growth.
 - [ ] Real diagnostics: source locations on every token, error

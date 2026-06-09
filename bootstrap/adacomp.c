@@ -493,7 +493,12 @@ enum {
     A_UNARY=6, A_BINARY=7,
     A_INDEX=8, A_INDEX2=9,
     A_CALL=10, A_DOTTED=11,
-    A_ATTR_TYPE=12, A_ATTR_VAR=13
+    A_ATTR_TYPE=12, A_ATTR_VAR=13,
+    /* Statement leaf nodes. Compound (if/while/for/loop/declare/begin) and
+       dotted-package statements still emit directly; they'll become full
+       AST nodes once declarations are AST-driven (step 4). */
+    S_NULL=20, S_RETURN=21, S_RAISE=22, S_EXIT=23,
+    S_ASSIGN=24, S_CALL=25, S_PARAMLESS=26, S_ARRAY_ASSIGN=27
 };
 
 enum {
@@ -561,6 +566,9 @@ static int  parse_term_ast(void);
 static int  parse_factor_ast(void);
 static int  parse_primary_ast(void);
 static void emit_expression_ast(int n);
+static void parse_statement(void);
+static int  parse_statement_ast(void);
+static void emit_statement_ast(int n);
 static void parse_statements(void);
 static void parse_declarations(void);
 
@@ -1047,40 +1055,122 @@ static int name_eq_ci(const char *name, int nlen, const char *s) {
     return 1;
 }
 
-static void parse_statement(void) {
-    if (tok == TK_NULL) {
+/* ---- Statement AST walker (leaf statements only) ----
+   Compound statements (IF/WHILE/LOOP/FOR/DECLARE/BEGIN) and dotted
+   package calls direct-emit during parse and return a 0 node; the
+   wrapper just skips emit for those. */
+static void emit_statement_ast(int n) {
+    if (n == 0) return;
+    int kind = n_kind[n];
+    if (kind == S_NULL) {
         emit_indent(); emit_line("/* null */;");
-        next_token(); expect(TK_SEMI);
-
-    } else if (tok == TK_RETURN) {
+    } else if (kind == S_RETURN) {
         emit_indent(); emit("return");
-        next_token();
-        if (tok != TK_SEMI) { emit(" "); parse_expression(); }
-        else if (in_main_proc) { emit(" 0"); }
-        emit_line(";"); expect(TK_SEMI);
-
-    } else if (tok == TK_RAISE) {
-        /* raise X; -> error and exit */
-        next_token();
+        if (n_left[n] != 0) {
+            emit(" ");
+            emit_expression_ast(n_left[n]);
+        } else if (n_op[n] == 1) {
+            emit(" 0");
+        }
+        emit_line(";");
+    } else if (kind == S_RAISE) {
         emit_indent();
         emit("{ fprintf(stderr, \"Exception raised at line %d\\n\", ");
-        emit_int(line_num);
+        emit_int(n_int[n]);
         emit_line("); exit(1); }");
-        while (tok != TK_SEMI && tok != TK_EOF) next_token();
-        expect(TK_SEMI);
-
-    } else if (tok == TK_EXIT) {
-        next_token();
-        if (tok == TK_WHEN) {
+    } else if (kind == S_EXIT) {
+        if (n_left[n] != 0) {
             emit_indent(); emit("if (");
-            next_token(); parse_expression();
+            emit_expression_ast(n_left[n]);
             emit_line(") break;");
         } else {
             emit_indent(); emit_line("break;");
         }
-        expect(TK_SEMI);
+    } else if (kind == S_ASSIGN) {
+        emit_indent();
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit(" = ");
+        emit_expression_ast(n_right[n]);
+        emit_line(";");
+    } else if (kind == S_CALL) {
+        emit_indent();
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit("(");
+        int a = n_first[n];
+        int first = 1;
+        while (a != 0) {
+            if (!first) emit(", ");
+            first = 0;
+            emit_expression_ast(a);
+            a = n_next[a];
+        }
+        emit_line(");");
+    } else if (kind == S_PARAMLESS) {
+        emit_indent();
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit_line("();");
+    } else if (kind == S_ARRAY_ASSIGN) {
+        int sidx = n_int[n];
+        emit_indent();
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit("[");
+        emit_expression_ast(n_right[n]);
+        if (sidx >= 0) { emit(" - "); emit_int(sym_arr_lo[sidx]); }
+        else emit(" - 1");
+        emit("]");
+        if (n_arg2[n] != 0) {
+            emit("[");
+            emit_expression_ast(n_arg2[n]);
+            emit(" - "); emit_int(sym_arr_inner_lo[sidx]);
+            emit("]");
+        }
+        emit(" = ");
+        emit_expression_ast(n_first[n]);
+        emit_line(";");
+    }
+}
 
-    } else if (tok == TK_IF) {
+/* Build an AST node for leaf statements; return 0 for compound and
+   dotted statements which still emit directly. */
+static int parse_statement_ast(void) {
+    int n;
+    if (tok == TK_NULL) {
+        n = new_node(S_NULL);
+        next_token(); expect(TK_SEMI);
+        return n;
+    }
+    if (tok == TK_RETURN) {
+        n = new_node(S_RETURN);
+        next_token();
+        if (tok != TK_SEMI) {
+            n_left[n] = parse_expression_ast();
+        } else if (in_main_proc) {
+            n_op[n] = 1;  /* signal "return 0" to the walker */
+        }
+        expect(TK_SEMI);
+        return n;
+    }
+    if (tok == TK_RAISE) {
+        n = new_node(S_RAISE);
+        n_int[n] = line_num;
+        next_token();
+        while (tok != TK_SEMI && tok != TK_EOF) next_token();
+        expect(TK_SEMI);
+        return n;
+    }
+    if (tok == TK_EXIT) {
+        n = new_node(S_EXIT);
+        next_token();
+        if (tok == TK_WHEN) {
+            next_token();
+            n_left[n] = parse_expression_ast();
+        }
+        expect(TK_SEMI);
+        return n;
+    }
+
+    /* Compound statements: direct emit, no AST node. */
+    if (tok == TK_IF) {
         emit_indent(); emit("if (");
         next_token(); parse_expression();
         emit_line(") {"); expect(TK_THEN);
@@ -1098,23 +1188,26 @@ static void parse_statement(void) {
         }
         emit_indent(); emit_line("}");
         expect(TK_END); expect(TK_IF); expect(TK_SEMI);
-
-    } else if (tok == TK_WHILE) {
+        return 0;
+    }
+    if (tok == TK_WHILE) {
         emit_indent(); emit("while (");
         next_token(); parse_expression();
         emit_line(") {"); expect(TK_LOOP);
         indent_level++; parse_statements(); indent_level--;
         emit_indent(); emit_line("}");
         expect(TK_END); expect(TK_LOOP); expect(TK_SEMI);
-
-    } else if (tok == TK_LOOP) {
+        return 0;
+    }
+    if (tok == TK_LOOP) {
         emit_indent(); emit_line("while (1) {");
         next_token();
         indent_level++; parse_statements(); indent_level--;
         emit_indent(); emit_line("}");
         expect(TK_END); expect(TK_LOOP); expect(TK_SEMI);
-
-    } else if (tok == TK_FOR) {
+        return 0;
+    }
+    if (tok == TK_FOR) {
         next_token();
         char loop_var[MAX_NAME];
         int lv_len = tok_len;
@@ -1161,8 +1254,9 @@ static void parse_statement(void) {
         if (is_reverse) emit_line("} }");
         else emit_line("}");
         expect(TK_END); expect(TK_LOOP); expect(TK_SEMI);
-
-    } else if (tok == TK_DECLARE) {
+        return 0;
+    }
+    if (tok == TK_DECLARE) {
         next_token();
         emit_indent(); emit_line("{");
         indent_level++;
@@ -1172,8 +1266,9 @@ static void parse_statement(void) {
         indent_level--;
         emit_indent(); emit_line("}");
         expect(TK_END); expect(TK_SEMI);
-
-    } else if (tok == TK_BEGIN) {
+        return 0;
+    }
+    if (tok == TK_BEGIN) {
         /* Bare begin...end block */
         next_token();
         emit_indent(); emit_line("{");
@@ -1182,8 +1277,13 @@ static void parse_statement(void) {
         indent_level--;
         emit_indent(); emit_line("}");
         expect(TK_END); expect(TK_SEMI);
+        return 0;
+    }
 
-    } else if (tok == TK_IDENT) {
+    /* Identifier-prefixed statement: assignment, call, array assign,
+       parameterless call, or dotted package call. The first four become
+       AST nodes; dotted still emits directly. */
+    if (tok == TK_IDENT) {
         char saved[MAX_TOK];
         int saved_len = tok_len;
         memcpy(saved, tok_val, tok_len);
@@ -1191,69 +1291,83 @@ static void parse_statement(void) {
         next_token();
 
         if (tok == TK_ASSIGN) {
-            /* Assignment */
-            emit_indent();
-            emit_str_lower(saved, saved_len);
-            emit(" = "); next_token();
-            parse_expression();
-            emit_line(";"); expect(TK_SEMI);
+            n = new_node(S_ASSIGN);
+            n_str_off[n] = pool_str(saved, saved_len);
+            n_str_len[n] = saved_len;
+            next_token();
+            n_right[n] = parse_expression_ast();
+            expect(TK_SEMI);
+            return n;
+        }
 
-        } else if (tok == TK_LPAREN) {
+        if (tok == TK_LPAREN) {
             next_token();
             if (sidx >= 0 && (sym_kind[sidx]==SK_PROC || sym_kind[sidx]==SK_FUNC)) {
-                /* Procedure call */
-                emit_indent();
-                emit_str_lower(saved, saved_len);
-                emit("(");
+                n = new_node(S_CALL);
+                n_str_off[n] = pool_str(saved, saved_len);
+                n_str_len[n] = saved_len;
+                n_int[n] = sidx;
                 if (tok != TK_RPAREN) {
-                    parse_expression();
-                    while (tok == TK_COMMA) { emit(", "); next_token(); parse_expression(); }
-                }
-                emit_line(");");
-                expect(TK_RPAREN); expect(TK_SEMI);
-            } else {
-                /* Array element assignment or function call as statement */
-                /* Look ahead: after ) if := then array assignment, else call */
-                /* We need to parse the index, then check */
-                emit_indent();
-                emit_str_lower(saved, saved_len);
-
-                /* Save position for lookahead - but single pass, so check sym */
-                if (sidx >= 0 && (sym_kind[sidx]==SK_VAR || sym_kind[sidx]==SK_PARAM) &&
-                    (sym_type[sidx]==TY_ARRAY)) {
-                    /* Array assignment */
-                    emit("[");
-                    parse_expression();
-                    if (sidx >= 0) { emit(" - "); emit_int(sym_arr_lo[sidx]); }
-                    else emit(" - 1");
-                    emit("]");
-                    expect(TK_RPAREN);
-                    /* Chained second index for 2D arrays */
-                    if (tok == TK_LPAREN && sym_arr_inner_hi[sidx] != 0) {
+                    int first = parse_expression_ast();
+                    n_first[n] = first;
+                    int prev = first;
+                    while (tok == TK_COMMA) {
                         next_token();
-                        emit("[");
-                        parse_expression();
-                        emit(" - "); emit_int(sym_arr_inner_lo[sidx]);
-                        emit("]");
-                        expect(TK_RPAREN);
+                        int arg = parse_expression_ast();
+                        n_next[prev] = arg;
+                        prev = arg;
                     }
-                    expect(TK_ASSIGN);
-                    emit(" = ");
-                    parse_expression();
-                    emit_line(";"); expect(TK_SEMI);
-                } else {
-                    /* Treat as procedure/function call */
-                    emit("(");
-                    if (tok != TK_RPAREN) {
-                        parse_expression();
-                        while (tok == TK_COMMA) { emit(", "); next_token(); parse_expression(); }
-                    }
-                    emit_line(");");
-                    expect(TK_RPAREN); expect(TK_SEMI);
+                }
+                expect(TK_RPAREN); expect(TK_SEMI);
+                return n;
+            }
+            if (sidx >= 0 && (sym_kind[sidx]==SK_VAR || sym_kind[sidx]==SK_PARAM)
+                && sym_type[sidx]==TY_ARRAY) {
+                n = new_node(S_ARRAY_ASSIGN);
+                n_str_off[n] = pool_str(saved, saved_len);
+                n_str_len[n] = saved_len;
+                n_int[n] = sidx;
+                n_right[n] = parse_expression_ast();
+                expect(TK_RPAREN);
+                if (tok == TK_LPAREN && sym_arr_inner_hi[sidx] != 0) {
+                    next_token();
+                    n_arg2[n] = parse_expression_ast();
+                    expect(TK_RPAREN);
+                }
+                expect(TK_ASSIGN);
+                n_first[n] = parse_expression_ast();
+                expect(TK_SEMI);
+                return n;
+            }
+            /* Unresolved IDENT(...) — treat as call */
+            n = new_node(S_CALL);
+            n_str_off[n] = pool_str(saved, saved_len);
+            n_str_len[n] = saved_len;
+            n_int[n] = sidx;
+            if (tok != TK_RPAREN) {
+                int first = parse_expression_ast();
+                n_first[n] = first;
+                int prev = first;
+                while (tok == TK_COMMA) {
+                    next_token();
+                    int arg = parse_expression_ast();
+                    n_next[prev] = arg;
+                    prev = arg;
                 }
             }
+            expect(TK_RPAREN); expect(TK_SEMI);
+            return n;
+        }
 
-        } else if (tok == TK_DOT) {
+        if (tok == TK_SEMI) {
+            n = new_node(S_PARAMLESS);
+            n_str_off[n] = pool_str(saved, saved_len);
+            n_str_len[n] = saved_len;
+            next_token();
+            return n;
+        }
+
+        if (tok == TK_DOT) {
             /* Package-qualified call */
             next_token();
             char sub[MAX_TOK];
@@ -1387,23 +1501,24 @@ static void parse_statement(void) {
                 }
             }
             expect(TK_SEMI);
-
-        } else if (tok == TK_SEMI) {
-            /* Procedure call with no args */
-            emit_indent();
-            emit_str_lower(saved, saved_len);
-            emit_line("();");
-            next_token();
-
-        } else {
-            fprintf(stderr, "After ident '%.*s', got token %d\n", saved_len, saved, tok);
-            error("expected := or ( after identifier");
+            return 0;
         }
-
-    } else {
-        fprintf(stderr, "Got token %d (val='%.*s')\n", tok, tok_len, tok_val);
-        error("unexpected token in statement");
+        fprintf(stderr, "After ident '%.*s', got token %d\n", saved_len, saved, tok);
+        error("expected := or ( after identifier");
+        return 0;
     }
+    fprintf(stderr, "Got token %d (val='%.*s')\n", tok, tok_len, tok_val);
+    error("unexpected token in statement");
+    return 0;
+}
+
+/* Public wrapper: build one statement's AST, walk it (only for leaf
+   statement kinds — compound and dotted paths already emitted during
+   build), then reset the pool. */
+static void parse_statement(void) {
+    int n = parse_statement_ast();
+    if (n != 0) emit_statement_ast(n);
+    reset_ast();
 }
 
 static void parse_statements(void) {
