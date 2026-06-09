@@ -5,7 +5,7 @@ CC = gcc
 CFLAGS = -O2 -Wall -Wno-unused-function
 RUNTIME = runtime
 
-.PHONY: all clean bootstrap stage1 stage2 test verify
+.PHONY: all clean bootstrap stage1 stage2 test test-stage1 verify
 
 all: bootstrap test
 
@@ -32,17 +32,14 @@ verify: build/stage1 build/stage2
 	./build/stage2 src/adacomp.adb build/verify_s2.c
 	diff build/verify_s1.c build/verify_s2.c && echo "SELF-HOSTING VERIFIED: stage1 and stage2 produce identical output!"
 
-# Test with sample programs
+# Run the .adb / .expected fixture suite under test/.
 test: build/bootstrap
-	@echo "=== Compiling hello.adb ==="
-	./build/bootstrap test/hello.adb build/hello.c
-	$(CC) $(CFLAGS) -I$(RUNTIME) -o build/hello build/hello.c
-	./build/hello
-	@echo ""
-	@echo "=== Compiling factorial.adb ==="
-	./build/bootstrap test/factorial.adb build/factorial.c
-	$(CC) $(CFLAGS) -I$(RUNTIME) -o build/factorial build/factorial.c
-	./build/factorial
+	@./test/run.sh
+
+# Same suite, but against the self-hosted stage1 binary. Useful for
+# catching divergence between the C bootstrap and the Ada self-host.
+test-stage1: build/stage1
+	@COMPILER=stage1 ./test/run.sh
 
 build:
 	mkdir -p build
