@@ -291,16 +291,28 @@ In progress.
   AST nodes — they couple to declarations (`declare` blocks embed
   decls that direct-emit during parse) and will be reworked alongside
   step 4. Self-hosting still verifies.
-- [ ] **Step 4.** Extend the AST to declarations (variable, procedure,
-  function, type) in both files, then circle back to convert
-  compound and dotted statements into full AST nodes so the whole
-  compiler walks one tree. *Next concrete commit.*
+- [x] **Step 4 (Pass A).** Variable declarations become AST nodes
+  (`D_VAR_SIMPLE` … `D_VAR_DOTTED`) in both files. `Parse_Declarations`
+  is now a build / walk / reset loop driven by `Parse_Declaration_AST`,
+  same hybrid pattern as statements: leaf-decl flavors (simple, named-
+  array, anonymous-array, String, File_Type, other dotted) build nodes;
+  type definitions and procedure / function declarations still emit
+  directly during parse and return 0. Self-hosting still verifies and
+  all 14 fixtures pass under both compilers.
+- [ ] **Step 4 (Pass B).** Convert procedure / function declarations
+  (and their parameter lists) into full AST nodes, so a body can hold
+  its own AST sub-tree. Coupled to converting compound statements
+  (if / while / for / loop / declare / begin) — once both are AST,
+  `declare` blocks can hold a decls-chain and a stmts-chain in one
+  tree and the whole program becomes one structure. *Next concrete
+  commit.*
 - [ ] Replace fixed-size buffers (source, token, name pool, symbol
   table) with dynamic growth.
 - [ ] Real diagnostics: source locations on every token, error
   recovery, multi-error reports.
-- [ ] Test infrastructure: per-feature `.adb` fixtures with expected
-  C output / runtime output / expected diagnostics.
+- [x] Test infrastructure: per-feature `.adb` fixtures with expected
+  output, runnable against bootstrap (`make test`) and stage1
+  (`make test-stage1`). 14 fixtures shipped; grows as features land.
 - [ ] CI: matrix build on every push.
 - [ ] Documented internal IR (one-page schema).
 

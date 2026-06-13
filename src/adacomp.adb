@@ -193,6 +193,15 @@ procedure Adacomp is
    S_PARAMLESS    : constant Integer := 26;
    S_ARRAY_ASSIGN : constant Integer := 27;
 
+   -- Variable-declaration leaf nodes. Type definitions and procedure /
+   -- function declarations still direct-emit during parse and return 0.
+   D_VAR_SIMPLE      : constant Integer := 30;
+   D_VAR_NAMED_ARRAY : constant Integer := 31;
+   D_VAR_ANON_ARRAY  : constant Integer := 32;
+   D_VAR_STRING      : constant Integer := 33;
+   D_VAR_FILE        : constant Integer := 34;
+   D_VAR_DOTTED      : constant Integer := 35;
+
    -- Node storage as parallel arrays
    type Node_Store is array (1 .. 10000) of Integer;
    N_Kind    : Node_Store;
@@ -823,8 +832,10 @@ procedure Adacomp is
    function  Parse_Factor_AST return Integer;
    function  Parse_Primary_AST return Integer;
    function  Parse_Statement_AST return Integer;
+   function  Parse_Declaration_AST return Integer;
    procedure Emit_Expression_AST (N : Integer);
    procedure Emit_Statement_AST (N : Integer);
+   procedure Emit_Declaration_AST (N : Integer);
 
    -- Parse type reference
    function Parse_Type_Ref return Integer is
@@ -1936,53 +1947,139 @@ procedure Adacomp is
       end loop;
    end Parse_Statements;
 
-   procedure Parse_Declarations is
+   -- ---- Declaration-AST walker (variable-leaf nodes only) ----
+   procedure Emit_Declaration_AST (N : Integer) is
+      Kind : Integer;
+      Is_Const : Integer;
+      Sidx : Integer;
+   begin
+      if N = 0 then return; end if;
+      Kind := N_Kind (N);
+      Is_Const := N_Op (N);
+
+      if Kind = D_VAR_SIMPLE then
+         Emit_Indent;
+         if Is_Const = 1 then Emit ("const "); end if;
+         Emit_C_Type (N_Int (N));
+         Emit (" ");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         if N_Left (N) /= 0 then
+            Emit (" = ");
+            Emit_Expression_AST (N_Left (N));
+         elsif N_Int (N) = TY_STRING then
+            Emit (" = """"");
+         else
+            Emit (" = 0");
+         end if;
+         Emit_Ln (";");
+      elsif Kind = D_VAR_NAMED_ARRAY then
+         Sidx := N_Int (N);
+         Emit_Indent;
+         Emit_C_Type (Sym_Arr_El (Sidx));
+         Emit (" ");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit ("[");
+         Emit_Int (Sym_Arr_Hi (Sidx) - Sym_Arr_Lo (Sidx) + 1);
+         Emit_Ln ("];");
+      elsif Kind = D_VAR_ANON_ARRAY then
+         Sidx := N_Int (N);
+         Emit_Indent;
+         if Is_Const = 1 then Emit ("const "); end if;
+         Emit_C_Type (Sym_Arr_El (Sidx));
+         Emit (" ");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit ("[");
+         Emit_Int (Sym_Arr_Hi (Sidx) - Sym_Arr_Lo (Sidx) + 1);
+         Emit ("]");
+         if Sym_Arr_Inner_Hi (Sidx) /= 0 then
+            Emit ("[");
+            Emit_Int (Sym_Arr_Inner_Hi (Sidx) - Sym_Arr_Inner_Lo (Sidx) + 1);
+            Emit ("]");
+         end if;
+         Emit_Ln (";");
+      elsif Kind = D_VAR_STRING then
+         Emit_Indent;
+         Emit ("const char *");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         if N_Left (N) /= 0 then
+            Emit (" = ");
+            Emit_Expression_AST (N_Left (N));
+         else
+            Emit (" = """"");
+         end if;
+         Emit_Ln (";");
+      elsif Kind = D_VAR_FILE then
+         Emit_Indent;
+         Emit ("FILE *");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit_Ln (" = NULL;");
+      elsif Kind = D_VAR_DOTTED then
+         Emit_Indent;
+         if Is_Const = 1 then Emit ("const "); end if;
+         Emit ("int ");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         if N_Left (N) /= 0 then
+            Emit (" = ");
+            Emit_Expression_AST (N_Left (N));
+         else
+            Emit (" = 0");
+         end if;
+         Emit_Ln (";");
+      end if;
+   end Emit_Declaration_AST;
+
+   -- ---- Parse one declaration ----
+   -- Variables become AST nodes; type definitions and procedure/function
+   -- declarations direct-emit and return 0. Returning 0 also signals
+   -- "this isn't a declaration we recognise" so the wrapper stops.
+   function Parse_Declaration_AST return Integer is
       Var_Name : Tok_Buffer;
       Var_Len  : Integer;
       Typ      : Integer;
       Is_Const : Boolean;
-      Handled  : Boolean;
+      N        : Integer;
    begin
-      while Tok /= TK_BEGIN and Tok /= TK_EOF loop
-         if Tok = TK_TYPE then
+      if Tok = TK_TYPE then
+         Next_Token;
+         Add_Sym (SK_TYPE, TY_ARRAY);
+         Next_Token;
+         Expect (TK_IS);
+         if Tok = TK_ARRAY then
             Next_Token;
-            Add_Sym (SK_TYPE, TY_ARRAY);
-            Next_Token;
-            Expect (TK_IS);
-            if Tok = TK_ARRAY then
+            Expect (TK_LPAREN);
+            declare
+               Lo : Integer := 0;
+               Hi : Integer := 0;
+               El : Integer;
+            begin
+               if Tok = TK_INT_LIT then Lo := Tok_Int; end if;
                Next_Token;
-               Expect (TK_LPAREN);
-               declare
-                  Lo : Integer := 0;
-                  Hi : Integer := 0;
-                  El : Integer;
-               begin
-                  if Tok = TK_INT_LIT then Lo := Tok_Int; end if;
+               Expect (TK_DOTDOT);
+               if Tok = TK_INT_LIT then Hi := Tok_Int; end if;
+               Next_Token;
+               if Tok = TK_COMMA then
                   Next_Token;
+                  if Tok = TK_INT_LIT then Next_Token; end if;
                   Expect (TK_DOTDOT);
-                  if Tok = TK_INT_LIT then Hi := Tok_Int; end if;
-                  Next_Token;
-                  if Tok = TK_COMMA then
-                     Next_Token;
-                     if Tok = TK_INT_LIT then Next_Token; end if;
-                     Expect (TK_DOTDOT);
-                     if Tok = TK_INT_LIT then Next_Token; end if;
-                  end if;
-                  Expect (TK_RPAREN);
-                  Expect (TK_OF);
-                  El := Parse_Type_Ref;
-                  Sym_Arr_Lo (Sym_Count) := Lo;
-                  Sym_Arr_Hi (Sym_Count) := Hi;
-                  Sym_Arr_El (Sym_Count) := El;
-               end;
-            else
-               while Tok /= TK_SEMI and Tok /= TK_EOF loop
-                  Next_Token;
-               end loop;
-            end if;
-            Expect (TK_SEMI);
+                  if Tok = TK_INT_LIT then Next_Token; end if;
+               end if;
+               Expect (TK_RPAREN);
+               Expect (TK_OF);
+               El := Parse_Type_Ref;
+               Sym_Arr_Lo (Sym_Count) := Lo;
+               Sym_Arr_Hi (Sym_Count) := Hi;
+               Sym_Arr_El (Sym_Count) := El;
+            end;
+         else
+            while Tok /= TK_SEMI and Tok /= TK_EOF loop
+               Next_Token;
+            end loop;
+         end if;
+         Expect (TK_SEMI);
+         return 0;
+      end if;
 
-         elsif Tok = TK_PROCEDURE then
+      if Tok = TK_PROCEDURE then
             Next_Token;
             declare
                P_Name : Tok_Buffer;
@@ -2072,8 +2169,10 @@ procedure Adacomp is
                   Pop_Scope;
                end if;
             end;
+         return 0;
+         end if;
 
-         elsif Tok = TK_FUNCTION then
+         if Tok = TK_FUNCTION then
             Next_Token;
             declare
                F_Name : Tok_Buffer;
@@ -2174,8 +2273,10 @@ procedure Adacomp is
                   Pop_Scope;
                end if;
             end;
+         return 0;
+         end if;
 
-         elsif Tok = TK_IDENT then
+         if Tok = TK_IDENT then
             Var_Len := Tok_Len;
             for I in 1 .. Tok_Len loop
                Var_Name (I) := Tok_Val (I);
@@ -2187,7 +2288,6 @@ procedure Adacomp is
                Is_Const := True;
                Next_Token;
             end if;
-            Handled := False;
 
             -- Anonymous inline array: Name : array (lo..hi) of T;
             if Tok = TK_ARRAY then
@@ -2235,34 +2335,24 @@ procedure Adacomp is
                      Sym_Arr_Inner_Lo (Sym_Count) := Inner_Lo;
                      Sym_Arr_Inner_Hi (Sym_Count) := Inner_Hi;
                   end if;
-                  Emit_Indent;
-                  if Is_Const then Emit ("const "); end if;
-                  Emit_C_Type (El_Type);
-                  Emit (" ");
-                  Emit_Lower (Var_Name, Var_Len);
-                  Emit ("[");
-                  Emit_Int (Hi - Lo + 1);
-                  Emit ("]");
-                  if Is_Nested then
-                     Emit ("[");
-                     Emit_Int (Inner_Hi - Inner_Lo + 1);
-                     Emit ("]");
-                  end if;
+                  N := New_Node (D_VAR_ANON_ARRAY);
+                  N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
+                  N_Str_Len (N) := Var_Len;
+                  N_Int (N) := Sym_Count;
+                  if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
                   if Tok = TK_ASSIGN then
                      Next_Token;
-                     Emit (" = {0}");
                      while Tok /= TK_SEMI and Tok /= TK_EOF loop
                         Next_Token;
                      end loop;
                   end if;
-                  Emit_Ln (";");
                   Expect (TK_SEMI);
-                  Handled := True;
+                  return N;
                end;
             end if;
 
             -- Named array type variable
-            if not Handled and Tok = TK_IDENT then
+            if Tok = TK_IDENT then
                declare
                   Tidx : Integer;
                begin
@@ -2276,52 +2366,47 @@ procedure Adacomp is
                      Sym_Arr_Lo (Sym_Count) := Sym_Arr_Lo (Tidx);
                      Sym_Arr_Hi (Sym_Count) := Sym_Arr_Hi (Tidx);
                      Sym_Arr_El (Sym_Count) := Sym_Arr_El (Tidx);
-                     Emit_Indent;
-                     Emit_C_Type (Sym_Arr_El (Tidx));
-                     Emit (" ");
-                     Emit_Lower (Var_Name, Var_Len);
-                     Emit ("[");
-                     Emit_Int (Sym_Arr_Hi (Tidx) - Sym_Arr_Lo (Tidx) + 1);
-                     Emit ("]");
+                     N := New_Node (D_VAR_NAMED_ARRAY);
+                     N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
+                     N_Str_Len (N) := Var_Len;
+                     N_Int (N) := Sym_Count;
+                     if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
                      Next_Token;
                      if Tok = TK_ASSIGN then
                         Next_Token;
-                        Emit (" = {0}");
                         while Tok /= TK_SEMI and Tok /= TK_EOF loop
                            Next_Token;
                         end loop;
                      end if;
-                     Emit_Ln (";");
                      Expect (TK_SEMI);
-                     Handled := True;
+                     return N;
                   end if;
                end;
             end if;
 
             -- String type variable
-            if not Handled and Tok = TK_STRING then
+            if Tok = TK_STRING then
                Next_Token;
                if Is_Const then
                   Add_Sym_Named (Var_Name, Var_Len, SK_CONST, TY_STRING);
                else
                   Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_STRING);
                end if;
-               Emit_Indent;
-               Emit ("const char *");
-               Emit_Lower (Var_Name, Var_Len);
+               N := New_Node (D_VAR_STRING);
+               N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
+               N_Str_Len (N) := Var_Len;
+               N_Int (N) := Sym_Count;
+               if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
                if Tok = TK_ASSIGN then
-                  Emit (" = "); Next_Token;
-                  Parse_Expression;
-               else
-                  Emit (" = """"");
+                  Next_Token;
+                  N_Left (N) := Parse_Expression_AST;
                end if;
-               Emit_Ln (";");
                Expect (TK_SEMI);
-               Handled := True;
+               return N;
             end if;
 
-            -- Dotted type (e.g. Ada.Text_IO.File_Type) or other ident-typed
-            if not Handled and Tok = TK_IDENT then
+            -- Dotted-type variable (File_Type or other dotted name)
+            if Tok = TK_IDENT then
                declare
                   Is_File_Type : Boolean := False;
                   First_Ident : Tok_Buffer;
@@ -2350,11 +2435,9 @@ procedure Adacomp is
                         else
                            Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_INTEGER);
                         end if;
-                        Emit_Indent;
-                        Emit ("FILE *");
-                        Emit_Lower (Var_Name, Var_Len);
-                        Emit (" = NULL");
-                        Emit_Ln (";");
+                        N := New_Node (D_VAR_FILE);
+                        N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
+                        N_Str_Len (N) := Var_Len;
                         if Tok = TK_ASSIGN then
                            Next_Token;
                            while Tok /= TK_SEMI and Tok /= TK_EOF loop
@@ -2362,85 +2445,87 @@ procedure Adacomp is
                            end loop;
                         end if;
                         Expect (TK_SEMI);
-                        Handled := True;
-                     else
-                        -- Non-file dotted type: treat as int
-                        if Is_Const then
-                           Add_Sym_Named (Var_Name, Var_Len, SK_CONST, TY_INTEGER);
-                        else
-                           Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_INTEGER);
-                        end if;
-                        Emit_Indent;
-                        if Is_Const then Emit ("const "); end if;
-                        Emit ("int ");
-                        Emit_Lower (Var_Name, Var_Len);
-                        if Tok = TK_ASSIGN then
-                           Emit (" = "); Next_Token;
-                           Parse_Expression;
-                        else
-                           Emit (" = 0");
-                        end if;
-                        Emit_Ln (";");
-                        Expect (TK_SEMI);
-                        Handled := True;
+                        return N;
                      end if;
-                  else
-                     -- Not dotted: First_Ident is the type name
-                     Tidx := Find_Sym (First_Ident, First_Len);
-                     if Tidx > 0 and then Sym_Kind (Tidx) = SK_TYPE then
-                        Typ2 := Sym_Type (Tidx);
-                     end if;
+                     -- Non-file dotted type: treat as int
                      if Is_Const then
-                        Add_Sym_Named (Var_Name, Var_Len, SK_CONST, Typ2);
+                        Add_Sym_Named (Var_Name, Var_Len, SK_CONST, TY_INTEGER);
                      else
-                        Add_Sym_Named (Var_Name, Var_Len, SK_VAR, Typ2);
+                        Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_INTEGER);
                      end if;
-                     Emit_Indent;
-                     if Is_Const then Emit ("const "); end if;
-                     Emit_C_Type (Typ2);
-                     Emit (" ");
-                     Emit_Lower (Var_Name, Var_Len);
+                     N := New_Node (D_VAR_DOTTED);
+                     N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
+                     N_Str_Len (N) := Var_Len;
+                     if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
                      if Tok = TK_ASSIGN then
-                        Emit (" = "); Next_Token;
-                        Parse_Expression;
-                     else
-                        Emit (" = 0");
+                        Next_Token;
+                        N_Left (N) := Parse_Expression_AST;
                      end if;
-                     Emit_Ln (";");
                      Expect (TK_SEMI);
-                     Handled := True;
+                     return N;
                   end if;
+                  -- Not dotted: First_Ident is the type name
+                  Tidx := Find_Sym (First_Ident, First_Len);
+                  if Tidx > 0 and then Sym_Kind (Tidx) = SK_TYPE then
+                     Typ2 := Sym_Type (Tidx);
+                  end if;
+                  if Is_Const then
+                     Add_Sym_Named (Var_Name, Var_Len, SK_CONST, Typ2);
+                  else
+                     Add_Sym_Named (Var_Name, Var_Len, SK_VAR, Typ2);
+                  end if;
+                  N := New_Node (D_VAR_SIMPLE);
+                  N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
+                  N_Str_Len (N) := Var_Len;
+                  N_Int (N) := Typ2;
+                  if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
+                  if Tok = TK_ASSIGN then
+                     Next_Token;
+                     N_Left (N) := Parse_Expression_AST;
+                  end if;
+                  Expect (TK_SEMI);
+                  return N;
                end;
             end if;
 
-            -- Generic typed variable (Integer, Character, Boolean, etc.)
-            if not Handled then
-               Typ := Parse_Type_Ref;
-               if Is_Const then
-                  Add_Sym_Named (Var_Name, Var_Len, SK_CONST, Typ);
-               else
-                  Add_Sym_Named (Var_Name, Var_Len, SK_VAR, Typ);
-               end if;
-               Emit_Indent;
-               if Is_Const then Emit ("const "); end if;
-               Emit_C_Type (Typ);
-               Emit (" ");
-               Emit_Lower (Var_Name, Var_Len);
-               if Tok = TK_ASSIGN then
-                  Emit (" = "); Next_Token;
-                  Parse_Expression;
-               elsif Typ = TY_STRING then
-                  Emit (" = """"");
-               else
-                  Emit (" = 0");
-               end if;
-               Emit_Ln (";");
-               Expect (TK_SEMI);
+            -- Generic typed variable (Integer/Character/Boolean keyword)
+            Typ := Parse_Type_Ref;
+            if Is_Const then
+               Add_Sym_Named (Var_Name, Var_Len, SK_CONST, Typ);
+            else
+               Add_Sym_Named (Var_Name, Var_Len, SK_VAR, Typ);
             end if;
-
-         else
-            return;
+            N := New_Node (D_VAR_SIMPLE);
+            N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
+            N_Str_Len (N) := Var_Len;
+            N_Int (N) := Typ;
+            if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
+            if Tok = TK_ASSIGN then
+               Next_Token;
+               N_Left (N) := Parse_Expression_AST;
+            end if;
+            Expect (TK_SEMI);
+            return N;
          end if;
+
+         -- Not a declaration we recognise — signal "stop".
+         return 0;
+   end Parse_Declaration_AST;
+
+   -- Public wrapper: loop, building one declaration at a time, walking
+   -- variable-leaf nodes, resetting the pool. Type definitions and
+   -- procedure / function declarations direct-emit during parse.
+   procedure Parse_Declarations is
+      N : Integer;
+   begin
+      while Tok = TK_TYPE or Tok = TK_PROCEDURE
+            or Tok = TK_FUNCTION or Tok = TK_IDENT
+      loop
+         N := Parse_Declaration_AST;
+         if N /= 0 then
+            Emit_Declaration_AST (N);
+         end if;
+         Reset_AST;
       end loop;
    end Parse_Declarations;
 

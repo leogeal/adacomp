@@ -498,7 +498,16 @@ enum {
        dotted-package statements still emit directly; they'll become full
        AST nodes once declarations are AST-driven (step 4). */
     S_NULL=20, S_RETURN=21, S_RAISE=22, S_EXIT=23,
-    S_ASSIGN=24, S_CALL=25, S_PARAMLESS=26, S_ARRAY_ASSIGN=27
+    S_ASSIGN=24, S_CALL=25, S_PARAMLESS=26, S_ARRAY_ASSIGN=27,
+    /* Variable-declaration leaf nodes. Type definitions and procedure /
+       function declarations still emit directly during parse and return
+       0 from parse_declaration_ast. */
+    D_VAR_SIMPLE=30,       /* X : Integer [:= expr]; (Integer / Character / Boolean) */
+    D_VAR_NAMED_ARRAY=31,  /* X : Some_Named_Array_Type; */
+    D_VAR_ANON_ARRAY=32,   /* X : array (lo..hi) of T; */
+    D_VAR_STRING=33,       /* X : String [:= expr]; */
+    D_VAR_FILE=34,         /* X : Ada.Text_IO.File_Type; */
+    D_VAR_DOTTED=35        /* X : Some.Other.Dotted_Type [:= expr]; (treated as int) */
 };
 
 enum {
@@ -571,6 +580,8 @@ static int  parse_statement_ast(void);
 static void emit_statement_ast(int n);
 static void parse_statements(void);
 static void parse_declarations(void);
+static int  parse_declaration_ast(void);
+static void emit_declaration_ast(int n);
 
 /* ---- Type reference ---- */
 static int parse_type_ref(void) {
@@ -1537,52 +1548,134 @@ static void parse_statements(void) {
 
 /* ---- Declaration parser ---- */
 
-static void parse_declarations(void) {
-    while (tok != TK_BEGIN && tok != TK_EOF) {
-        if (tok == TK_TYPE) {
-            next_token();
-            char tname[MAX_NAME];
-            int tlen = tok_len;
-            memcpy(tname, tok_val, tok_len);
-            add_sym(SK_TYPE, TY_ARRAY);
-            next_token();
-            expect(TK_IS);
-            if (tok == TK_ARRAY) {
-                next_token();
-                expect(TK_LPAREN);
-                int lo = tok_int; next_token();
-                expect(TK_DOTDOT);
-                int hi = tok_int; next_token();
-                /* Handle Name .. Name or int .. int */
-                /* For multi-dimensional: (1..N, 1..M) */
-                if (tok == TK_COMMA) {
-                    /* 2D array */
-                    next_token();
-                    int lo2 = tok_int; next_token();
-                    expect(TK_DOTDOT);
-                    int hi2 = tok_int; next_token();
-                    expect(TK_RPAREN);
-                    expect(TK_OF);
-                    int el = parse_type_ref();
-                    sym_arr_lo[sym_count-1] = lo;
-                    sym_arr_hi[sym_count-1] = hi;
-                    sym_arr_el[sym_count-1] = el;
-                    /* Store second dimension info - simplified */
-                } else {
-                    expect(TK_RPAREN);
-                    expect(TK_OF);
-                    int el = parse_type_ref();
-                    sym_arr_lo[sym_count-1] = lo;
-                    sym_arr_hi[sym_count-1] = hi;
-                    sym_arr_el[sym_count-1] = el;
-                }
-            } else {
-                /* Skip other type definitions for now */
-                while (tok != TK_SEMI && tok != TK_EOF) next_token();
-            }
-            expect(TK_SEMI);
+/* ---- Variable-declaration AST walker ----
+   Emits the C for one variable-declaration leaf node. Type definitions
+   and procedure/function declarations don't go through this walker —
+   they direct-emit during parse_declaration_ast and return 0. */
+static void emit_declaration_ast(int n) {
+    if (n == 0) return;
+    int kind = n_kind[n];
+    int is_const = n_op[n];
+    int sidx;
 
-        } else if (tok == TK_PROCEDURE) {
+    if (kind == D_VAR_SIMPLE) {
+        emit_indent();
+        if (is_const) emit("const ");
+        emit_c_type(n_int[n]);
+        emit(" ");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        if (n_left[n] != 0) {
+            emit(" = ");
+            emit_expression_ast(n_left[n]);
+        } else if (n_int[n] == TY_STRING) {
+            emit(" = \"\"");
+        } else {
+            emit(" = 0");
+        }
+        emit_line(";");
+    } else if (kind == D_VAR_NAMED_ARRAY) {
+        sidx = n_int[n];
+        emit_indent();
+        emit_c_type(sym_arr_el[sidx]);
+        emit(" ");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit("[");
+        emit_int(sym_arr_hi[sidx] - sym_arr_lo[sidx] + 1);
+        emit_line("];");
+    } else if (kind == D_VAR_ANON_ARRAY) {
+        sidx = n_int[n];
+        emit_indent();
+        if (is_const) emit("const ");
+        emit_c_type(sym_arr_el[sidx]);
+        emit(" ");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit("[");
+        emit_int(sym_arr_hi[sidx] - sym_arr_lo[sidx] + 1);
+        emit("]");
+        if (sym_arr_inner_hi[sidx] != 0) {
+            emit("[");
+            emit_int(sym_arr_inner_hi[sidx] - sym_arr_inner_lo[sidx] + 1);
+            emit("]");
+        }
+        emit_line(";");
+    } else if (kind == D_VAR_STRING) {
+        emit_indent();
+        emit("const char *");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        if (n_left[n] != 0) {
+            emit(" = ");
+            emit_expression_ast(n_left[n]);
+        } else {
+            emit(" = \"\"");
+        }
+        emit_line(";");
+    } else if (kind == D_VAR_FILE) {
+        emit_indent();
+        emit("FILE *");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit_line(" = NULL;");
+    } else if (kind == D_VAR_DOTTED) {
+        emit_indent();
+        if (is_const) emit("const ");
+        emit("int ");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        if (n_left[n] != 0) {
+            emit(" = ");
+            emit_expression_ast(n_left[n]);
+        } else {
+            emit(" = 0");
+        }
+        emit_line(";");
+    }
+}
+
+/* Parse one declaration. Variable declarations become AST nodes; type
+   definitions and procedure / function declarations direct-emit and
+   return 0. The signal value 0 also indicates "no more declarations
+   here" (the loop in parse_declarations stops when it sees something
+   that isn't a declaration). */
+static int parse_declaration_ast(void) {
+    if (tok == TK_TYPE) {
+        /* Type definition (no C emission; just populates the symbol table). */
+        next_token();
+        add_sym(SK_TYPE, TY_ARRAY);
+        next_token();
+        expect(TK_IS);
+        if (tok == TK_ARRAY) {
+            next_token();
+            expect(TK_LPAREN);
+            int lo = tok_int; next_token();
+            expect(TK_DOTDOT);
+            int hi = tok_int; next_token();
+            if (tok == TK_COMMA) {
+                /* 2D form (1..N, 1..M) — second dim parsed but not
+                   tracked separately. */
+                next_token();
+                next_token();
+                expect(TK_DOTDOT);
+                next_token();
+                expect(TK_RPAREN);
+                expect(TK_OF);
+                int el = parse_type_ref();
+                sym_arr_lo[sym_count-1] = lo;
+                sym_arr_hi[sym_count-1] = hi;
+                sym_arr_el[sym_count-1] = el;
+            } else {
+                expect(TK_RPAREN);
+                expect(TK_OF);
+                int el = parse_type_ref();
+                sym_arr_lo[sym_count-1] = lo;
+                sym_arr_hi[sym_count-1] = hi;
+                sym_arr_el[sym_count-1] = el;
+            }
+        } else {
+            while (tok != TK_SEMI && tok != TK_EOF) next_token();
+        }
+        expect(TK_SEMI);
+        return 0;
+    }
+
+    if (tok == TK_PROCEDURE) {
             next_token();
             char pname[MAX_NAME];
             int plen = tok_len;
@@ -1643,7 +1736,7 @@ static void parse_declarations(void) {
                 emit_line(");");
                 next_token();
                 pop_scope();
-                continue;
+                return 0;
             }
 
             emit_line(") {");
@@ -1659,8 +1752,10 @@ static void parse_declarations(void) {
             if (tok == TK_IDENT) next_token();
             expect(TK_SEMI);
             pop_scope();
+            return 0;
+        }
 
-        } else if (tok == TK_FUNCTION) {
+        if (tok == TK_FUNCTION) {
             next_token();
             char fname[MAX_NAME];
             int flen = tok_len;
@@ -1738,7 +1833,7 @@ static void parse_declarations(void) {
                 emit_line(");");
                 next_token();
                 pop_scope();
-                continue;
+                return 0;
             }
 
             emit_line(") {");
@@ -1755,20 +1850,21 @@ static void parse_declarations(void) {
             if (tok == TK_IDENT) next_token();
             expect(TK_SEMI);
             pop_scope();
+            return 0;
+        }
 
-        } else if (tok == TK_IDENT) {
+        if (tok == TK_IDENT) {
             /* Variable declaration */
             char vname[MAX_NAME];
             int vlen = tok_len;
             memcpy(vname, tok_val, tok_len);
             next_token();
-
-            /* Handle comma-separated names: A, B : Integer; */
-            /* For simplicity, handle single names */
             expect(TK_COLON);
 
             int is_const = 0;
             if (tok == TK_CONSTANT) { is_const = 1; next_token(); }
+
+            int n;
 
             /* Anonymous inline array: Name : array (lo .. hi) of T; */
             if (tok == TK_ARRAY) {
@@ -1779,19 +1875,15 @@ static void parse_declarations(void) {
                 int hi = tok_int; next_token();
                 expect(TK_RPAREN);
                 expect(TK_OF);
-
-                /* Element type may itself be a named array type */
                 int el_type = TY_INTEGER;
-                int inner_lo = 0, inner_hi = 0, inner_el = TY_INTEGER;
-                int is_nested = 0;
+                int inner_lo = 0, inner_hi = 0, is_nested = 0;
                 if (tok == TK_IDENT) {
                     int tidx = find_sym(tok_val, tok_len);
                     if (tidx >= 0 && sym_kind[tidx] == SK_TYPE && sym_type[tidx] == TY_ARRAY) {
                         is_nested = 1;
                         inner_lo = sym_arr_lo[tidx];
                         inner_hi = sym_arr_hi[tidx];
-                        inner_el = sym_arr_el[tidx];
-                        el_type = inner_el;
+                        el_type = sym_arr_el[tidx];
                         next_token();
                     } else {
                         el_type = parse_type_ref();
@@ -1799,7 +1891,6 @@ static void parse_declarations(void) {
                 } else {
                     el_type = parse_type_ref();
                 }
-
                 if (is_const) add_sym(SK_CONST, TY_ARRAY);
                 else add_sym(SK_VAR, TY_ARRAY);
                 sym_arr_lo[sym_count-1] = lo;
@@ -1812,64 +1903,48 @@ static void parse_declarations(void) {
                 memcpy(sym_name[sym_count-1], vname, vlen);
                 sym_nlen[sym_count-1] = vlen;
 
-                emit_indent();
-                if (is_const) emit("const ");
-                emit_c_type(el_type);
-                emit(" ");
-                emit_str_lower(vname, vlen);
-                emit("[");
-                emit_int(hi - lo + 1);
-                emit("]");
-                if (is_nested) {
-                    emit("[");
-                    emit_int(inner_hi - inner_lo + 1);
-                    emit("]");
-                }
+                n = new_node(D_VAR_ANON_ARRAY);
+                n_str_off[n] = pool_str(vname, vlen);
+                n_str_len[n] = vlen;
+                n_int[n] = sym_count - 1;
+                n_op[n] = is_const;
                 if (tok == TK_ASSIGN) {
                     next_token();
-                    emit(" = {0}");
+                    /* skip the initializer expression — we always emit {0} */
                     while (tok != TK_SEMI && tok != TK_EOF) next_token();
                 }
-                emit_line(";");
                 expect(TK_SEMI);
-                continue;
+                return n;
             }
 
-            /* Check for array type */
+            /* Named array type reference: Name : Some_Array_Type; */
             if (tok == TK_IDENT) {
                 int tidx = find_sym(tok_val, tok_len);
                 if (tidx >= 0 && sym_kind[tidx] == SK_TYPE && sym_type[tidx] == TY_ARRAY) {
                     if (is_const) add_sym(SK_CONST, TY_ARRAY);
                     else add_sym(SK_VAR, TY_ARRAY);
-                    /* Copy array info from type to variable */
                     sym_arr_lo[sym_count-1] = sym_arr_lo[tidx];
                     sym_arr_hi[sym_count-1] = sym_arr_hi[tidx];
                     sym_arr_el[sym_count-1] = sym_arr_el[tidx];
-                    /* Update sym name to variable name */
                     memcpy(sym_name[sym_count-1], vname, vlen);
                     sym_nlen[sym_count-1] = vlen;
 
-                    emit_indent();
-                    emit_c_type(sym_arr_el[tidx]);
-                    emit(" ");
-                    emit_str_lower(vname, vlen);
-                    emit("[");
-                    emit_int(sym_arr_hi[tidx] - sym_arr_lo[tidx] + 1);
-                    emit("]");
+                    n = new_node(D_VAR_NAMED_ARRAY);
+                    n_str_off[n] = pool_str(vname, vlen);
+                    n_str_len[n] = vlen;
+                    n_int[n] = sym_count - 1;
+                    n_op[n] = is_const;
                     next_token();
                     if (tok == TK_ASSIGN) {
                         next_token();
-                        emit(" = {0}");
-                        /* Skip initializer expression */
                         while (tok != TK_SEMI && tok != TK_EOF) next_token();
                     }
-                    emit_line(";");
                     expect(TK_SEMI);
-                    continue;
+                    return n;
                 }
             }
 
-            /* Check for String type with constraint */
+            /* String-typed variable: Name : String [:= expr]; */
             if (tok == TK_STRING) {
                 next_token();
                 if (is_const) add_sym(SK_CONST, TY_STRING);
@@ -1877,42 +1952,27 @@ static void parse_declarations(void) {
                 memcpy(sym_name[sym_count-1], vname, vlen);
                 sym_nlen[sym_count-1] = vlen;
 
-                emit_indent();
-                emit("const char *");
-                emit_str_lower(vname, vlen);
-
+                n = new_node(D_VAR_STRING);
+                n_str_off[n] = pool_str(vname, vlen);
+                n_str_len[n] = vlen;
+                n_int[n] = sym_count - 1;
+                n_op[n] = is_const;
                 if (tok == TK_ASSIGN) {
-                    emit(" = ");
                     next_token();
-                    parse_expression();
-                } else {
-                    emit(" = \"\"");
+                    n_left[n] = parse_expression_ast();
                 }
-                emit_line(";");
                 expect(TK_SEMI);
-                continue;
+                return n;
             }
 
-            /* Check if this is a dotted type like Ada.Text_IO.File_Type */
-            /* Save position to detect File_Type */
-            int is_file_type = 0;
+            /* Dotted-type variable: File_Type, or another dotted name. */
             if (tok == TK_IDENT) {
-                /* peek: does this identifier lead to dots? */
                 char first_ident[MAX_NAME];
                 int first_len = tok_len;
                 memcpy(first_ident, tok_val, tok_len);
-                /* Check if next token will be a dot (look at source) */
-                int save_pos = src_pos;
-                int save_line = line_num;
-                int save_tok = tok;
-                int save_tok_len = tok_len;
-                int save_tok_int = tok_int;
-                char save_tok_val[MAX_TOK];
-                memcpy(save_tok_val, tok_val, tok_len);
-
-                next_token(); /* consume the ident */
+                next_token();
                 if (tok == TK_DOT) {
-                    /* It's a dotted type name */
+                    int is_file_type = 0;
                     while (tok == TK_DOT) {
                         next_token();
                         if (tok == TK_IDENT || tok == TK_INTEGER || tok == TK_CHARACTER) {
@@ -1925,43 +1985,33 @@ static void parse_declarations(void) {
                         else add_sym(SK_VAR, TY_INTEGER);
                         memcpy(sym_name[sym_count-1], vname, vlen);
                         sym_nlen[sym_count-1] = vlen;
-                        emit_indent();
-                        emit("FILE *");
-                        emit_str_lower(vname, vlen);
-                        emit(" = NULL");
-                        emit_line(";");
+                        n = new_node(D_VAR_FILE);
+                        n_str_off[n] = pool_str(vname, vlen);
+                        n_str_len[n] = vlen;
                         if (tok == TK_ASSIGN) {
                             next_token();
                             while (tok != TK_SEMI && tok != TK_EOF) next_token();
                         }
                         expect(TK_SEMI);
-                        continue;
+                        return n;
                     }
-                    /* Non-file dotted type - treat as int */
+                    /* Non-File_Type dotted name — treat as int. */
                     if (is_const) add_sym(SK_CONST, TY_INTEGER);
                     else add_sym(SK_VAR, TY_INTEGER);
                     memcpy(sym_name[sym_count-1], vname, vlen);
                     sym_nlen[sym_count-1] = vlen;
-                    emit_indent();
-                    if (is_const) emit("const ");
-                    emit("int ");
-                    emit_str_lower(vname, vlen);
+                    n = new_node(D_VAR_DOTTED);
+                    n_str_off[n] = pool_str(vname, vlen);
+                    n_str_len[n] = vlen;
+                    n_op[n] = is_const;
                     if (tok == TK_ASSIGN) {
-                        emit(" = "); next_token();
-                        parse_expression();
-                    } else {
-                        emit(" = 0");
+                        next_token();
+                        n_left[n] = parse_expression_ast();
                     }
-                    emit_line(";");
                     expect(TK_SEMI);
-                    continue;
+                    return n;
                 }
-                /* Not a dotted type - restore and proceed with normal type parsing */
-                /* We already consumed first_ident and have next token */
-                /* The ident was consumed by next_token, need to handle it */
-                /* Actually we can't easily restore. Let's handle inline. */
-                /* We consumed first_ident via next_token and now tok is whatever follows */
-                /* first_ident was the type name. Look it up. */
+                /* Not dotted — first_ident was the type name. */
                 int tidx2 = find_sym(first_ident, first_len);
                 int typ2 = TY_INTEGER;
                 if (tidx2 >= 0 && sym_kind[tidx2] == SK_TYPE) typ2 = sym_type[tidx2];
@@ -1970,50 +2020,52 @@ static void parse_declarations(void) {
                 else add_sym(SK_VAR, typ2);
                 memcpy(sym_name[sym_count-1], vname, vlen);
                 sym_nlen[sym_count-1] = vlen;
-                emit_indent();
-                if (is_const) emit("const ");
-                emit_c_type(typ2);
-                emit(" ");
-                emit_str_lower(vname, vlen);
+                n = new_node(D_VAR_SIMPLE);
+                n_str_off[n] = pool_str(vname, vlen);
+                n_str_len[n] = vlen;
+                n_int[n] = typ2;
+                n_op[n] = is_const;
                 if (tok == TK_ASSIGN) {
-                    emit(" = "); next_token();
-                    parse_expression();
-                } else {
-                    emit(" = 0");
+                    next_token();
+                    n_left[n] = parse_expression_ast();
                 }
-                emit_line(";");
                 expect(TK_SEMI);
-                continue;
+                return n;
             }
 
-            int typ = parse_type_ref();
-            if (is_const) add_sym(SK_CONST, typ);
-            else add_sym(SK_VAR, typ);
-            /* Update sym name to variable name */
-            memcpy(sym_name[sym_count-1], vname, vlen);
-            sym_nlen[sym_count-1] = vlen;
-
-            emit_indent();
-            if (is_const) emit("const ");
-            emit_c_type(typ);
-            emit(" ");
-            emit_str_lower(vname, vlen);
-
-            if (tok == TK_ASSIGN) {
-                emit(" = "); next_token();
-                parse_expression();
-            } else if (typ == TY_STRING) {
-                emit(" = \"\"");
-            } else {
-                emit(" = 0");
+            /* Generic typed variable (Integer / Character / Boolean keyword). */
+            {
+                int typ = parse_type_ref();
+                if (is_const) add_sym(SK_CONST, typ);
+                else add_sym(SK_VAR, typ);
+                memcpy(sym_name[sym_count-1], vname, vlen);
+                sym_nlen[sym_count-1] = vlen;
+                n = new_node(D_VAR_SIMPLE);
+                n_str_off[n] = pool_str(vname, vlen);
+                n_str_len[n] = vlen;
+                n_int[n] = typ;
+                n_op[n] = is_const;
+                if (tok == TK_ASSIGN) {
+                    next_token();
+                    n_left[n] = parse_expression_ast();
+                }
+                expect(TK_SEMI);
+                return n;
             }
-            emit_line(";");
-            expect(TK_SEMI);
-
-        } else {
-            /* Not a declaration - break out */
-            return;
         }
+
+        /* Not a declaration we recognise — signal "stop". */
+        return 0;
+}
+
+/* Public wrapper: loop, building one declaration's AST at a time,
+   walking it if it's a leaf-decl node, and resetting the pool. */
+static void parse_declarations(void) {
+    while (tok == TK_TYPE || tok == TK_PROCEDURE || tok == TK_FUNCTION
+           || tok == TK_IDENT) {
+        int n = parse_declaration_ast();
+        if (n != 0) emit_declaration_ast(n);
+        reset_ast();
     }
 }
 
