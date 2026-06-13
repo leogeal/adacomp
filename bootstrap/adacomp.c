@@ -532,6 +532,8 @@ static int n_right[MAX_NODES];   /* BINARY rhs, INDEX/INDEX2 index expression */
 static int n_arg2[MAX_NODES];    /* INDEX2 second index, DOTTED sub-name offset */
 static int n_first[MAX_NODES];   /* CALL/DOTTED arg list head */
 static int n_next[MAX_NODES];    /* sibling pointer in arg lists */
+static int n_aux1[MAX_NODES];    /* resolved-at-build scratch: inner subtrahend / el type / had-parens */
+static int n_aux2[MAX_NODES];    /* resolved-at-build scratch: outer dim count */
 static int n_line[MAX_NODES];    /* source line at parse time */
 static int n_count = 1;          /* index 0 reserved; first real allocation at 1 */
 
@@ -556,6 +558,8 @@ static int new_node(int kind) {
     n_arg2[n] = 0;
     n_first[n] = 0;
     n_next[n] = 0;
+    n_aux1[n] = 0;
+    n_aux2[n] = 0;
     n_line[n] = line_num;
     return n;
 }
@@ -749,19 +753,22 @@ static int parse_primary_ast(void) {
                 expect(TK_RPAREN);
                 return n;
             }
-            /* Array indexing. The base name is held in str_off/str_len; the
-               resolved sym index in n_int lets the walker pick up Sym_Arr_Lo
-               and the inner-dim fields without re-looking-up. */
+            /* Array indexing. The base name is held in str_off/str_len.
+               The outer index subtrahend (Ada lower bound, or 1 when the
+               name is unresolved) is resolved here at build time into n_op,
+               and the inner subtrahend into n_aux1, so the walker never
+               reads the symbol table — letting the walk be deferred. */
             next_token();
             n = new_node(A_INDEX);
             n_str_off[n] = pool_str(saved, saved_len);
             n_str_len[n] = saved_len;
-            n_int[n] = sidx;
+            n_op[n] = (sidx >= 0) ? sym_arr_lo[sidx] : 1;
             n_right[n] = parse_expression_ast();
             expect(TK_RPAREN);
             if (tok == TK_LPAREN && sidx >= 0 && sym_arr_inner_hi[sidx] != 0) {
                 next_token();
                 n_kind[n] = A_INDEX2;
+                n_aux1[n] = sym_arr_inner_lo[sidx];
                 n_arg2[n] = parse_expression_ast();
                 expect(TK_RPAREN);
             }
@@ -804,11 +811,13 @@ static int parse_primary_ast(void) {
             return n;
         }
 
-        /* Simple variable, or parameterless function call. */
+        /* Simple variable, or parameterless function call. Whether the
+           trailing "()" is needed is resolved here into n_op so the
+           walker is symbol-table-independent. */
         n = new_node(A_IDENT);
         n_str_off[n] = pool_str(saved, saved_len);
         n_str_len[n] = saved_len;
-        n_int[n] = sidx;
+        n_op[n] = (sidx >= 0 && sym_kind[sidx] == SK_FUNC) ? 1 : 0;
         return n;
     }
     error("expected expression");
@@ -927,8 +936,7 @@ static void emit_expression_ast(int n) {
         emit(n_int[n] ? "1" : "0");
     } else if (kind == A_IDENT) {
         emit_pool_lower(n_str_off[n], n_str_len[n]);
-        int sidx = n_int[n];
-        if (sidx >= 0 && sym_kind[sidx] == SK_FUNC) emit("()");
+        if (n_op[n]) emit("()");   /* resolved paramless-function call */
     } else if (kind == A_UNARY) {
         emit(n_op[n] == OP_NEG ? "-" : "!");
         emit_expression_ast(n_left[n]);
@@ -959,19 +967,16 @@ static void emit_expression_ast(int n) {
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit("[");
         emit_expression_ast(n_right[n]);
-        int sidx = n_int[n];
-        if (sidx >= 0) { emit(" - "); emit_int(sym_arr_lo[sidx]); }
-        else emit(" - 1");
+        emit(" - "); emit_int(n_op[n]);   /* resolved outer subtrahend */
         emit("]");
     } else if (kind == A_INDEX2) {
-        int sidx = n_int[n];
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit("[");
         emit_expression_ast(n_right[n]);
-        emit(" - "); emit_int(sym_arr_lo[sidx]);
+        emit(" - "); emit_int(n_op[n]);    /* resolved outer subtrahend */
         emit("][");
         emit_expression_ast(n_arg2[n]);
-        emit(" - "); emit_int(sym_arr_inner_lo[sidx]);
+        emit(" - "); emit_int(n_aux1[n]);  /* resolved inner subtrahend */
         emit("]");
     } else if (kind == A_CALL) {
         emit_pool_lower(n_str_off[n], n_str_len[n]);
@@ -1121,18 +1126,16 @@ static void emit_statement_ast(int n) {
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit_line("();");
     } else if (kind == S_ARRAY_ASSIGN) {
-        int sidx = n_int[n];
         emit_indent();
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit("[");
         emit_expression_ast(n_right[n]);
-        if (sidx >= 0) { emit(" - "); emit_int(sym_arr_lo[sidx]); }
-        else emit(" - 1");
+        emit(" - "); emit_int(n_op[n]);    /* resolved outer subtrahend */
         emit("]");
         if (n_arg2[n] != 0) {
             emit("[");
             emit_expression_ast(n_arg2[n]);
-            emit(" - "); emit_int(sym_arr_inner_lo[sidx]);
+            emit(" - "); emit_int(n_aux1[n]);  /* resolved inner subtrahend */
             emit("]");
         }
         emit(" = ");
@@ -1337,7 +1340,8 @@ static int parse_statement_ast(void) {
                 n = new_node(S_ARRAY_ASSIGN);
                 n_str_off[n] = pool_str(saved, saved_len);
                 n_str_len[n] = saved_len;
-                n_int[n] = sidx;
+                n_op[n] = sym_arr_lo[sidx];          /* resolved outer subtrahend */
+                n_aux1[n] = sym_arr_inner_lo[sidx];  /* resolved inner subtrahend */
                 n_right[n] = parse_expression_ast();
                 expect(TK_RPAREN);
                 if (tok == TK_LPAREN && sym_arr_inner_hi[sidx] != 0) {
@@ -1556,7 +1560,6 @@ static void emit_declaration_ast(int n) {
     if (n == 0) return;
     int kind = n_kind[n];
     int is_const = n_op[n];
-    int sidx;
 
     if (kind == D_VAR_SIMPLE) {
         emit_indent();
@@ -1574,27 +1577,28 @@ static void emit_declaration_ast(int n) {
         }
         emit_line(";");
     } else if (kind == D_VAR_NAMED_ARRAY) {
-        sidx = n_int[n];
+        /* el type in n_aux1, element count in n_aux2 (resolved at build). */
         emit_indent();
-        emit_c_type(sym_arr_el[sidx]);
+        emit_c_type(n_aux1[n]);
         emit(" ");
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit("[");
-        emit_int(sym_arr_hi[sidx] - sym_arr_lo[sidx] + 1);
+        emit_int(n_aux2[n]);
         emit_line("];");
     } else if (kind == D_VAR_ANON_ARRAY) {
-        sidx = n_int[n];
+        /* el type in n_aux1, outer count in n_aux2, inner count in n_int
+           (0 = not nested), all resolved at build. */
         emit_indent();
         if (is_const) emit("const ");
-        emit_c_type(sym_arr_el[sidx]);
+        emit_c_type(n_aux1[n]);
         emit(" ");
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit("[");
-        emit_int(sym_arr_hi[sidx] - sym_arr_lo[sidx] + 1);
+        emit_int(n_aux2[n]);
         emit("]");
-        if (sym_arr_inner_hi[sidx] != 0) {
+        if (n_int[n] != 0) {
             emit("[");
-            emit_int(sym_arr_inner_hi[sidx] - sym_arr_inner_lo[sidx] + 1);
+            emit_int(n_int[n]);
             emit("]");
         }
         emit_line(";");
@@ -1906,8 +1910,10 @@ static int parse_declaration_ast(void) {
                 n = new_node(D_VAR_ANON_ARRAY);
                 n_str_off[n] = pool_str(vname, vlen);
                 n_str_len[n] = vlen;
-                n_int[n] = sym_count - 1;
                 n_op[n] = is_const;
+                n_aux1[n] = el_type;                          /* resolved element type */
+                n_aux2[n] = hi - lo + 1;                      /* resolved outer count */
+                n_int[n] = is_nested ? (inner_hi - inner_lo + 1) : 0;  /* inner count, 0 if flat */
                 if (tok == TK_ASSIGN) {
                     next_token();
                     /* skip the initializer expression — we always emit {0} */
@@ -1932,8 +1938,9 @@ static int parse_declaration_ast(void) {
                     n = new_node(D_VAR_NAMED_ARRAY);
                     n_str_off[n] = pool_str(vname, vlen);
                     n_str_len[n] = vlen;
-                    n_int[n] = sym_count - 1;
                     n_op[n] = is_const;
+                    n_aux1[n] = sym_arr_el[tidx];                       /* resolved element type */
+                    n_aux2[n] = sym_arr_hi[tidx] - sym_arr_lo[tidx] + 1; /* resolved element count */
                     next_token();
                     if (tok == TK_ASSIGN) {
                         next_token();

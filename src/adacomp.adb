@@ -214,6 +214,8 @@ procedure Adacomp is
    N_Arg2    : Node_Store;  -- INDEX2 second index / DOTTED sub-name offset
    N_First   : Node_Store;  -- arg list head for CALL / DOTTED
    N_Next    : Node_Store;  -- sibling pointer in arg lists
+   N_Aux1    : Node_Store;  -- resolved-at-build scratch: inner subtrahend / el type / had-parens
+   N_Aux2    : Node_Store;  -- resolved-at-build scratch: outer dim count
    N_Line    : Node_Store;
    N_Count   : Integer := 1;  -- index 0 reserved; allocations start at 1
 
@@ -786,6 +788,8 @@ procedure Adacomp is
       N_Arg2 (N) := 0;
       N_First (N) := 0;
       N_Next (N) := 0;
+      N_Aux1 (N) := 0;
+      N_Aux2 (N) := 0;
       N_Line (N) := Line_Num;
       return N;
    end New_Node;
@@ -1057,12 +1061,18 @@ procedure Adacomp is
                Expect (TK_RPAREN);
                return N;
             end if;
-            -- Array indexing, possibly chained for 2D
+            -- Array indexing, possibly chained for 2D. Outer subtrahend
+            -- (lower bound, or 1 when unresolved) resolved here into N_Op
+            -- and inner into N_Aux1, so the walker is symbol-independent.
             Next_Token;
             N := New_Node (A_INDEX);
             N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
             N_Str_Len (N) := Saved_Len;
-            N_Int (N) := Sym_Idx;
+            if Sym_Idx > 0 then
+               N_Op (N) := Sym_Arr_Lo (Sym_Idx);
+            else
+               N_Op (N) := 1;
+            end if;
             N_Right (N) := Parse_Expression_AST;
             Expect (TK_RPAREN);
             if Tok = TK_LPAREN and then Sym_Idx > 0
@@ -1070,6 +1080,7 @@ procedure Adacomp is
             then
                Next_Token;
                N_Kind (N) := A_INDEX2;
+               N_Aux1 (N) := Sym_Arr_Inner_Lo (Sym_Idx);
                N_Arg2 (N) := Parse_Expression_AST;
                Expect (TK_RPAREN);
             end if;
@@ -1125,11 +1136,16 @@ procedure Adacomp is
             end;
          end if;
 
-         -- Simple variable, or parameterless function call.
+         -- Simple variable, or parameterless function call. The trailing
+         -- "()" need is resolved here into N_Op so walk is symbol-free.
          N := New_Node (A_IDENT);
          N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
          N_Str_Len (N) := Saved_Len;
-         N_Int (N) := Sym_Idx;
+         if Sym_Idx > 0 and then Sym_Kind (Sym_Idx) = SK_FUNC then
+            N_Op (N) := 1;
+         else
+            N_Op (N) := 0;
+         end if;
          return N;
       end if;
       Error ("expected expression");
@@ -1255,7 +1271,6 @@ procedure Adacomp is
    procedure Emit_Expression_AST (N : Integer) is
       Kind : Integer;
       C : Character;
-      Sym_Idx : Integer;
       Sub_Off : Integer;
       Sub_Len : Integer;
       A : Integer;
@@ -1297,8 +1312,7 @@ procedure Adacomp is
          end if;
       elsif Kind = A_IDENT then
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
-         Sym_Idx := N_Int (N);
-         if Sym_Idx > 0 and then Sym_Kind (Sym_Idx) = SK_FUNC then
+         if N_Op (N) = 1 then   -- resolved paramless-function call
             Emit ("()");
          end if;
       elsif Kind = A_UNARY then
@@ -1331,23 +1345,16 @@ procedure Adacomp is
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit ("[");
          Emit_Expression_AST (N_Right (N));
-         Sym_Idx := N_Int (N);
-         if Sym_Idx > 0 then
-            Emit (" - ");
-            Emit_Int (Sym_Arr_Lo (Sym_Idx));
-         else
-            Emit (" - 1");
-         end if;
+         Emit (" - "); Emit_Int (N_Op (N));   -- resolved outer subtrahend
          Emit ("]");
       elsif Kind = A_INDEX2 then
-         Sym_Idx := N_Int (N);
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit ("[");
          Emit_Expression_AST (N_Right (N));
-         Emit (" - "); Emit_Int (Sym_Arr_Lo (Sym_Idx));
+         Emit (" - "); Emit_Int (N_Op (N));     -- resolved outer subtrahend
          Emit ("][");
          Emit_Expression_AST (N_Arg2 (N));
-         Emit (" - "); Emit_Int (Sym_Arr_Inner_Lo (Sym_Idx));
+         Emit (" - "); Emit_Int (N_Aux1 (N));   -- resolved inner subtrahend
          Emit ("]");
       elsif Kind = A_CALL then
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
@@ -1435,7 +1442,6 @@ procedure Adacomp is
    -- ---- Statement-AST walker (leaf statements only) ----
    procedure Emit_Statement_AST (N : Integer) is
       Kind : Integer;
-      Sym_Idx : Integer;
       A : Integer;
       First : Boolean;
    begin
@@ -1489,23 +1495,17 @@ procedure Adacomp is
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit_Ln ("();");
       elsif Kind = S_ARRAY_ASSIGN then
-         Sym_Idx := N_Int (N);
          Emit_Indent;
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit ("[");
          Emit_Expression_AST (N_Right (N));
-         if Sym_Idx > 0 then
-            Emit (" - ");
-            Emit_Int (Sym_Arr_Lo (Sym_Idx));
-         else
-            Emit (" - 1");
-         end if;
+         Emit (" - "); Emit_Int (N_Op (N));    -- resolved outer subtrahend
          Emit ("]");
          if N_Arg2 (N) /= 0 then
             Emit ("[");
             Emit_Expression_AST (N_Arg2 (N));
             Emit (" - ");
-            Emit_Int (Sym_Arr_Inner_Lo (Sym_Idx));
+            Emit_Int (N_Aux1 (N));             -- resolved inner subtrahend
             Emit ("]");
          end if;
          Emit (" = ");
@@ -1743,7 +1743,8 @@ procedure Adacomp is
                N := New_Node (S_ARRAY_ASSIGN);
                N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
                N_Str_Len (N) := Saved_Len;
-               N_Int (N) := Sym_Idx;
+               N_Op (N) := Sym_Arr_Lo (Sym_Idx);         -- resolved outer subtrahend
+               N_Aux1 (N) := Sym_Arr_Inner_Lo (Sym_Idx); -- resolved inner subtrahend
                N_Right (N) := Parse_Expression_AST;
                Expect (TK_RPAREN);
                if Tok = TK_LPAREN and then Sym_Arr_Inner_Hi (Sym_Idx) /= 0 then
@@ -1951,7 +1952,6 @@ procedure Adacomp is
    procedure Emit_Declaration_AST (N : Integer) is
       Kind : Integer;
       Is_Const : Integer;
-      Sidx : Integer;
    begin
       if N = 0 then return; end if;
       Kind := N_Kind (N);
@@ -1973,27 +1973,28 @@ procedure Adacomp is
          end if;
          Emit_Ln (";");
       elsif Kind = D_VAR_NAMED_ARRAY then
-         Sidx := N_Int (N);
+         -- el type in N_Aux1, element count in N_Aux2 (resolved at build).
          Emit_Indent;
-         Emit_C_Type (Sym_Arr_El (Sidx));
+         Emit_C_Type (N_Aux1 (N));
          Emit (" ");
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit ("[");
-         Emit_Int (Sym_Arr_Hi (Sidx) - Sym_Arr_Lo (Sidx) + 1);
+         Emit_Int (N_Aux2 (N));
          Emit_Ln ("];");
       elsif Kind = D_VAR_ANON_ARRAY then
-         Sidx := N_Int (N);
+         -- el type in N_Aux1, outer count in N_Aux2, inner count in N_Int
+         -- (0 = flat), all resolved at build.
          Emit_Indent;
          if Is_Const = 1 then Emit ("const "); end if;
-         Emit_C_Type (Sym_Arr_El (Sidx));
+         Emit_C_Type (N_Aux1 (N));
          Emit (" ");
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit ("[");
-         Emit_Int (Sym_Arr_Hi (Sidx) - Sym_Arr_Lo (Sidx) + 1);
+         Emit_Int (N_Aux2 (N));
          Emit ("]");
-         if Sym_Arr_Inner_Hi (Sidx) /= 0 then
+         if N_Int (N) /= 0 then
             Emit ("[");
-            Emit_Int (Sym_Arr_Inner_Hi (Sidx) - Sym_Arr_Inner_Lo (Sidx) + 1);
+            Emit_Int (N_Int (N));
             Emit ("]");
          end if;
          Emit_Ln (";");
@@ -2338,8 +2339,14 @@ procedure Adacomp is
                   N := New_Node (D_VAR_ANON_ARRAY);
                   N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
                   N_Str_Len (N) := Var_Len;
-                  N_Int (N) := Sym_Count;
                   if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
+                  N_Aux1 (N) := El_Type;          -- resolved element type
+                  N_Aux2 (N) := Hi - Lo + 1;      -- resolved outer count
+                  if Is_Nested then               -- inner count, 0 if flat
+                     N_Int (N) := Inner_Hi - Inner_Lo + 1;
+                  else
+                     N_Int (N) := 0;
+                  end if;
                   if Tok = TK_ASSIGN then
                      Next_Token;
                      while Tok /= TK_SEMI and Tok /= TK_EOF loop
@@ -2369,8 +2376,9 @@ procedure Adacomp is
                      N := New_Node (D_VAR_NAMED_ARRAY);
                      N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
                      N_Str_Len (N) := Var_Len;
-                     N_Int (N) := Sym_Count;
                      if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
+                     N_Aux1 (N) := Sym_Arr_El (Tidx);  -- resolved element type
+                     N_Aux2 (N) := Sym_Arr_Hi (Tidx) - Sym_Arr_Lo (Tidx) + 1;
                      Next_Token;
                      if Tok = TK_ASSIGN then
                         Next_Token;
