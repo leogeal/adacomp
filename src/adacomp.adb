@@ -80,6 +80,10 @@ procedure Adacomp is
    TK_STRING    : constant Integer := 70;
    TK_REVERSE   : constant Integer := 71;
    TK_TICK      : constant Integer := 72;
+   TK_ACCESS    : constant Integer := 73;
+   TK_NEW       : constant Integer := 74;
+   TK_RANGE     : constant Integer := 75;
+   TK_BOX       : constant Integer := 76;
 
    -- Current token
    type Tok_Buffer is array (1 .. 4096) of Character;
@@ -102,6 +106,7 @@ procedure Adacomp is
    TY_BOOLEAN   : constant Integer := 3;
    TY_ARRAY     : constant Integer := 4;
    TY_STRING    : constant Integer := 5;
+   TY_ACCESS    : constant Integer := 6;
 
    -- Symbol table (flat arrays)
    type Int_Store is array (1 .. 2000) of Integer;
@@ -155,6 +160,7 @@ procedure Adacomp is
    A_DOTTED    : constant Integer := 11;
    A_ATTR_TYPE : constant Integer := 12;
    A_ATTR_VAR  : constant Integer := 13;
+   A_NEW       : constant Integer := 14;
 
    -- Operator codes (for UNARY / BINARY)
    OP_ADD : constant Integer := 1;
@@ -222,6 +228,7 @@ procedure Adacomp is
    D_VAR_STRING      : constant Integer := 33;
    D_VAR_FILE        : constant Integer := 34;
    D_VAR_DOTTED      : constant Integer := 35;
+   D_VAR_ACCESS      : constant Integer := 36;
 
    -- Node storage as parallel arrays
    type Node_Store is array (1 .. 10000) of Integer;
@@ -367,6 +374,9 @@ procedure Adacomp is
       if Tok_Eq_CI ("type") then return TK_TYPE; end if;
       if Tok_Eq_CI ("array") then return TK_ARRAY; end if;
       if Tok_Eq_CI ("of") then return TK_OF; end if;
+      if Tok_Eq_CI ("access") then return TK_ACCESS; end if;
+      if Tok_Eq_CI ("new") then return TK_NEW; end if;
+      if Tok_Eq_CI ("range") then return TK_RANGE; end if;
       if Tok_Eq_CI ("not") then return TK_NOT; end if;
       if Tok_Eq_CI ("and") then return TK_AND; end if;
       if Tok_Eq_CI ("or") then return TK_OR; end if;
@@ -489,6 +499,8 @@ procedure Adacomp is
          elsif C = '<' then
             if Src_Pos <= Src_Len and then Peek = '=' then
                Advance; Tok := TK_LE;
+            elsif Src_Pos <= Src_Len and then Peek = '>' then
+               Advance; Tok := TK_BOX;
             else
                Tok := TK_LT;
             end if;
@@ -984,6 +996,33 @@ procedure Adacomp is
          N_Left (N) := Parse_Primary_AST;
          return N;
       end if;
+      if Tok = TK_NEW then
+         -- Allocator: `new <ArrayType> (lo .. hi)`. Element type (for
+         -- sizeof) in N_Op; bound expressions in N_Left / N_Right.
+         declare
+            El : Integer := TY_INTEGER;
+            Ti : Integer;
+         begin
+            Next_Token;
+            if Tok = TK_IDENT then
+               Ti := Find_Sym (Tok_Val, Tok_Len);
+               if Ti > 0 and then Sym_Kind (Ti) = SK_TYPE then
+                  El := Sym_Arr_El (Ti);
+               end if;
+               Next_Token;
+            else
+               El := Parse_Type_Ref;
+            end if;
+            N := New_Node (A_NEW);
+            N_Op (N) := El;
+            Expect (TK_LPAREN);
+            N_Left (N) := Parse_Expression_AST;
+            Expect (TK_DOTDOT);
+            N_Right (N) := Parse_Expression_AST;
+            Expect (TK_RPAREN);
+            return N;
+         end;
+      end if;
       if Tok = TK_LPAREN then
          -- Parens contribute no node; the inner expression carries through.
          Next_Token;
@@ -1414,6 +1453,15 @@ procedure Adacomp is
          elsif N_Op (N) = ATTR_FIRST then
             Emit ("1");
          end if;
+      elsif Kind = A_NEW then
+         -- new T (lo..hi) -> malloc(((hi) - (lo) + 1) * sizeof(T))
+         Emit ("malloc((");
+         Emit_Expression_AST (N_Right (N));
+         Emit (" - ");
+         Emit_Expression_AST (N_Left (N));
+         Emit (" + 1) * sizeof(");
+         Emit_C_Type (N_Op (N));
+         Emit ("))");
       elsif Kind = A_DOTTED then
          Sub_Off := N_Arg2 (N);
          Sub_Len := N_Int (N);
@@ -2193,6 +2241,20 @@ procedure Adacomp is
          Emit ("FILE *");
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit_Ln (" = NULL;");
+      elsif Kind = D_VAR_ACCESS then
+         -- Elem *name [= <new ...>]; (default NULL)
+         Emit_Indent;
+         if Is_Const = 1 then Emit ("const "); end if;
+         Emit_C_Type (N_Aux1 (N));
+         Emit (" *");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         if N_Left (N) /= 0 then
+            Emit (" = ");
+            Emit_Expression_AST (N_Left (N));
+         else
+            Emit (" = NULL");
+         end if;
+         Emit_Ln (";");
       elsif Kind = D_VAR_DOTTED then
          Emit_Indent;
          if Is_Const = 1 then Emit ("const "); end if;
@@ -2227,27 +2289,67 @@ procedure Adacomp is
          if Tok = TK_ARRAY then
             Next_Token;
             Expect (TK_LPAREN);
-            declare
-               Lo : Integer := 0;
-               Hi : Integer := 0;
-               El : Integer;
-            begin
-               if Tok = TK_INT_LIT then Lo := Tok_Int; end if;
-               Next_Token;
-               Expect (TK_DOTDOT);
-               if Tok = TK_INT_LIT then Hi := Tok_Int; end if;
-               Next_Token;
-               if Tok = TK_COMMA then
+            if Tok = TK_INTEGER or Tok = TK_CHARACTER or Tok = TK_BOOLEAN then
+               -- Unconstrained: `array (Index range <>) of Elem`. hi=0
+               -- marks "no fixed size"; only used as an access target.
+               declare
+                  El : Integer;
+               begin
                   Next_Token;
-                  if Tok = TK_INT_LIT then Next_Token; end if;
+                  Expect (TK_RANGE);
+                  Expect (TK_BOX);
+                  Expect (TK_RPAREN);
+                  Expect (TK_OF);
+                  El := Parse_Type_Ref;
+                  Sym_Arr_Lo (Sym_Count) := 1;
+                  Sym_Arr_Hi (Sym_Count) := 0;
+                  Sym_Arr_El (Sym_Count) := El;
+               end;
+            else
+               declare
+                  Lo : Integer := 0;
+                  Hi : Integer := 0;
+                  El : Integer;
+               begin
+                  if Tok = TK_INT_LIT then Lo := Tok_Int; end if;
+                  Next_Token;
                   Expect (TK_DOTDOT);
-                  if Tok = TK_INT_LIT then Next_Token; end if;
+                  if Tok = TK_INT_LIT then Hi := Tok_Int; end if;
+                  Next_Token;
+                  if Tok = TK_COMMA then
+                     Next_Token;
+                     if Tok = TK_INT_LIT then Next_Token; end if;
+                     Expect (TK_DOTDOT);
+                     if Tok = TK_INT_LIT then Next_Token; end if;
+                  end if;
+                  Expect (TK_RPAREN);
+                  Expect (TK_OF);
+                  El := Parse_Type_Ref;
+                  Sym_Arr_Lo (Sym_Count) := Lo;
+                  Sym_Arr_Hi (Sym_Count) := Hi;
+                  Sym_Arr_El (Sym_Count) := El;
+               end;
+            end if;
+         elsif Tok = TK_ACCESS then
+            -- `access <ArrayTypeName>` or `access <ScalarType>`: a pointer
+            -- to its element type.
+            declare
+               El : Integer := TY_INTEGER;
+               Ti : Integer;
+            begin
+               Next_Token;
+               if Tok = TK_IDENT then
+                  Ti := Find_Sym (Tok_Val, Tok_Len);
+                  if Ti > 0 and then Sym_Kind (Ti) = SK_TYPE then
+                     El := Sym_Arr_El (Ti);
+                  end if;
+                  Next_Token;
+               else
+                  El := Parse_Type_Ref;
                end if;
-               Expect (TK_RPAREN);
-               Expect (TK_OF);
-               El := Parse_Type_Ref;
-               Sym_Arr_Lo (Sym_Count) := Lo;
-               Sym_Arr_Hi (Sym_Count) := Hi;
+               Sym_Type (Sym_Count) := TY_ACCESS;
+               Sym_Arr_Lo (Sym_Count) := 1;
+               Sym_Arr_Hi (Sym_Count) := 0;
                Sym_Arr_El (Sym_Count) := El;
             end;
          else
@@ -2564,6 +2666,41 @@ procedure Adacomp is
                         while Tok /= TK_SEMI and Tok /= TK_EOF loop
                            Next_Token;
                         end loop;
+                     end if;
+                     Expect (TK_SEMI);
+                     return N;
+                  end if;
+               end;
+            end if;
+
+            -- Access-typed variable: registered as an indexable pointer
+            -- (TY_ARRAY, lo=1, no fixed size) so the array index / assign
+            -- machinery applies; only the declaration differs.
+            if Tok = TK_IDENT then
+               declare
+                  Tidx : Integer;
+                  El   : Integer;
+               begin
+                  Tidx := Find_Sym (Tok_Val, Tok_Len);
+                  if Tidx > 0 and then Sym_Kind (Tidx) = SK_TYPE and then Sym_Type (Tidx) = TY_ACCESS then
+                     El := Sym_Arr_El (Tidx);
+                     if Is_Const then
+                        Add_Sym_Named (Var_Name, Var_Len, SK_CONST, TY_ARRAY);
+                     else
+                        Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_ARRAY);
+                     end if;
+                     Sym_Arr_Lo (Sym_Count) := 1;
+                     Sym_Arr_Hi (Sym_Count) := 0;
+                     Sym_Arr_El (Sym_Count) := El;
+                     N := New_Node (D_VAR_ACCESS);
+                     N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
+                     N_Str_Len (N) := Var_Len;
+                     if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
+                     N_Aux1 (N) := El;            -- element type for `Elem *`
+                     Next_Token;
+                     if Tok = TK_ASSIGN then
+                        Next_Token;
+                        N_Left (N) := Parse_Expression_AST;   -- e.g. new ...
                      end if;
                      Expect (TK_SEMI);
                      return N;

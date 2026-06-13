@@ -318,7 +318,23 @@ In progress.
   proc/func decls drive the recursion rather than being nodes — which
   is why their bodies, not the decls themselves, are the trees.)
 - [ ] Replace fixed-size buffers (source, token, name pool, symbol
-  table) with dynamic growth. *Next concrete item.*
+  table) with dynamic growth. **In progress** — true dynamic growth in
+  the *self-hosted* compiler needs heap allocation, which the subset
+  lacked, so this was split:
+  - [x] **Buffers/1: access types.** Added a minimal, C-mappable
+    access-type subset to both compilers — unconstrained array types
+    (`array (Integer range <>) of E`), access types (`type P is access
+    A`), access-typed variables (`Elem *p = NULL;`), and the `new T
+    (lo..hi)` allocator (`malloc((hi-lo+1)*sizeof(E))`). An access-to-
+    array variable reuses the existing array index/assign machinery
+    (it's a 1-based pointer), so only declaration and allocation are
+    new. Fixture `access_types.adb` builds a growable buffer; the
+    self-hosted stage1 compiles it with byte-identical codegen to the
+    bootstrap. adacomp.adb does not use the feature yet, so self-hosting
+    stays byte-identical. 16/16 fixtures under both compilers.
+  - [ ] **Buffers/2: use it.** Convert adacomp.adb's own fixed buffers
+    (source, token, name pool, symbol table, AST node store) to
+    access-typed, grown on demand. *Next concrete item.*
 - [ ] Real diagnostics: source locations on every token, error
   recovery, multi-error reports.
 - [x] Test infrastructure: per-feature `.adb` fixtures with expected

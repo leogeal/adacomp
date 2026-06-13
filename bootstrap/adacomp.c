@@ -38,7 +38,8 @@ enum {
     TK_CONSTANT=59, TK_EXIT=60, TK_WHEN=61, TK_USE=62,
     TK_INTEGER=63, TK_CHARACTER=64, TK_BOOLEAN=65,
     TK_TRUE=66, TK_FALSE=67, TK_DECLARE=68, TK_RAISE=69,
-    TK_STRING=70, TK_REVERSE=71, TK_TICK=72
+    TK_STRING=70, TK_REVERSE=71, TK_TICK=72,
+    TK_ACCESS=73, TK_NEW=74, TK_RANGE=75, TK_BOX=76
 };
 
 /* Current token */
@@ -51,7 +52,8 @@ static int tok_int = 0;
 enum { SK_VAR=1, SK_CONST=2, SK_PARAM=3, SK_PROC=4, SK_FUNC=5, SK_TYPE=6 };
 
 /* Type kinds */
-enum { TY_INTEGER=1, TY_CHARACTER=2, TY_BOOLEAN=3, TY_ARRAY=4, TY_STRING=5 };
+enum { TY_INTEGER=1, TY_CHARACTER=2, TY_BOOLEAN=3, TY_ARRAY=4, TY_STRING=5,
+       TY_ACCESS=6 };
 
 /* Symbol table */
 static char sym_name[MAX_SYMS][MAX_NAME];
@@ -166,6 +168,9 @@ static int check_keyword(void) {
     if (tok_eq_ci("type")) return TK_TYPE;
     if (tok_eq_ci("array")) return TK_ARRAY;
     if (tok_eq_ci("of")) return TK_OF;
+    if (tok_eq_ci("access")) return TK_ACCESS;
+    if (tok_eq_ci("new")) return TK_NEW;
+    if (tok_eq_ci("range")) return TK_RANGE;
     if (tok_eq_ci("not")) return TK_NOT;
     if (tok_eq_ci("and")) return TK_AND;
     if (tok_eq_ci("or")) return TK_OR;
@@ -296,6 +301,7 @@ static void next_token(void) {
             break;
         case '<':
             if (src_pos < src_len && peek()=='=') { advance(); tok=TK_LE; }
+            else if (src_pos < src_len && peek()=='>') { advance(); tok=TK_BOX; }
             else tok=TK_LT;
             break;
         case '>':
@@ -493,7 +499,7 @@ enum {
     A_UNARY=6, A_BINARY=7,
     A_INDEX=8, A_INDEX2=9,
     A_CALL=10, A_DOTTED=11,
-    A_ATTR_TYPE=12, A_ATTR_VAR=13,
+    A_ATTR_TYPE=12, A_ATTR_VAR=13, A_NEW=14,
     /* Statement leaf nodes. Compound (if/while/for/loop/declare/begin) and
        dotted-package statements still emit directly; they'll become full
        AST nodes once declarations are AST-driven (step 4). */
@@ -512,7 +518,8 @@ enum {
     D_VAR_ANON_ARRAY=32,   /* X : array (lo..hi) of T; */
     D_VAR_STRING=33,       /* X : String [:= expr]; */
     D_VAR_FILE=34,         /* X : Ada.Text_IO.File_Type; */
-    D_VAR_DOTTED=35        /* X : Some.Other.Dotted_Type [:= expr]; (treated as int) */
+    D_VAR_DOTTED=35,       /* X : Some.Other.Dotted_Type [:= expr]; (treated as int) */
+    D_VAR_ACCESS=36        /* X : Some_Access_Type [:= expr]; -> Elem *x = NULL; */
 };
 
 enum {
@@ -693,6 +700,28 @@ static int parse_primary_ast(void) {
         n = new_node(A_UNARY);
         n_op[n] = OP_NEG;
         n_left[n] = parse_primary_ast();
+        return n;
+    }
+    if (tok == TK_NEW) {
+        /* Allocator: `new <ArrayType> (lo .. hi)` -> malloc of that many
+           elements. Element type (for sizeof) in n_op; bound expressions
+           in n_left (lo) and n_right (hi). */
+        next_token();
+        int el = TY_INTEGER;
+        if (tok == TK_IDENT) {
+            int ti = find_sym(tok_val, tok_len);
+            if (ti >= 0 && sym_kind[ti] == SK_TYPE) el = sym_arr_el[ti];
+            next_token();
+        } else {
+            el = parse_type_ref();
+        }
+        n = new_node(A_NEW);
+        n_op[n] = el;
+        expect(TK_LPAREN);
+        n_left[n] = parse_expression_ast();
+        expect(TK_DOTDOT);
+        n_right[n] = parse_expression_ast();
+        expect(TK_RPAREN);
         return n;
     }
     if (tok == TK_LPAREN) {
@@ -1026,6 +1055,15 @@ static void emit_expression_ast(int n) {
         } else if (n_op[n] == ATTR_FIRST) {
             emit("1");
         }
+    } else if (kind == A_NEW) {
+        /* new T (lo..hi) -> malloc(((hi) - (lo) + 1) * sizeof(T)) */
+        emit("malloc((");
+        emit_expression_ast(n_right[n]);
+        emit(" - ");
+        emit_expression_ast(n_left[n]);
+        emit(" + 1) * sizeof(");
+        emit_c_type(n_op[n]);
+        emit("))");
     } else if (kind == A_DOTTED) {
         int sub_off = n_arg2[n];
         int sub_len = n_int[n];
@@ -1731,6 +1769,20 @@ static void emit_declaration_ast(int n) {
         emit("FILE *");
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit_line(" = NULL;");
+    } else if (kind == D_VAR_ACCESS) {
+        /* Elem *name [= <new ...>]; (default NULL) */
+        emit_indent();
+        if (is_const) emit("const ");
+        emit_c_type(n_aux1[n]);
+        emit(" *");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        if (n_left[n] != 0) {
+            emit(" = ");
+            emit_expression_ast(n_left[n]);
+        } else {
+            emit(" = NULL");
+        }
+        emit_line(";");
     } else if (kind == D_VAR_DOTTED) {
         emit_indent();
         if (is_const) emit("const ");
@@ -1761,30 +1813,61 @@ static int parse_declaration_ast(void) {
         if (tok == TK_ARRAY) {
             next_token();
             expect(TK_LPAREN);
-            int lo = tok_int; next_token();
-            expect(TK_DOTDOT);
-            int hi = tok_int; next_token();
-            if (tok == TK_COMMA) {
-                /* 2D form (1..N, 1..M) — second dim parsed but not
-                   tracked separately. */
+            if (tok == TK_INTEGER || tok == TK_CHARACTER || tok == TK_BOOLEAN) {
+                /* Unconstrained: `array (Index range <>) of Elem`. The
+                   hi=0 marker says "no fixed size"; such a type is only
+                   used as the target of an access type. */
                 next_token();
-                next_token();
-                expect(TK_DOTDOT);
-                next_token();
+                expect(TK_RANGE);
+                expect(TK_BOX);
                 expect(TK_RPAREN);
                 expect(TK_OF);
                 int el = parse_type_ref();
-                sym_arr_lo[sym_count-1] = lo;
-                sym_arr_hi[sym_count-1] = hi;
+                sym_arr_lo[sym_count-1] = 1;
+                sym_arr_hi[sym_count-1] = 0;
                 sym_arr_el[sym_count-1] = el;
             } else {
-                expect(TK_RPAREN);
-                expect(TK_OF);
-                int el = parse_type_ref();
-                sym_arr_lo[sym_count-1] = lo;
-                sym_arr_hi[sym_count-1] = hi;
-                sym_arr_el[sym_count-1] = el;
+                int lo = tok_int; next_token();
+                expect(TK_DOTDOT);
+                int hi = tok_int; next_token();
+                if (tok == TK_COMMA) {
+                    /* 2D form (1..N, 1..M) — second dim parsed but not
+                       tracked separately. */
+                    next_token();
+                    next_token();
+                    expect(TK_DOTDOT);
+                    next_token();
+                    expect(TK_RPAREN);
+                    expect(TK_OF);
+                    int el = parse_type_ref();
+                    sym_arr_lo[sym_count-1] = lo;
+                    sym_arr_hi[sym_count-1] = hi;
+                    sym_arr_el[sym_count-1] = el;
+                } else {
+                    expect(TK_RPAREN);
+                    expect(TK_OF);
+                    int el = parse_type_ref();
+                    sym_arr_lo[sym_count-1] = lo;
+                    sym_arr_hi[sym_count-1] = hi;
+                    sym_arr_el[sym_count-1] = el;
+                }
             }
+        } else if (tok == TK_ACCESS) {
+            /* `access <ArrayTypeName>` or `access <ScalarType>`. Modelled
+               as a pointer to its element type. */
+            next_token();
+            int el = TY_INTEGER;
+            if (tok == TK_IDENT) {
+                int ti = find_sym(tok_val, tok_len);
+                if (ti >= 0 && sym_kind[ti] == SK_TYPE) el = sym_arr_el[ti];
+                next_token();
+            } else {
+                el = parse_type_ref();
+            }
+            sym_type[sym_count-1] = TY_ACCESS;
+            sym_arr_lo[sym_count-1] = 1;
+            sym_arr_hi[sym_count-1] = 0;
+            sym_arr_el[sym_count-1] = el;
         } else {
             while (tok != TK_SEMI && tok != TK_EOF) next_token();
         }
@@ -2058,6 +2141,37 @@ static int parse_declaration_ast(void) {
                     if (tok == TK_ASSIGN) {
                         next_token();
                         while (tok != TK_SEMI && tok != TK_EOF) next_token();
+                    }
+                    expect(TK_SEMI);
+                    return n;
+                }
+            }
+
+            /* Access-typed variable: Name : Some_Access_Type [:= expr];
+               Registered as an indexable pointer (TY_ARRAY, lo=1, no fixed
+               size) so the existing array index / assign machinery applies;
+               only the declaration differs (`Elem *name = NULL;`). */
+            if (tok == TK_IDENT) {
+                int tidx = find_sym(tok_val, tok_len);
+                if (tidx >= 0 && sym_kind[tidx] == SK_TYPE && sym_type[tidx] == TY_ACCESS) {
+                    int el = sym_arr_el[tidx];
+                    if (is_const) add_sym(SK_CONST, TY_ARRAY);
+                    else add_sym(SK_VAR, TY_ARRAY);
+                    sym_arr_lo[sym_count-1] = 1;
+                    sym_arr_hi[sym_count-1] = 0;
+                    sym_arr_el[sym_count-1] = el;
+                    memcpy(sym_name[sym_count-1], vname, vlen);
+                    sym_nlen[sym_count-1] = vlen;
+
+                    n = new_node(D_VAR_ACCESS);
+                    n_str_off[n] = pool_str(vname, vlen);
+                    n_str_len[n] = vlen;
+                    n_op[n] = is_const;
+                    n_aux1[n] = el;                /* element type for `Elem *` */
+                    next_token();
+                    if (tok == TK_ASSIGN) {
+                        next_token();
+                        n_left[n] = parse_expression_ast();   /* e.g. new ... */
                     }
                     expect(TK_SEMI);
                     return n;
