@@ -181,9 +181,7 @@ procedure Adacomp is
    ATTR_FIRST  : constant Integer := 5;
    ATTR_LAST   : constant Integer := 6;
 
-   -- Statement-leaf AST node kinds. Compound (if/while/for/loop/declare/
-   -- begin) and dotted-package calls still emit directly during parse;
-   -- they'll become full AST nodes once declarations are AST-driven.
+   -- Statement-leaf AST node kinds.
    S_NULL         : constant Integer := 20;
    S_RETURN       : constant Integer := 21;
    S_RAISE        : constant Integer := 22;
@@ -192,6 +190,29 @@ procedure Adacomp is
    S_CALL         : constant Integer := 25;
    S_PARAMLESS    : constant Integer := 26;
    S_ARRAY_ASSIGN : constant Integer := 27;
+
+   -- Compound statements and dotted package calls (Pass B.2): full
+   -- subtree nodes, so a program unit's body is one tree walked after
+   -- the unit is fully parsed.
+   S_IF      : constant Integer := 40;
+   S_ELSIF   : constant Integer := 41;
+   S_WHILE   : constant Integer := 42;
+   S_LOOP    : constant Integer := 43;
+   S_FOR     : constant Integer := 44;
+   S_DECLARE : constant Integer := 45;
+   S_BLOCK   : constant Integer := 46;
+   S_PKG     : constant Integer := 47;
+
+   -- Sub-ops for S_PKG (dotted Ada.Text_IO.* statement calls).
+   PKG_PUT_LINE : constant Integer := 1;
+   PKG_PUT      : constant Integer := 2;
+   PKG_NEW_LINE : constant Integer := 3;
+   PKG_OPEN     : constant Integer := 4;
+   PKG_CREATE   : constant Integer := 5;
+   PKG_CLOSE    : constant Integer := 6;
+   PKG_GET_LINE : constant Integer := 7;
+   PKG_GET      : constant Integer := 8;
+   PKG_GENERIC  : constant Integer := 9;
 
    -- Variable-declaration leaf nodes. Type definitions and procedure /
    -- function declarations still direct-emit during parse and return 0.
@@ -827,7 +848,6 @@ procedure Adacomp is
 
    -- Forward declarations
    procedure Parse_Expression;
-   procedure Parse_Statement;
    procedure Parse_Statements;
    procedure Parse_Declarations;
    function  Parse_Expression_AST return Integer;
@@ -836,7 +856,11 @@ procedure Adacomp is
    function  Parse_Factor_AST return Integer;
    function  Parse_Primary_AST return Integer;
    function  Parse_Statement_AST return Integer;
+   function  Parse_Statement_Chain return Integer;
+   procedure Emit_Statement_Chain (Head : Integer);
    function  Parse_Declaration_AST return Integer;
+   function  Parse_Var_Decl_Chain return Integer;
+   procedure Emit_Declaration_Chain (Head : Integer);
    procedure Emit_Expression_AST (N : Integer);
    procedure Emit_Statement_AST (N : Integer);
    procedure Emit_Declaration_AST (N : Integer);
@@ -1439,10 +1463,12 @@ procedure Adacomp is
       Reset_AST;
    end Parse_Expression;
 
-   -- ---- Statement-AST walker (leaf statements only) ----
+   -- ---- Statement-AST walker (leaf and compound) ----
    procedure Emit_Statement_AST (N : Integer) is
       Kind : Integer;
       A : Integer;
+      E : Integer;
+      Sub : Integer;
       First : Boolean;
    begin
       if N = 0 then return; end if;
@@ -1511,6 +1537,179 @@ procedure Adacomp is
          Emit (" = ");
          Emit_Expression_AST (N_First (N));
          Emit_Ln (";");
+      elsif Kind = S_IF then
+         Emit_Indent; Emit ("if (");
+         Emit_Expression_AST (N_Left (N));
+         Emit_Ln (") {");
+         Indent_Level := Indent_Level + 1;
+         Emit_Statement_Chain (N_First (N));
+         Indent_Level := Indent_Level - 1;
+         E := N_Right (N);
+         while E /= 0 loop
+            Emit_Indent; Emit ("} else if (");
+            Emit_Expression_AST (N_Left (E));
+            Emit_Ln (") {");
+            Indent_Level := Indent_Level + 1;
+            Emit_Statement_Chain (N_First (E));
+            Indent_Level := Indent_Level - 1;
+            E := N_Next (E);
+         end loop;
+         if N_Arg2 (N) /= 0 then
+            Emit_Indent; Emit_Ln ("} else {");
+            Indent_Level := Indent_Level + 1;
+            Emit_Statement_Chain (N_Arg2 (N));
+            Indent_Level := Indent_Level - 1;
+         end if;
+         Emit_Indent; Emit_Ln ("}");
+      elsif Kind = S_WHILE then
+         Emit_Indent; Emit ("while (");
+         Emit_Expression_AST (N_Left (N));
+         Emit_Ln (") {");
+         Indent_Level := Indent_Level + 1;
+         Emit_Statement_Chain (N_First (N));
+         Indent_Level := Indent_Level - 1;
+         Emit_Indent; Emit_Ln ("}");
+      elsif Kind = S_LOOP then
+         Emit_Indent; Emit_Ln ("while (1) {");
+         Indent_Level := Indent_Level + 1;
+         Emit_Statement_Chain (N_First (N));
+         Indent_Level := Indent_Level - 1;
+         Emit_Indent; Emit_Ln ("}");
+      elsif Kind = S_FOR then
+         Emit_Indent;
+         if N_Op (N) = 1 then
+            Emit ("{ int __lo = ");
+            Emit_Expression_AST (N_Left (N));
+            Emit ("; int __hi = ");
+            Emit_Expression_AST (N_Right (N));
+            Emit ("; for (int ");
+            Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            Emit (" = __hi; ");
+            Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            Emit (" >= __lo; ");
+            Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            Emit_Ln ("--) {");
+         else
+            Emit ("for (int ");
+            Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            Emit (" = ");
+            Emit_Expression_AST (N_Left (N));
+            Emit ("; ");
+            Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            Emit (" <= ");
+            Emit_Expression_AST (N_Right (N));
+            Emit ("; ");
+            Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            Emit_Ln ("++) {");
+         end if;
+         Indent_Level := Indent_Level + 1;
+         Emit_Statement_Chain (N_First (N));
+         Indent_Level := Indent_Level - 1;
+         Emit_Indent;
+         if N_Op (N) = 1 then
+            Emit_Ln ("} }");
+         else
+            Emit_Ln ("}");
+         end if;
+      elsif Kind = S_DECLARE then
+         Emit_Indent; Emit_Ln ("{");
+         Indent_Level := Indent_Level + 1;
+         Emit_Declaration_Chain (N_First (N));
+         Emit_Statement_Chain (N_Arg2 (N));
+         Indent_Level := Indent_Level - 1;
+         Emit_Indent; Emit_Ln ("}");
+      elsif Kind = S_BLOCK then
+         Emit_Indent; Emit_Ln ("{");
+         Indent_Level := Indent_Level + 1;
+         Emit_Statement_Chain (N_First (N));
+         Indent_Level := Indent_Level - 1;
+         Emit_Indent; Emit_Ln ("}");
+      elsif Kind = S_PKG then
+         Sub := N_Op (N);
+         Emit_Indent;
+         if Sub = PKG_PUT_LINE then
+            if N_Right (N) /= 0 then
+               Emit ("ada_fput_line(");
+               Emit_Expression_AST (N_Left (N));
+               Emit (", ");
+               Emit_Expression_AST (N_Right (N));
+            else
+               Emit ("ada_put_line(");
+               Emit_Expression_AST (N_Left (N));
+            end if;
+            Emit_Ln (");");
+         elsif Sub = PKG_PUT then
+            if N_Right (N) /= 0 then
+               if N_Aux1 (N) = 1 then
+                  Emit ("ada_fput_char(");
+               else
+                  Emit ("ada_fput_str(");
+               end if;
+               Emit_Expression_AST (N_Left (N));
+               Emit (", ");
+               Emit_Expression_AST (N_Right (N));
+            else
+               Emit ("ada_put_str(");
+               Emit_Expression_AST (N_Left (N));
+            end if;
+            Emit_Ln (");");
+         elsif Sub = PKG_NEW_LINE then
+            if N_Left (N) /= 0 then
+               Emit ("ada_fput_newline(");
+               Emit_Expression_AST (N_Left (N));
+               Emit_Ln (");");
+            else
+               Emit_Ln ("ada_new_line();");
+            end if;
+         elsif Sub = PKG_OPEN then
+            Emit_Expression_AST (N_Left (N));
+            Emit (" = fopen(");
+            Emit_Expression_AST (N_Right (N));
+            if N_Int (N) = 1 then
+               Emit (", ""w""");
+            else
+               Emit (", ""r""");
+            end if;
+            Emit_Ln (");");
+         elsif Sub = PKG_CREATE then
+            Emit_Expression_AST (N_Left (N));
+            Emit (" = fopen(");
+            Emit_Expression_AST (N_Right (N));
+            Emit (", ""w""");
+            Emit_Ln (");");
+         elsif Sub = PKG_CLOSE then
+            Emit ("fclose(");
+            Emit_Expression_AST (N_Left (N));
+            Emit_Ln (");");
+         elsif Sub = PKG_GET_LINE then
+            Emit ("ada_get_line(");
+            Emit_Expression_AST (N_Left (N));
+            Emit_Ln (");");
+         elsif Sub = PKG_GET then
+            Emit ("{int __gc = fgetc(");
+            Emit_Expression_AST (N_Left (N));
+            Emit ("); if (__gc != EOF) ");
+            Emit_Expression_AST (N_Right (N));
+            Emit_Ln (" = (char)__gc;}");
+         elsif Sub = PKG_GENERIC then
+            Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            Emit ("_");
+            Emit_Pool_Lower (N_Arg2 (N), N_Int (N));
+            if N_Aux1 (N) = 1 then
+               Emit ("(");
+               A := N_First (N);
+               First := True;
+               while A /= 0 loop
+                  if not First then Emit (", "); end if;
+                  First := False;
+                  Emit_Expression_AST (A);
+                  A := N_Next (A);
+               end loop;
+               Emit_Ln (");");
+            else
+               Emit_Ln ("();");
+            end if;
+         end if;
       end if;
    end Emit_Statement_AST;
 
@@ -1559,133 +1758,88 @@ procedure Adacomp is
          return N;
       end if;
 
-      -- Compound statements: direct emit, no AST node.
+      -- Compound statements: build a subtree; children are sub-chains.
       if Tok = TK_IF then
-         Emit_Indent; Emit ("if (");
-         Next_Token; Parse_Expression;
-         Emit_Ln (") {"); Expect (TK_THEN);
-         Indent_Level := Indent_Level + 1;
-         Parse_Statements;
-         Indent_Level := Indent_Level - 1;
-         while Tok = TK_ELSIF loop
-            Emit_Indent; Emit ("} else if (");
-            Next_Token; Parse_Expression;
-            Emit_Ln (") {"); Expect (TK_THEN);
-            Indent_Level := Indent_Level + 1;
-            Parse_Statements;
-            Indent_Level := Indent_Level - 1;
-         end loop;
+         N := New_Node (S_IF);
+         Next_Token;
+         N_Left (N) := Parse_Expression_AST;
+         Expect (TK_THEN);
+         N_First (N) := Parse_Statement_Chain;
+         declare
+            Prev_Elsif : Integer := 0;
+            E : Integer;
+         begin
+            while Tok = TK_ELSIF loop
+               Next_Token;
+               E := New_Node (S_ELSIF);
+               N_Left (E) := Parse_Expression_AST;
+               Expect (TK_THEN);
+               N_First (E) := Parse_Statement_Chain;
+               if Prev_Elsif = 0 then
+                  N_Right (N) := E;
+               else
+                  N_Next (Prev_Elsif) := E;
+               end if;
+               Prev_Elsif := E;
+            end loop;
+         end;
          if Tok = TK_ELSE then
-            Emit_Indent; Emit_Ln ("} else {");
             Next_Token;
-            Indent_Level := Indent_Level + 1;
-            Parse_Statements;
-            Indent_Level := Indent_Level - 1;
+            N_Arg2 (N) := Parse_Statement_Chain;
          end if;
-         Emit_Indent; Emit_Ln ("}");
          Expect (TK_END); Expect (TK_IF); Expect (TK_SEMI);
-         return 0;
+         return N;
       end if;
       if Tok = TK_WHILE then
-         Emit_Indent; Emit ("while (");
-         Next_Token; Parse_Expression;
-         Emit_Ln (") {"); Expect (TK_LOOP);
-         Indent_Level := Indent_Level + 1;
-         Parse_Statements;
-         Indent_Level := Indent_Level - 1;
-         Emit_Indent; Emit_Ln ("}");
+         N := New_Node (S_WHILE);
+         Next_Token;
+         N_Left (N) := Parse_Expression_AST;
+         Expect (TK_LOOP);
+         N_First (N) := Parse_Statement_Chain;
          Expect (TK_END); Expect (TK_LOOP); Expect (TK_SEMI);
-         return 0;
+         return N;
       end if;
       if Tok = TK_LOOP then
-         Emit_Indent; Emit_Ln ("while (1) {");
+         N := New_Node (S_LOOP);
          Next_Token;
-         Indent_Level := Indent_Level + 1;
-         Parse_Statements;
-         Indent_Level := Indent_Level - 1;
-         Emit_Indent; Emit_Ln ("}");
+         N_First (N) := Parse_Statement_Chain;
          Expect (TK_END); Expect (TK_LOOP); Expect (TK_SEMI);
-         return 0;
+         return N;
       end if;
       if Tok = TK_FOR then
+         N := New_Node (S_FOR);
          Next_Token;
-         Saved_Len := Tok_Len;
-         for I in 1 .. Tok_Len loop
-            Saved (I) := Tok_Val (I);
-         end loop;
+         N_Str_Off (N) := Pool_Str (Tok_Val, Tok_Len);
+         N_Str_Len (N) := Tok_Len;
          Next_Token;
          Expect (TK_IN);
-         declare
-            Is_Reverse : Boolean := False;
-         begin
-            if Tok = TK_REVERSE then
-               Is_Reverse := True;
-               Next_Token;
-            end if;
-            Emit_Indent;
-            if Is_Reverse then
-               -- Wrap in a block so __lo/__hi temps scope-shadow when nested.
-               Emit ("{ int __lo = ");
-               Parse_Expression;
-               Expect (TK_DOTDOT);
-               Emit ("; int __hi = ");
-               Parse_Expression;
-               Emit ("; for (int ");
-               Emit_Lower (Saved, Saved_Len);
-               Emit (" = __hi; ");
-               Emit_Lower (Saved, Saved_Len);
-               Emit (" >= __lo; ");
-               Emit_Lower (Saved, Saved_Len);
-               Emit_Ln ("--) {");
-            else
-               Emit ("for (int ");
-               Emit_Lower (Saved, Saved_Len);
-               Emit (" = ");
-               Parse_Expression;
-               Expect (TK_DOTDOT);
-               Emit ("; ");
-               Emit_Lower (Saved, Saved_Len);
-               Emit (" <= ");
-               Parse_Expression;
-               Emit ("; ");
-               Emit_Lower (Saved, Saved_Len);
-               Emit_Ln ("++) {");
-            end if;
-            Expect (TK_LOOP);
-            Indent_Level := Indent_Level + 1;
-            Parse_Statements;
-            Indent_Level := Indent_Level - 1;
-            Emit_Indent;
-            if Is_Reverse then
-               Emit_Ln ("} }");
-            else
-               Emit_Ln ("}");
-            end if;
-            Expect (TK_END); Expect (TK_LOOP); Expect (TK_SEMI);
-         end;
-         return 0;
+         if Tok = TK_REVERSE then
+            N_Op (N) := 1;
+            Next_Token;
+         end if;
+         N_Left (N) := Parse_Expression_AST;
+         Expect (TK_DOTDOT);
+         N_Right (N) := Parse_Expression_AST;
+         Expect (TK_LOOP);
+         N_First (N) := Parse_Statement_Chain;
+         Expect (TK_END); Expect (TK_LOOP); Expect (TK_SEMI);
+         return N;
       end if;
       if Tok = TK_DECLARE then
+         N := New_Node (S_DECLARE);
          Next_Token;
-         Emit_Indent; Emit_Ln ("{");
-         Indent_Level := Indent_Level + 1;
-         Parse_Declarations;
+         N_First (N) := Parse_Var_Decl_Chain;
          Expect (TK_BEGIN);
-         Parse_Statements;
-         Indent_Level := Indent_Level - 1;
-         Emit_Indent; Emit_Ln ("}");
+         N_Arg2 (N) := Parse_Statement_Chain;
          Expect (TK_END); Expect (TK_SEMI);
-         return 0;
+         return N;
       end if;
       if Tok = TK_BEGIN then
+         N := New_Node (S_BLOCK);
          Next_Token;
-         Emit_Indent; Emit_Ln ("{");
-         Indent_Level := Indent_Level + 1;
-         Parse_Statements;
-         Indent_Level := Indent_Level - 1;
-         Emit_Indent; Emit_Ln ("}");
+         N_First (N) := Parse_Statement_Chain;
          Expect (TK_END); Expect (TK_SEMI);
-         return 0;
+         return N;
       end if;
 
       -- Identifier-prefixed: assignment, call, array-assign, paramless,
@@ -1792,6 +1946,7 @@ procedure Adacomp is
          end if;
 
          if Tok = TK_DOT then
+            -- Package-qualified call → S_PKG subtree node.
             Next_Token;
             Sub_Len := Tok_Len;
             for I in 1 .. Tok_Len loop
@@ -1806,112 +1961,116 @@ procedure Adacomp is
                end loop;
                Next_Token;
             end loop;
-            Emit_Indent;
+            N := New_Node (S_PKG);
             if Name_Eq (Sub, Sub_Len, "Put_Line") then
+               N_Op (N) := PKG_PUT_LINE;
                Expect (TK_LPAREN);
                if Has_Arg_Separator_Ahead then
-                  Emit ("ada_fput_line(");
-                  Parse_Expression;
-                  Expect (TK_COMMA); Emit (", ");
-                  Parse_Expression;
+                  N_Left (N) := Parse_Expression_AST;
+                  Expect (TK_COMMA);
+                  N_Right (N) := Parse_Expression_AST;
                else
-                  Emit ("ada_put_line(");
-                  Parse_Expression;
+                  N_Left (N) := Parse_Expression_AST;
                end if;
-               Emit_Ln (");"); Expect (TK_RPAREN);
+               Expect (TK_RPAREN);
             elsif Name_Eq (Sub, Sub_Len, "Put") then
+               N_Op (N) := PKG_PUT;
                Expect (TK_LPAREN);
                if Has_Arg_Separator_Ahead then
                   if Second_Arg_Is_Char then
-                     Emit ("ada_fput_char(");
+                     N_Aux1 (N) := 1;
                   else
-                     Emit ("ada_fput_str(");
+                     N_Aux1 (N) := 0;
                   end if;
-                  Parse_Expression;
-                  Expect (TK_COMMA); Emit (", ");
-                  Parse_Expression;
+                  N_Left (N) := Parse_Expression_AST;
+                  Expect (TK_COMMA);
+                  N_Right (N) := Parse_Expression_AST;
                else
-                  Emit ("ada_put_str(");
-                  Parse_Expression;
+                  N_Left (N) := Parse_Expression_AST;
                end if;
-               Emit_Ln (");"); Expect (TK_RPAREN);
+               Expect (TK_RPAREN);
             elsif Name_Eq (Sub, Sub_Len, "New_Line") then
+               N_Op (N) := PKG_NEW_LINE;
                if Tok = TK_LPAREN then
                   Expect (TK_LPAREN);
                   if Tok /= TK_RPAREN then
-                     Emit ("ada_fput_newline(");
-                     Parse_Expression;
-                     Emit_Ln (");");
-                  else
-                     Emit_Ln ("ada_new_line();");
+                     N_Left (N) := Parse_Expression_AST;
                   end if;
                   Expect (TK_RPAREN);
-               else
-                  Emit_Ln ("ada_new_line();");
                end if;
             elsif Name_Eq (Sub, Sub_Len, "Open") then
+               N_Op (N) := PKG_OPEN;
                Expect (TK_LPAREN);
-               Parse_Expression;
+               N_Left (N) := Parse_Expression_AST;   -- file var
                Expect (TK_COMMA);
                while Tok /= TK_COMMA and Tok /= TK_RPAREN and Tok /= TK_EOF loop
+                  if Tok_Eq_CI ("Out_File") then N_Int (N) := 1; end if;
                   Next_Token;
                   if Tok = TK_DOT then Next_Token; Next_Token; end if;
                end loop;
                if Tok = TK_COMMA then Next_Token; end if;
-               Emit (" = fopen(");
-               Parse_Expression;
-               Emit (", ""r""");
-               Emit_Ln (");"); Expect (TK_RPAREN);
+               N_Right (N) := Parse_Expression_AST;   -- name
+               Expect (TK_RPAREN);
             elsif Name_Eq (Sub, Sub_Len, "Create") then
+               N_Op (N) := PKG_CREATE;
                Expect (TK_LPAREN);
-               Parse_Expression;
+               N_Left (N) := Parse_Expression_AST;
                Expect (TK_COMMA);
                while Tok /= TK_COMMA and Tok /= TK_RPAREN and Tok /= TK_EOF loop
                   Next_Token;
                   if Tok = TK_DOT then Next_Token; Next_Token; end if;
                end loop;
                if Tok = TK_COMMA then Next_Token; end if;
-               Emit (" = fopen(");
-               Parse_Expression;
-               Emit (", ""w""");
-               Emit_Ln (");"); Expect (TK_RPAREN);
+               N_Right (N) := Parse_Expression_AST;
+               Expect (TK_RPAREN);
             elsif Name_Eq (Sub, Sub_Len, "Close") then
-               Emit ("fclose(");
-               Expect (TK_LPAREN); Parse_Expression;
-               Emit_Ln (");"); Expect (TK_RPAREN);
-            elsif Name_Eq (Sub, Sub_Len, "Get_Line") then
-               Emit ("ada_get_line(");
-               Expect (TK_LPAREN); Parse_Expression;
-               Emit_Ln (");"); Expect (TK_RPAREN);
-            elsif Name_Eq (Sub, Sub_Len, "Get") then
+               N_Op (N) := PKG_CLOSE;
                Expect (TK_LPAREN);
-               Emit ("{int __gc = fgetc(");
-               Parse_Expression;
-               Emit ("); if (__gc != EOF) ");
+               N_Left (N) := Parse_Expression_AST;
+               Expect (TK_RPAREN);
+            elsif Name_Eq (Sub, Sub_Len, "Get_Line") then
+               N_Op (N) := PKG_GET_LINE;
+               Expect (TK_LPAREN);
+               N_Left (N) := Parse_Expression_AST;
+               Expect (TK_RPAREN);
+            elsif Name_Eq (Sub, Sub_Len, "Get") then
+               N_Op (N) := PKG_GET;
+               Expect (TK_LPAREN);
+               N_Left (N) := Parse_Expression_AST;   -- file
                Expect (TK_COMMA);
-               Parse_Expression;
-               Emit_Ln (" = (char)__gc;}");
+               N_Right (N) := Parse_Expression_AST;   -- char var
                Expect (TK_RPAREN);
             else
-               Emit_Lower (Saved, Saved_Len);
-               Emit ("_");
-               Emit_Lower (Sub, Sub_Len);
+               N_Op (N) := PKG_GENERIC;
+               N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+               N_Str_Len (N) := Saved_Len;
+               N_Arg2 (N) := Pool_Str (Sub, Sub_Len);
+               N_Int (N) := Sub_Len;
                if Tok = TK_LPAREN then
-                  Emit ("("); Next_Token;
+                  N_Aux1 (N) := 1;
+                  Next_Token;
                   if Tok /= TK_RPAREN then
-                     Parse_Expression;
-                     while Tok = TK_COMMA loop
-                        Emit (", "); Next_Token;
-                        Parse_Expression;
-                     end loop;
+                     declare
+                        First : Integer;
+                        Prev : Integer;
+                        Arg : Integer;
+                     begin
+                        First := Parse_Expression_AST;
+                        N_First (N) := First;
+                        Prev := First;
+                        while Tok = TK_COMMA loop
+                           Next_Token;
+                           Arg := Parse_Expression_AST;
+                           N_Next (Prev) := Arg;
+                           Prev := Arg;
+                        end loop;
+                     end;
                   end if;
-                  Emit_Ln (");"); Expect (TK_RPAREN);
-               else
-                  Emit_Ln ("();");
+                  Expect (TK_RPAREN);
                end if;
             end if;
             Expect (TK_SEMI);
-            return 0;
+            return N;
          end if;
          Error ("expected := or ( after identifier");
          return 0;
@@ -1920,19 +2079,12 @@ procedure Adacomp is
       return 0;
    end Parse_Statement_AST;
 
-   -- Public wrapper: build one statement's AST, walk it (compound and
-   -- dotted paths already emitted during build), reset the pool.
-   procedure Parse_Statement is
-      N : Integer;
-   begin
-      N := Parse_Statement_AST;
-      if N /= 0 then
-         Emit_Statement_AST (N);
-      end if;
-      Reset_AST;
-   end Parse_Statement;
-
-   procedure Parse_Statements is
+   -- Build a chain of statement nodes (linked by N_Next) until a list
+   -- terminator. No emission, no reset — walked later as one tree.
+   function Parse_Statement_Chain return Integer is
+      Head : Integer := 0;
+      Prev : Integer := 0;
+      S    : Integer;
    begin
       while Tok /= TK_END and Tok /= TK_ELSIF and
             Tok /= TK_ELSE and Tok /= TK_EOF and Tok /= TK_WHEN
@@ -1942,10 +2094,37 @@ procedure Adacomp is
             while Tok /= TK_END and Tok /= TK_EOF loop
                Next_Token;
             end loop;
-            return;
+            exit;
          end if;
-         Parse_Statement;
+         S := Parse_Statement_AST;
+         if Head = 0 then
+            Head := S;
+         else
+            N_Next (Prev) := S;
+         end if;
+         Prev := S;
       end loop;
+      return Head;
+   end Parse_Statement_Chain;
+
+   procedure Emit_Statement_Chain (Head : Integer) is
+      N : Integer;
+   begin
+      N := Head;
+      while N /= 0 loop
+         Emit_Statement_AST (N);
+         N := N_Next (N);
+      end loop;
+   end Emit_Statement_Chain;
+
+   -- Parse one program-unit body: build its statement tree, walk it,
+   -- then reset the shared node pool.
+   procedure Parse_Statements is
+      Head : Integer;
+   begin
+      Head := Parse_Statement_Chain;
+      Emit_Statement_Chain (Head);
+      Reset_AST;
    end Parse_Statements;
 
    -- ---- Declaration-AST walker (variable-leaf nodes only) ----
@@ -2536,6 +2715,40 @@ procedure Adacomp is
          Reset_AST;
       end loop;
    end Parse_Declarations;
+
+   -- Build a chain of variable-declaration nodes for a `declare` block.
+   -- No reset — the chain is part of the enclosing unit's tree. Type
+   -- definitions (no node) still register their symbol as a side effect.
+   function Parse_Var_Decl_Chain return Integer is
+      Head : Integer := 0;
+      Prev : Integer := 0;
+      D    : Integer;
+   begin
+      while Tok = TK_TYPE or Tok = TK_PROCEDURE
+            or Tok = TK_FUNCTION or Tok = TK_IDENT
+      loop
+         D := Parse_Declaration_AST;
+         if D /= 0 then
+            if Head = 0 then
+               Head := D;
+            else
+               N_Next (Prev) := D;
+            end if;
+            Prev := D;
+         end if;
+      end loop;
+      return Head;
+   end Parse_Var_Decl_Chain;
+
+   procedure Emit_Declaration_Chain (Head : Integer) is
+      N : Integer;
+   begin
+      N := Head;
+      while N /= 0 loop
+         Emit_Declaration_AST (N);
+         N := N_Next (N);
+      end loop;
+   end Emit_Declaration_Chain;
 
    procedure Parse_Context is
    begin

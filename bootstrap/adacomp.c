@@ -499,6 +499,11 @@ enum {
        AST nodes once declarations are AST-driven (step 4). */
     S_NULL=20, S_RETURN=21, S_RAISE=22, S_EXIT=23,
     S_ASSIGN=24, S_CALL=25, S_PARAMLESS=26, S_ARRAY_ASSIGN=27,
+    /* Compound statements and dotted package calls (Pass B.2): full
+       subtree nodes, so a program unit's body is one tree walked after
+       the unit is fully parsed. */
+    S_IF=40, S_ELSIF=41, S_WHILE=42, S_LOOP=43, S_FOR=44,
+    S_DECLARE=45, S_BLOCK=46, S_PKG=47,
     /* Variable-declaration leaf nodes. Type definitions and procedure /
        function declarations still emit directly during parse and return
        0 from parse_declaration_ast. */
@@ -520,6 +525,12 @@ enum {
 enum {
     ATTR_IMAGE=1, ATTR_POS=2, ATTR_VAL=3,
     ATTR_LENGTH=4, ATTR_FIRST=5, ATTR_LAST=6
+};
+
+/* Sub-ops for S_PKG (dotted Ada.Text_IO.* statement calls). */
+enum {
+    PKG_PUT_LINE=1, PKG_PUT=2, PKG_NEW_LINE=3, PKG_OPEN=4,
+    PKG_CREATE=5, PKG_CLOSE=6, PKG_GET_LINE=7, PKG_GET=8, PKG_GENERIC=9
 };
 
 static int n_kind[MAX_NODES];
@@ -579,13 +590,16 @@ static int  parse_term_ast(void);
 static int  parse_factor_ast(void);
 static int  parse_primary_ast(void);
 static void emit_expression_ast(int n);
-static void parse_statement(void);
 static int  parse_statement_ast(void);
 static void emit_statement_ast(int n);
+static int  parse_statement_chain(void);
+static void emit_statement_chain(int head);
 static void parse_statements(void);
 static void parse_declarations(void);
 static int  parse_declaration_ast(void);
 static void emit_declaration_ast(int n);
+static int  parse_var_decl_chain(void);
+static void emit_declaration_chain(int head);
 
 /* ---- Type reference ---- */
 static int parse_type_ref(void) {
@@ -1141,11 +1155,159 @@ static void emit_statement_ast(int n) {
         emit(" = ");
         emit_expression_ast(n_first[n]);
         emit_line(";");
+    } else if (kind == S_IF) {
+        emit_indent(); emit("if (");
+        emit_expression_ast(n_left[n]);
+        emit_line(") {");
+        indent_level++; emit_statement_chain(n_first[n]); indent_level--;
+        for (int e = n_right[n]; e != 0; e = n_next[e]) {
+            emit_indent(); emit("} else if (");
+            emit_expression_ast(n_left[e]);
+            emit_line(") {");
+            indent_level++; emit_statement_chain(n_first[e]); indent_level--;
+        }
+        if (n_arg2[n] != 0) {
+            emit_indent(); emit_line("} else {");
+            indent_level++; emit_statement_chain(n_arg2[n]); indent_level--;
+        }
+        emit_indent(); emit_line("}");
+    } else if (kind == S_WHILE) {
+        emit_indent(); emit("while (");
+        emit_expression_ast(n_left[n]);
+        emit_line(") {");
+        indent_level++; emit_statement_chain(n_first[n]); indent_level--;
+        emit_indent(); emit_line("}");
+    } else if (kind == S_LOOP) {
+        emit_indent(); emit_line("while (1) {");
+        indent_level++; emit_statement_chain(n_first[n]); indent_level--;
+        emit_indent(); emit_line("}");
+    } else if (kind == S_FOR) {
+        emit_indent();
+        if (n_op[n]) {
+            /* reverse: wrap in a block so __lo/__hi can scope-shadow */
+            emit("{ int __lo = ");
+            emit_expression_ast(n_left[n]);
+            emit("; int __hi = ");
+            emit_expression_ast(n_right[n]);
+            emit("; for (int ");
+            emit_pool_lower(n_str_off[n], n_str_len[n]);
+            emit(" = __hi; ");
+            emit_pool_lower(n_str_off[n], n_str_len[n]);
+            emit(" >= __lo; ");
+            emit_pool_lower(n_str_off[n], n_str_len[n]);
+            emit_line("--) {");
+        } else {
+            emit("for (int ");
+            emit_pool_lower(n_str_off[n], n_str_len[n]);
+            emit(" = ");
+            emit_expression_ast(n_left[n]);
+            emit("; ");
+            emit_pool_lower(n_str_off[n], n_str_len[n]);
+            emit(" <= ");
+            emit_expression_ast(n_right[n]);
+            emit("; ");
+            emit_pool_lower(n_str_off[n], n_str_len[n]);
+            emit_line("++) {");
+        }
+        indent_level++; emit_statement_chain(n_first[n]); indent_level--;
+        emit_indent();
+        if (n_op[n]) emit_line("} }");
+        else emit_line("}");
+    } else if (kind == S_DECLARE) {
+        emit_indent(); emit_line("{");
+        indent_level++;
+        emit_declaration_chain(n_first[n]);
+        emit_statement_chain(n_arg2[n]);
+        indent_level--;
+        emit_indent(); emit_line("}");
+    } else if (kind == S_BLOCK) {
+        emit_indent(); emit_line("{");
+        indent_level++;
+        emit_statement_chain(n_first[n]);
+        indent_level--;
+        emit_indent(); emit_line("}");
+    } else if (kind == S_PKG) {
+        int sub = n_op[n];
+        emit_indent();
+        if (sub == PKG_PUT_LINE) {
+            if (n_right[n] != 0) {
+                emit("ada_fput_line(");
+                emit_expression_ast(n_left[n]);
+                emit(", ");
+                emit_expression_ast(n_right[n]);
+            } else {
+                emit("ada_put_line(");
+                emit_expression_ast(n_left[n]);
+            }
+            emit_line(");");
+        } else if (sub == PKG_PUT) {
+            if (n_right[n] != 0) {
+                emit(n_aux1[n] ? "ada_fput_char(" : "ada_fput_str(");
+                emit_expression_ast(n_left[n]);
+                emit(", ");
+                emit_expression_ast(n_right[n]);
+            } else {
+                emit("ada_put_str(");
+                emit_expression_ast(n_left[n]);
+            }
+            emit_line(");");
+        } else if (sub == PKG_NEW_LINE) {
+            if (n_left[n] != 0) {
+                emit("ada_fput_newline(");
+                emit_expression_ast(n_left[n]);
+                emit_line(");");
+            } else {
+                emit_line("ada_new_line();");
+            }
+        } else if (sub == PKG_OPEN) {
+            emit_expression_ast(n_left[n]);
+            emit(" = fopen(");
+            emit_expression_ast(n_right[n]);
+            emit(n_int[n] ? ", \"w\"" : ", \"r\"");
+            emit_line(");");
+        } else if (sub == PKG_CREATE) {
+            emit_expression_ast(n_left[n]);
+            emit(" = fopen(");
+            emit_expression_ast(n_right[n]);
+            emit(", \"w\"");
+            emit_line(");");
+        } else if (sub == PKG_CLOSE) {
+            emit("fclose(");
+            emit_expression_ast(n_left[n]);
+            emit_line(");");
+        } else if (sub == PKG_GET_LINE) {
+            emit("ada_get_line(");
+            emit_expression_ast(n_left[n]);
+            emit_line(");");
+        } else if (sub == PKG_GET) {
+            emit("{int __gc = fgetc(");
+            emit_expression_ast(n_left[n]);
+            emit("); if (__gc != EOF) ");
+            emit_expression_ast(n_right[n]);
+            emit_line(" = (char)__gc;}");
+        } else if (sub == PKG_GENERIC) {
+            emit_pool_lower(n_str_off[n], n_str_len[n]);
+            emit("_");
+            emit_pool_lower(n_arg2[n], n_int[n]);
+            if (n_aux1[n]) {
+                emit("(");
+                int a = n_first[n];
+                int first = 1;
+                while (a != 0) {
+                    if (!first) emit(", ");
+                    first = 0;
+                    emit_expression_ast(a);
+                    a = n_next[a];
+                }
+                emit_line(");");
+            } else {
+                emit_line("();");
+            }
+        }
     }
 }
 
-/* Build an AST node for leaf statements; return 0 for compound and
-   dotted statements which still emit directly. */
+/* Build one statement node (leaf or compound). */
 static int parse_statement_ast(void) {
     int n;
     if (tok == TK_NULL) {
@@ -1183,115 +1345,78 @@ static int parse_statement_ast(void) {
         return n;
     }
 
-    /* Compound statements: direct emit, no AST node. */
+    /* Compound statements: build a subtree; children are sub-chains. */
     if (tok == TK_IF) {
-        emit_indent(); emit("if (");
-        next_token(); parse_expression();
-        emit_line(") {"); expect(TK_THEN);
-        indent_level++; parse_statements(); indent_level--;
+        n = new_node(S_IF);
+        next_token();
+        n_left[n] = parse_expression_ast();
+        expect(TK_THEN);
+        n_first[n] = parse_statement_chain();
+        int prev_elsif = 0;
         while (tok == TK_ELSIF) {
-            emit_indent(); emit("} else if (");
-            next_token(); parse_expression();
-            emit_line(") {"); expect(TK_THEN);
-            indent_level++; parse_statements(); indent_level--;
+            next_token();
+            int e = new_node(S_ELSIF);
+            n_left[e] = parse_expression_ast();
+            expect(TK_THEN);
+            n_first[e] = parse_statement_chain();
+            if (prev_elsif == 0) n_right[n] = e;
+            else n_next[prev_elsif] = e;
+            prev_elsif = e;
         }
         if (tok == TK_ELSE) {
-            emit_indent(); emit_line("} else {");
             next_token();
-            indent_level++; parse_statements(); indent_level--;
+            n_arg2[n] = parse_statement_chain();
         }
-        emit_indent(); emit_line("}");
         expect(TK_END); expect(TK_IF); expect(TK_SEMI);
-        return 0;
+        return n;
     }
     if (tok == TK_WHILE) {
-        emit_indent(); emit("while (");
-        next_token(); parse_expression();
-        emit_line(") {"); expect(TK_LOOP);
-        indent_level++; parse_statements(); indent_level--;
-        emit_indent(); emit_line("}");
+        n = new_node(S_WHILE);
+        next_token();
+        n_left[n] = parse_expression_ast();
+        expect(TK_LOOP);
+        n_first[n] = parse_statement_chain();
         expect(TK_END); expect(TK_LOOP); expect(TK_SEMI);
-        return 0;
+        return n;
     }
     if (tok == TK_LOOP) {
-        emit_indent(); emit_line("while (1) {");
+        n = new_node(S_LOOP);
         next_token();
-        indent_level++; parse_statements(); indent_level--;
-        emit_indent(); emit_line("}");
+        n_first[n] = parse_statement_chain();
         expect(TK_END); expect(TK_LOOP); expect(TK_SEMI);
-        return 0;
+        return n;
     }
     if (tok == TK_FOR) {
+        n = new_node(S_FOR);
         next_token();
-        char loop_var[MAX_NAME];
-        int lv_len = tok_len;
-        memcpy(loop_var, tok_val, tok_len);
+        n_str_off[n] = pool_str(tok_val, tok_len);
+        n_str_len[n] = tok_len;
         next_token();
         expect(TK_IN);
-
-        int is_reverse = 0;
-        if (tok == TK_REVERSE) { is_reverse = 1; next_token(); }
-
-        emit_indent();
-        if (is_reverse) {
-            /* Wrap in a block so __lo/__hi temps can scope-shadow when nested. */
-            emit("{ int __lo = ");
-            parse_expression();
-            expect(TK_DOTDOT);
-            emit("; int __hi = ");
-            parse_expression();
-            emit("; for (int ");
-            emit_str_lower(loop_var, lv_len);
-            emit(" = __hi; ");
-            emit_str_lower(loop_var, lv_len);
-            emit(" >= __lo; ");
-            emit_str_lower(loop_var, lv_len);
-            emit_line("--) {");
-        } else {
-            emit("for (int ");
-            emit_str_lower(loop_var, lv_len);
-            emit(" = ");
-            parse_expression();
-            expect(TK_DOTDOT);
-            emit("; ");
-            emit_str_lower(loop_var, lv_len);
-            emit(" <= ");
-            parse_expression();
-            emit("; ");
-            emit_str_lower(loop_var, lv_len);
-            emit_line("++) {");
-        }
-
+        if (tok == TK_REVERSE) { n_op[n] = 1; next_token(); }
+        n_left[n] = parse_expression_ast();
+        expect(TK_DOTDOT);
+        n_right[n] = parse_expression_ast();
         expect(TK_LOOP);
-        indent_level++; parse_statements(); indent_level--;
-        emit_indent();
-        if (is_reverse) emit_line("} }");
-        else emit_line("}");
+        n_first[n] = parse_statement_chain();
         expect(TK_END); expect(TK_LOOP); expect(TK_SEMI);
-        return 0;
+        return n;
     }
     if (tok == TK_DECLARE) {
+        n = new_node(S_DECLARE);
         next_token();
-        emit_indent(); emit_line("{");
-        indent_level++;
-        parse_declarations();
+        n_first[n] = parse_var_decl_chain();
         expect(TK_BEGIN);
-        parse_statements();
-        indent_level--;
-        emit_indent(); emit_line("}");
+        n_arg2[n] = parse_statement_chain();
         expect(TK_END); expect(TK_SEMI);
-        return 0;
+        return n;
     }
     if (tok == TK_BEGIN) {
-        /* Bare begin...end block */
+        n = new_node(S_BLOCK);
         next_token();
-        emit_indent(); emit_line("{");
-        indent_level++;
-        parse_statements();
-        indent_level--;
-        emit_indent(); emit_line("}");
+        n_first[n] = parse_statement_chain();
         expect(TK_END); expect(TK_SEMI);
-        return 0;
+        return n;
     }
 
     /* Identifier-prefixed statement: assignment, call, array assign,
@@ -1383,13 +1508,12 @@ static int parse_statement_ast(void) {
         }
 
         if (tok == TK_DOT) {
-            /* Package-qualified call */
+            /* Package-qualified call → S_PKG subtree node. */
             next_token();
             char sub[MAX_TOK];
             int sub_len = tok_len;
             memcpy(sub, tok_val, tok_len);
             next_token();
-
             while (tok == TK_DOT) {
                 next_token();
                 sub_len = tok_len;
@@ -1397,126 +1521,104 @@ static int parse_statement_ast(void) {
                 next_token();
             }
 
-            emit_indent();
-
+            n = new_node(S_PKG);
             if (name_eq_ci(sub, sub_len, "Put_Line")) {
+                n_op[n] = PKG_PUT_LINE;
                 expect(TK_LPAREN);
                 if (has_arg_separator_ahead()) {
-                    emit("ada_fput_line(");
-                    parse_expression();
-                    expect(TK_COMMA); emit(", ");
-                    parse_expression();
+                    n_left[n] = parse_expression_ast();
+                    expect(TK_COMMA);
+                    n_right[n] = parse_expression_ast();
                 } else {
-                    emit("ada_put_line(");
-                    parse_expression();
+                    n_left[n] = parse_expression_ast();
                 }
-                emit_line(");"); expect(TK_RPAREN);
+                expect(TK_RPAREN);
             } else if (name_eq_ci(sub, sub_len, "Put")) {
+                n_op[n] = PKG_PUT;
                 expect(TK_LPAREN);
                 if (has_arg_separator_ahead()) {
-                    if (second_arg_is_char()) {
-                        emit("ada_fput_char(");
-                    } else {
-                        emit("ada_fput_str(");
-                    }
-                    parse_expression();
-                    expect(TK_COMMA); emit(", ");
-                    parse_expression();
+                    n_aux1[n] = second_arg_is_char() ? 1 : 0;
+                    n_left[n] = parse_expression_ast();
+                    expect(TK_COMMA);
+                    n_right[n] = parse_expression_ast();
                 } else {
-                    emit("ada_put_str(");
-                    parse_expression();
+                    n_left[n] = parse_expression_ast();
                 }
-                emit_line(");"); expect(TK_RPAREN);
+                expect(TK_RPAREN);
             } else if (name_eq_ci(sub, sub_len, "New_Line")) {
+                n_op[n] = PKG_NEW_LINE;
                 if (tok == TK_LPAREN) {
                     expect(TK_LPAREN);
-                    if (tok != TK_RPAREN) {
-                        emit("ada_fput_newline(");
-                        parse_expression();
-                        emit_line(");");
-                    } else {
-                        emit_line("ada_new_line();");
-                    }
+                    if (tok != TK_RPAREN) n_left[n] = parse_expression_ast();
                     expect(TK_RPAREN);
-                } else {
-                    emit_line("ada_new_line();");
                 }
             } else if (name_eq_ci(sub, sub_len, "Open")) {
-                /* Ada.Text_IO.Open(F, In_File, Name) */
+                n_op[n] = PKG_OPEN;
                 expect(TK_LPAREN);
-                /* First arg is file variable */
-                char fvar[MAX_TOK];
-                int fvar_len = tok_len;
-                memcpy(fvar, tok_val, tok_len);
-                parse_expression(); /* emits file var name */
+                n_left[n] = parse_expression_ast();   /* file var */
                 expect(TK_COMMA);
-                /* Skip second arg (mode) but capture to determine r/w */
-                /* Just skip tokens until comma */
-                char mode[64] = "r";
                 while (tok != TK_COMMA && tok != TK_RPAREN && tok != TK_EOF) {
-                    if (tok_eq_ci("Out_File")) strcpy(mode, "w");
+                    if (tok_eq_ci("Out_File")) n_int[n] = 1;
                     next_token();
                     if (tok == TK_DOT) { next_token(); next_token(); }
                 }
                 if (tok == TK_COMMA) next_token();
-                /* Rewrite: fvar = fopen(name, mode) */
-                emit(" = fopen(");
-                parse_expression();
-                fprintf(out_file, ", \"%s\"", mode);
-                emit_line(");"); expect(TK_RPAREN);
+                n_right[n] = parse_expression_ast();   /* name */
+                expect(TK_RPAREN);
             } else if (name_eq_ci(sub, sub_len, "Create")) {
+                n_op[n] = PKG_CREATE;
                 expect(TK_LPAREN);
-                parse_expression(); /* file var */
+                n_left[n] = parse_expression_ast();
                 expect(TK_COMMA);
                 while (tok != TK_COMMA && tok != TK_RPAREN && tok != TK_EOF) {
                     next_token();
                     if (tok == TK_DOT) { next_token(); next_token(); }
                 }
                 if (tok == TK_COMMA) next_token();
-                emit(" = fopen(");
-                parse_expression();
-                emit(", \"w\"");
-                emit_line(");"); expect(TK_RPAREN);
+                n_right[n] = parse_expression_ast();
+                expect(TK_RPAREN);
             } else if (name_eq_ci(sub, sub_len, "Close")) {
-                emit("fclose(");
-                expect(TK_LPAREN); parse_expression();
-                emit_line(");"); expect(TK_RPAREN);
-            } else if (name_eq_ci(sub, sub_len, "Get_Line")) {
-                emit("ada_get_line(");
-                expect(TK_LPAREN); parse_expression();
-                emit_line(");"); expect(TK_RPAREN);
-            } else if (name_eq_ci(sub, sub_len, "Get")) {
-                /* Ada.Text_IO.Get(F, Ch) -> ch = fgetc(f); */
+                n_op[n] = PKG_CLOSE;
                 expect(TK_LPAREN);
-                /* Skip first arg (file), capture second (char var) */
-                char farg[MAX_TOK]; int farg_len = 0;
-                /* Emit: second_arg = fgetc(first_arg); */
-                /* We need both args. Parse first into temp. */
-                /* Actually, just emit inline */
-                emit("{int __gc = fgetc(");
-                parse_expression(); /* file arg */
-                emit("); if (__gc != EOF) ");
+                n_left[n] = parse_expression_ast();
+                expect(TK_RPAREN);
+            } else if (name_eq_ci(sub, sub_len, "Get_Line")) {
+                n_op[n] = PKG_GET_LINE;
+                expect(TK_LPAREN);
+                n_left[n] = parse_expression_ast();
+                expect(TK_RPAREN);
+            } else if (name_eq_ci(sub, sub_len, "Get")) {
+                n_op[n] = PKG_GET;
+                expect(TK_LPAREN);
+                n_left[n] = parse_expression_ast();   /* file */
                 expect(TK_COMMA);
-                parse_expression(); /* char var */
-                emit_line(" = (char)__gc;}");
+                n_right[n] = parse_expression_ast();   /* char var */
                 expect(TK_RPAREN);
             } else {
-                emit_str_lower(saved, saved_len);
-                emit("_");
-                emit_str_lower(sub, sub_len);
+                n_op[n] = PKG_GENERIC;
+                n_str_off[n] = pool_str(saved, saved_len);
+                n_str_len[n] = saved_len;
+                n_arg2[n] = pool_str(sub, sub_len);
+                n_int[n] = sub_len;
                 if (tok == TK_LPAREN) {
-                    emit("("); next_token();
+                    n_aux1[n] = 1;
+                    next_token();
                     if (tok != TK_RPAREN) {
-                        parse_expression();
-                        while (tok == TK_COMMA) { emit(", "); next_token(); parse_expression(); }
+                        int first = parse_expression_ast();
+                        n_first[n] = first;
+                        int prev = first;
+                        while (tok == TK_COMMA) {
+                            next_token();
+                            int arg = parse_expression_ast();
+                            n_next[prev] = arg;
+                            prev = arg;
+                        }
                     }
-                    emit_line(");"); expect(TK_RPAREN);
-                } else {
-                    emit_line("();");
+                    expect(TK_RPAREN);
                 }
             }
             expect(TK_SEMI);
-            return 0;
+            return n;
         }
         fprintf(stderr, "After ident '%.*s', got token %d\n", saved_len, saved, tok);
         error("expected := or ( after identifier");
@@ -1527,27 +1629,38 @@ static int parse_statement_ast(void) {
     return 0;
 }
 
-/* Public wrapper: build one statement's AST, walk it (only for leaf
-   statement kinds — compound and dotted paths already emitted during
-   build), then reset the pool. */
-static void parse_statement(void) {
-    int n = parse_statement_ast();
-    if (n != 0) emit_statement_ast(n);
-    reset_ast();
-}
-
-static void parse_statements(void) {
+/* Build a chain of statement nodes (linked by n_next) until a list
+   terminator. No emission, no reset — the whole chain is walked later. */
+static int parse_statement_chain(void) {
+    int head = 0, prev = 0;
     while (tok != TK_END && tok != TK_ELSIF && tok != TK_ELSE &&
            tok != TK_EOF && tok != TK_WHEN) {
-        /* Skip 'exception' handler blocks */
+        /* Skip 'exception' handler blocks: stop the chain at the handler. */
         if (tok == TK_IDENT && tok_eq_ci("exception")) {
-            /* Skip to matching 'end' */
             next_token();
             while (tok != TK_END && tok != TK_EOF) next_token();
-            return;
+            break;
         }
-        parse_statement();
+        int s = parse_statement_ast();
+        if (head == 0) head = s;
+        else n_next[prev] = s;
+        prev = s;
     }
+    return head;
+}
+
+/* Walk a statement chain. */
+static void emit_statement_chain(int head) {
+    for (int n = head; n != 0; n = n_next[n]) emit_statement_ast(n);
+}
+
+/* Parse one program-unit body: build its statement tree, walk it, then
+   reset the shared node pool. Called for the main body and for proc /
+   function bodies (after their local declarations are emitted). */
+static void parse_statements(void) {
+    int head = parse_statement_chain();
+    emit_statement_chain(head);
+    reset_ast();
 }
 
 /* ---- Declaration parser ---- */
@@ -2074,6 +2187,28 @@ static void parse_declarations(void) {
         if (n != 0) emit_declaration_ast(n);
         reset_ast();
     }
+}
+
+/* Build a chain of variable-declaration nodes for a `declare` block.
+   No reset — the chain is part of the enclosing unit's tree, walked
+   later via emit_declaration_chain. Type definitions (which produce no
+   node) still register their symbol as a side effect. */
+static int parse_var_decl_chain(void) {
+    int head = 0, prev = 0;
+    while (tok == TK_TYPE || tok == TK_PROCEDURE || tok == TK_FUNCTION
+           || tok == TK_IDENT) {
+        int d = parse_declaration_ast();
+        if (d != 0) {
+            if (head == 0) head = d;
+            else n_next[prev] = d;
+            prev = d;
+        }
+    }
+    return head;
+}
+
+static void emit_declaration_chain(int head) {
+    for (int n = head; n != 0; n = n_next[n]) emit_declaration_ast(n);
 }
 
 /* ---- Parse context clauses ---- */

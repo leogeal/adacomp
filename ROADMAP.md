@@ -299,20 +299,31 @@ In progress.
   type definitions and procedure / function declarations still emit
   directly during parse and return 0. Self-hosting still verifies and
   all 14 fixtures pass under both compilers.
-- [ ] **Step 4 (Pass B).** Convert procedure / function declarations
-  (and their parameter lists) into full AST nodes, so a body can hold
-  its own AST sub-tree. Coupled to converting compound statements
-  (if / while / for / loop / declare / begin) — once both are AST,
-  `declare` blocks can hold a decls-chain and a stmts-chain in one
-  tree and the whole program becomes one structure. *Next concrete
-  commit.*
+- [x] **Step 4 (Pass B.1).** Decouple the AST walkers from the symbol
+  table: every walker now reads symbol-derived values (array bounds,
+  element type, paramless-function flag) from the node itself, resolved
+  at build time into two new scratch fields (`n_aux1`/`n_aux2`). Pure
+  refactor — byte-identical output — but it makes a node self-contained
+  so the walk can be deferred. Both files; self-hosting verifies.
+- [x] **Step 4 (Pass B.2).** Compound statements (`if`/`while`/`for`/
+  `loop`/`declare`/`begin`) and dotted package calls
+  (`Ada.Text_IO.Put_Line`, `Put`, `New_Line`, `Open`/`Create`/`Close`/
+  `Get`/`Get_Line`, generic `Pkg.Op`) become subtree nodes
+  (`S_IF` … `S_PKG`). `parse_statements` now builds a whole program
+  unit's body as a chain of statement nodes (compound nodes holding
+  sub-chains) and walks it once, after the unit is fully parsed.
+  A program unit's statement body is now a single AST tree. Both
+  files; self-hosting verifies and all 15 fixtures pass under both
+  compilers. (Declarations remain streamed at program-unit level —
+  proc/func decls drive the recursion rather than being nodes — which
+  is why their bodies, not the decls themselves, are the trees.)
 - [ ] Replace fixed-size buffers (source, token, name pool, symbol
-  table) with dynamic growth.
+  table) with dynamic growth. *Next concrete item.*
 - [ ] Real diagnostics: source locations on every token, error
   recovery, multi-error reports.
 - [x] Test infrastructure: per-feature `.adb` fixtures with expected
   output, runnable against bootstrap (`make test`) and stage1
-  (`make test-stage1`). 14 fixtures shipped; grows as features land.
+  (`make test-stage1`). 15 fixtures shipped; grows as features land.
 - [ ] CI: matrix build on every push.
 - [ ] Documented internal IR (one-page schema).
 
