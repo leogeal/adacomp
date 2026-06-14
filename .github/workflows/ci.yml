@@ -1,0 +1,39 @@
+name: CI
+
+# Runs the full bootstrap chain on every push to main and every PR:
+#   bootstrap  -> compile the C seed compiler
+#   test       -> fixture suite compiled by the bootstrap
+#   verify     -> stage1 and stage2 must produce byte-identical C
+#                 (the self-hosting guarantee)
+#   test-stage1-> fixture suite compiled by the self-hosted stage1
+# gcc, make, and bash are all present on ubuntu-latest by default.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  self-host:
+    name: Build, test, and verify self-hosting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          gcc --version | head -n 1
+          make --version | head -n 1
+
+      - name: Build bootstrap compiler
+        run: make bootstrap
+
+      - name: Fixture suite (compiled by bootstrap)
+        run: make test
+
+      - name: Verify self-hosting (stage1 == stage2)
+        run: make verify
+
+      - name: Fixture suite (compiled by self-hosted stage1)
+        run: make test-stage1
