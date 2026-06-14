@@ -10,10 +10,9 @@
 #include <string.h>
 #include <ctype.h>
 
-#define MAX_SRC    200000
+#define MAX_SRC    200000   /* unused: src now grows dynamically */
 #define MAX_TOK    4096
-#define MAX_SYMS   2000
-#define MAX_NAME   128
+#define MAX_NAME   128       /* cap on a single identifier's length */
 #define MAX_NEST   64
 
 /* Source buffer (dynamically grown to hold the whole input file). */
@@ -56,19 +55,39 @@ enum { SK_VAR=1, SK_CONST=2, SK_PARAM=3, SK_PROC=4, SK_FUNC=5, SK_TYPE=6 };
 enum { TY_INTEGER=1, TY_CHARACTER=2, TY_BOOLEAN=3, TY_ARRAY=4, TY_STRING=5,
        TY_ACCESS=6 };
 
-/* Symbol table */
-static char sym_name[MAX_SYMS][MAX_NAME];
-static int sym_nlen[MAX_SYMS];
-static int sym_kind[MAX_SYMS];
-static int sym_type[MAX_SYMS];
-static int sym_arr_lo[MAX_SYMS];
-static int sym_arr_hi[MAX_SYMS];
-static int sym_arr_el[MAX_SYMS];
-static int sym_arr_inner_lo[MAX_SYMS];
-static int sym_arr_inner_hi[MAX_SYMS];
-static int sym_scope[MAX_SYMS];
+/* Symbol table (dynamically grown; MAX_NAME caps a single name's length,
+   but the number of symbols grows without bound). */
+static char (*sym_name)[MAX_NAME] = NULL;
+static int *sym_nlen = NULL;
+static int *sym_kind = NULL;
+static int *sym_type = NULL;
+static int *sym_arr_lo = NULL;
+static int *sym_arr_hi = NULL;
+static int *sym_arr_el = NULL;
+static int *sym_arr_inner_lo = NULL;
+static int *sym_arr_inner_hi = NULL;
+static int *sym_scope = NULL;
+static int sym_cap = 0;
 static int sym_count = 0;
 static int cur_scope = 0;
+
+/* Grow all symbol-table arrays so index `need` (0-based) is valid. */
+static void grow_syms(int need) {
+    if (need < sym_cap) return;
+    int new_cap = sym_cap ? sym_cap * 2 : 2048;
+    if (new_cap <= need) new_cap = need + 1;
+    sym_name        = realloc(sym_name, (size_t)new_cap * MAX_NAME);
+    sym_nlen        = realloc(sym_nlen, (size_t)new_cap * sizeof(int));
+    sym_kind        = realloc(sym_kind, (size_t)new_cap * sizeof(int));
+    sym_type        = realloc(sym_type, (size_t)new_cap * sizeof(int));
+    sym_arr_lo      = realloc(sym_arr_lo, (size_t)new_cap * sizeof(int));
+    sym_arr_hi      = realloc(sym_arr_hi, (size_t)new_cap * sizeof(int));
+    sym_arr_el      = realloc(sym_arr_el, (size_t)new_cap * sizeof(int));
+    sym_arr_inner_lo = realloc(sym_arr_inner_lo, (size_t)new_cap * sizeof(int));
+    sym_arr_inner_hi = realloc(sym_arr_inner_hi, (size_t)new_cap * sizeof(int));
+    sym_scope       = realloc(sym_scope, (size_t)new_cap * sizeof(int));
+    sym_cap = new_cap;
+}
 
 /* Scope stack */
 static int scope_saved[MAX_NEST];
@@ -470,6 +489,7 @@ static int find_sym(const char *n, int nlen) {
 }
 
 static void add_sym(int kind, int typ) {
+    grow_syms(sym_count);
     memcpy(sym_name[sym_count], tok_val, tok_len);
     sym_nlen[sym_count] = tok_len;
     sym_kind[sym_count] = kind;

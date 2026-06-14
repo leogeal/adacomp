@@ -342,10 +342,18 @@ In progress.
       64 KB initial cap. (Off-by-one caught in review: grow before
       bumping `Src_Len` so the copy loop never reads the still-null old
       buffer — C `realloc` hid this in the bootstrap.)
-    - [ ] Name pool + symbol table (cumulative; the next real cap).
+    - [x] **Name pool + symbol table.** The 9 per-symbol arrays grow in
+      lock-step via `Ensure_Sym_Cap` (access-to-`Int_Vec`), and the name
+      pool via `Ensure_Name_Pool_Cap` (access-to-`Char_Vec`); the
+      bootstrap reallocs its 10 parallel arrays in `grow_syms`. Both
+      ensure capacity *before* bumping the count (the `Src` off-by-one
+      lesson). stage1 now compiles a 3000-symbol program (past the old
+      2000-symbol / 64 KB name-pool caps); self-hosting verifies, 16/16
+      fixtures under both compilers.
     - [ ] AST node store + NPool (per-unit-body; large bodies).
+      *Next concrete item.*
     - [ ] Token buffer (`Tok_Buffer`) — fixed max token length; lowest
-      priority. *Next concrete item: name pool + symbol table.*
+      priority.
 - [ ] Real diagnostics: source locations on every token, error
   recovery, multi-error reports.
 - [x] Test infrastructure: per-feature `.adb` fixtures with expected

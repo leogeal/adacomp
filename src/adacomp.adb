@@ -111,21 +111,24 @@ procedure Adacomp is
    TY_STRING    : constant Integer := 5;
    TY_ACCESS    : constant Integer := 6;
 
-   -- Symbol table (flat arrays)
-   type Int_Store is array (1 .. 2000) of Integer;
-   -- Symbol names stored as offset+length into a name pool
-   type Name_Pool_Buf is array (1 .. 64000) of Character;
-   Name_Pool         : Name_Pool_Buf;
+   -- Symbol table (dynamically grown). Names live in a growable character
+   -- pool addressed by offset+length; the per-symbol fields are growable
+   -- integer arrays kept in lock-step (all share Sym_Cap).
+   type Int_Vec is array (Integer range <>) of Integer;
+   type Int_Vec_Ptr is access Int_Vec;
+   Name_Pool         : Char_Vec_Ptr;
+   Name_Pool_Cap     : Integer := 0;
    Name_Pool_Len     : Integer := 0;
-   Sym_Name_Off      : Int_Store;
-   Sym_Name_Len      : Int_Store;
-   Sym_Kind          : Int_Store;
-   Sym_Type          : Int_Store;
-   Sym_Arr_Lo        : Int_Store;
-   Sym_Arr_Hi        : Int_Store;
-   Sym_Arr_El        : Int_Store;
-   Sym_Arr_Inner_Lo  : Int_Store;
-   Sym_Arr_Inner_Hi  : Int_Store;
+   Sym_Name_Off      : Int_Vec_Ptr;
+   Sym_Name_Len      : Int_Vec_Ptr;
+   Sym_Kind          : Int_Vec_Ptr;
+   Sym_Type          : Int_Vec_Ptr;
+   Sym_Arr_Lo        : Int_Vec_Ptr;
+   Sym_Arr_Hi        : Int_Vec_Ptr;
+   Sym_Arr_El        : Int_Vec_Ptr;
+   Sym_Arr_Inner_Lo  : Int_Vec_Ptr;
+   Sym_Arr_Inner_Hi  : Int_Vec_Ptr;
+   Sym_Cap           : Integer := 0;
    Sym_Count         : Integer := 0;
 
    -- Scope stack
@@ -764,8 +767,75 @@ procedure Adacomp is
       return 0;
    end Find_Sym;
 
+   --  Grow the name pool to hold at least Need characters.
+   procedure Ensure_Name_Pool_Cap (Need : Integer) is
+      New_Cap : Integer;
+      New_Buf : Char_Vec_Ptr;
+   begin
+      if Need <= Name_Pool_Cap then return; end if;
+      New_Cap := Name_Pool_Cap * 2 + 65536;
+      if New_Cap < Need then New_Cap := Need; end if;
+      New_Buf := new Char_Vec (1 .. New_Cap);
+      for I in 1 .. Name_Pool_Len loop
+         New_Buf (I) := Name_Pool (I);
+      end loop;
+      Name_Pool := New_Buf;
+      Name_Pool_Cap := New_Cap;
+   end Ensure_Name_Pool_Cap;
+
+   --  Grow all per-symbol arrays in lock-step to hold at least Need entries.
+   procedure Ensure_Sym_Cap (Need : Integer) is
+      New_Cap : Integer;
+      A1 : Int_Vec_Ptr;
+      A2 : Int_Vec_Ptr;
+      A3 : Int_Vec_Ptr;
+      A4 : Int_Vec_Ptr;
+      A5 : Int_Vec_Ptr;
+      A6 : Int_Vec_Ptr;
+      A7 : Int_Vec_Ptr;
+      A8 : Int_Vec_Ptr;
+      A9 : Int_Vec_Ptr;
+   begin
+      if Need <= Sym_Cap then return; end if;
+      New_Cap := Sym_Cap * 2;
+      if New_Cap < 2048 then New_Cap := 2048; end if;
+      if New_Cap < Need then New_Cap := Need; end if;
+      A1 := new Int_Vec (1 .. New_Cap);
+      A2 := new Int_Vec (1 .. New_Cap);
+      A3 := new Int_Vec (1 .. New_Cap);
+      A4 := new Int_Vec (1 .. New_Cap);
+      A5 := new Int_Vec (1 .. New_Cap);
+      A6 := new Int_Vec (1 .. New_Cap);
+      A7 := new Int_Vec (1 .. New_Cap);
+      A8 := new Int_Vec (1 .. New_Cap);
+      A9 := new Int_Vec (1 .. New_Cap);
+      for I in 1 .. Sym_Count loop
+         A1 (I) := Sym_Name_Off (I);
+         A2 (I) := Sym_Name_Len (I);
+         A3 (I) := Sym_Kind (I);
+         A4 (I) := Sym_Type (I);
+         A5 (I) := Sym_Arr_Lo (I);
+         A6 (I) := Sym_Arr_Hi (I);
+         A7 (I) := Sym_Arr_El (I);
+         A8 (I) := Sym_Arr_Inner_Lo (I);
+         A9 (I) := Sym_Arr_Inner_Hi (I);
+      end loop;
+      Sym_Name_Off := A1;
+      Sym_Name_Len := A2;
+      Sym_Kind := A3;
+      Sym_Type := A4;
+      Sym_Arr_Lo := A5;
+      Sym_Arr_Hi := A6;
+      Sym_Arr_El := A7;
+      Sym_Arr_Inner_Lo := A8;
+      Sym_Arr_Inner_Hi := A9;
+      Sym_Cap := New_Cap;
+   end Ensure_Sym_Cap;
+
    procedure Add_Sym (Kind : Integer; Typ : Integer) is
    begin
+      Ensure_Sym_Cap (Sym_Count + 1);
+      Ensure_Name_Pool_Cap (Name_Pool_Len + Tok_Len);
       Sym_Count := Sym_Count + 1;
       Sym_Name_Off (Sym_Count) := Name_Pool_Len + 1;
       Sym_Name_Len (Sym_Count) := Tok_Len;
@@ -789,6 +859,8 @@ procedure Adacomp is
 
    procedure Add_Sym_Named (Buf : Tok_Buffer; BLen : Integer; Kind : Integer; Typ : Integer) is
    begin
+      Ensure_Sym_Cap (Sym_Count + 1);
+      Ensure_Name_Pool_Cap (Name_Pool_Len + BLen);
       Sym_Count := Sym_Count + 1;
       Sym_Name_Off (Sym_Count) := Name_Pool_Len + 1;
       Sym_Name_Len (Sym_Count) := BLen;
