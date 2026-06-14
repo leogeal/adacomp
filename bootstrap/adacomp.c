@@ -16,8 +16,9 @@
 #define MAX_NAME   128
 #define MAX_NEST   64
 
-/* Source buffer */
-static char src[MAX_SRC];
+/* Source buffer (dynamically grown to hold the whole input file). */
+static char *src = NULL;
+static int src_cap = 0;
 static int src_len = 0;
 static int src_pos = 0;
 static int line_num = 1;
@@ -115,7 +116,17 @@ static void error(const char *msg) {
 static void read_file(const char *name) {
     FILE *f = fopen(name, "r");
     if (!f) { fprintf(stderr, "Cannot open %s\n", name); exit(1); }
-    src_len = fread(src, 1, MAX_SRC - 1, f);
+    src_cap = 65536;
+    src = malloc(src_cap);
+    src_len = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (src_len + 1 >= src_cap) {
+            src_cap *= 2;
+            src = realloc(src, src_cap);
+        }
+        src[src_len++] = (char)c;
+    }
     src[src_len] = 0;
     fclose(f);
 }

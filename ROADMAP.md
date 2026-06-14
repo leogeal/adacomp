@@ -332,9 +332,20 @@ In progress.
     self-hosted stage1 compiles it with byte-identical codegen to the
     bootstrap. adacomp.adb does not use the feature yet, so self-hosting
     stays byte-identical. 16/16 fixtures under both compilers.
-  - [ ] **Buffers/2: use it.** Convert adacomp.adb's own fixed buffers
-    (source, token, name pool, symbol table, AST node store) to
-    access-typed, grown on demand. *Next concrete item.*
+  - [~] **Buffers/2: use it.** Converting adacomp.adb's own fixed
+    buffers to access-typed, grown on demand, one at a time:
+    - [x] **Source buffer.** `Src` is now an access-to-`Char_Vec` grown
+      geometrically (×2 + 64 KB) in `Read_Source`; the bootstrap's `src`
+      likewise became a `realloc`-grown `char *`. Both compilers now read
+      a 359 KB source (past the old 200 KB cap); `make verify` already
+      exercises the regrowth path since adacomp.adb (~95 KB) exceeds the
+      64 KB initial cap. (Off-by-one caught in review: grow before
+      bumping `Src_Len` so the copy loop never reads the still-null old
+      buffer — C `realloc` hid this in the bootstrap.)
+    - [ ] Name pool + symbol table (cumulative; the next real cap).
+    - [ ] AST node store + NPool (per-unit-body; large bodies).
+    - [ ] Token buffer (`Tok_Buffer`) — fixed max token length; lowest
+      priority. *Next concrete item: name pool + symbol table.*
 - [ ] Real diagnostics: source locations on every token, error
   recovery, multi-error reports.
 - [x] Test infrastructure: per-feature `.adb` fixtures with expected

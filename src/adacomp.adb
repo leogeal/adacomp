@@ -11,9 +11,12 @@ with Ada.Command_Line;
 
 procedure Adacomp is
 
-   -- Source buffer
-   type Source_Buf is array (1 .. 200000) of Character;
-   Src      : Source_Buf;
+   -- Source buffer (dynamically grown via an access-to-unconstrained-array;
+   -- 1-based, so indexing matches the old fixed array exactly).
+   type Char_Vec is array (Integer range <>) of Character;
+   type Char_Vec_Ptr is access Char_Vec;
+   Src      : Char_Vec_Ptr;
+   Src_Cap  : Integer := 0;
    Src_Len  : Integer := 0;
    Src_Pos  : Integer := 1;
    Line_Num : Integer := 1;
@@ -285,6 +288,22 @@ procedure Adacomp is
       raise Program_Error;
    end Error;
 
+   -- Grow Src so it can hold at least Need characters (geometric growth).
+   procedure Ensure_Src_Cap (Need : Integer) is
+      New_Cap : Integer;
+      New_Buf : Char_Vec_Ptr;
+   begin
+      if Need <= Src_Cap then return; end if;
+      New_Cap := Src_Cap * 2 + 65536;
+      if New_Cap < Need then New_Cap := Need; end if;
+      New_Buf := new Char_Vec (1 .. New_Cap);
+      for I in 1 .. Src_Len loop
+         New_Buf (I) := Src (I);
+      end loop;
+      Src := New_Buf;
+      Src_Cap := New_Cap;
+   end Ensure_Src_Cap;
+
    procedure Read_Source (Name : String) is
       F  : Ada.Text_IO.File_Type;
       Ch : Character;
@@ -293,6 +312,10 @@ procedure Adacomp is
       Src_Len := 0;
       while not Ada.Text_IO.End_Of_File (F) loop
          Ada.Text_IO.Get (F, Ch);
+         --  Grow BEFORE bumping Src_Len, so Ensure_Src_Cap's copy loop
+         --  (1 .. Src_Len) only touches already-valid elements — the old
+         --  buffer may still be null on the first growth.
+         Ensure_Src_Cap (Src_Len + 1);
          Src_Len := Src_Len + 1;
          Src (Src_Len) := Ch;
       end loop;
