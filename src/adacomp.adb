@@ -236,26 +236,29 @@ procedure Adacomp is
    D_VAR_DOTTED      : constant Integer := 35;
    D_VAR_ACCESS      : constant Integer := 36;
 
-   -- Node storage as parallel arrays
-   type Node_Store is array (1 .. 10000) of Integer;
-   N_Kind    : Node_Store;
-   N_Op      : Node_Store;
-   N_Int     : Node_Store;  -- literal value, sym index, or sub-name length for DOTTED
-   N_Str_Off : Node_Store;  -- offset into NPool
-   N_Str_Len : Node_Store;
-   N_Left    : Node_Store;  -- primary operand
-   N_Right   : Node_Store;  -- BINARY rhs / INDEX rhs
-   N_Arg2    : Node_Store;  -- INDEX2 second index / DOTTED sub-name offset
-   N_First   : Node_Store;  -- arg list head for CALL / DOTTED
-   N_Next    : Node_Store;  -- sibling pointer in arg lists
-   N_Aux1    : Node_Store;  -- resolved-at-build scratch: inner subtrahend / el type / had-parens
-   N_Aux2    : Node_Store;  -- resolved-at-build scratch: outer dim count
-   N_Line    : Node_Store;
+   -- Node storage: 13 parallel growable arrays (access-to-Int_Vec, the
+   -- type introduced for the symbol table). Reset_AST only rewinds the
+   -- lengths and keeps the capacity, so a unit's peak allocation is
+   -- reached once and reused for every later unit.
+   N_Kind    : Int_Vec_Ptr;
+   N_Op      : Int_Vec_Ptr;
+   N_Int     : Int_Vec_Ptr;  -- literal value, sym index, or sub-name length for DOTTED
+   N_Str_Off : Int_Vec_Ptr;  -- offset into NPool
+   N_Str_Len : Int_Vec_Ptr;
+   N_Left    : Int_Vec_Ptr;  -- primary operand
+   N_Right   : Int_Vec_Ptr;  -- BINARY rhs / INDEX rhs
+   N_Arg2    : Int_Vec_Ptr;  -- INDEX2 second index / DOTTED sub-name offset
+   N_First   : Int_Vec_Ptr;  -- arg list head for CALL / DOTTED
+   N_Next    : Int_Vec_Ptr;  -- sibling pointer in arg lists
+   N_Aux1    : Int_Vec_Ptr;  -- resolved-at-build scratch: inner subtrahend / el type / had-parens
+   N_Aux2    : Int_Vec_Ptr;  -- resolved-at-build scratch: outer dim count
+   N_Line    : Int_Vec_Ptr;
+   N_Cap     : Integer := 0;
    N_Count   : Integer := 1;  -- index 0 reserved; allocations start at 1
 
-   -- Character pool for AST names and string literals
-   type NPool_Buf is array (1 .. 200000) of Character;
-   NPool     : NPool_Buf;
+   -- Character pool for AST names and string literals (growable).
+   NPool     : Char_Vec_Ptr;
+   NPool_Cap : Integer := 0;
    NPool_Len : Integer := 0;
 
    -- Helper: lowercase character
@@ -897,13 +900,82 @@ procedure Adacomp is
 
    procedure Reset_AST is
    begin
+      --  Rewind lengths only; keep the grown capacity for reuse.
       N_Count := 1;
       NPool_Len := 0;
    end Reset_AST;
 
+   --  Grow all node arrays in lock-step so index Need is valid. Existing
+   --  nodes are 1 .. N_Count - 1 (index 0 is reserved, N_Count is the next
+   --  free slot), so only those are copied.
+   procedure Ensure_Node_Cap (Need : Integer) is
+      New_Cap : Integer;
+      A1 : Int_Vec_Ptr;
+      A2 : Int_Vec_Ptr;
+      A3 : Int_Vec_Ptr;
+      A4 : Int_Vec_Ptr;
+      A5 : Int_Vec_Ptr;
+      A6 : Int_Vec_Ptr;
+      A7 : Int_Vec_Ptr;
+      A8 : Int_Vec_Ptr;
+      A9 : Int_Vec_Ptr;
+      A10 : Int_Vec_Ptr;
+      A11 : Int_Vec_Ptr;
+      A12 : Int_Vec_Ptr;
+      A13 : Int_Vec_Ptr;
+   begin
+      if Need <= N_Cap then return; end if;
+      New_Cap := N_Cap * 2;
+      if New_Cap < 16384 then New_Cap := 16384; end if;
+      if New_Cap < Need then New_Cap := Need; end if;
+      A1  := new Int_Vec (1 .. New_Cap);
+      A2  := new Int_Vec (1 .. New_Cap);
+      A3  := new Int_Vec (1 .. New_Cap);
+      A4  := new Int_Vec (1 .. New_Cap);
+      A5  := new Int_Vec (1 .. New_Cap);
+      A6  := new Int_Vec (1 .. New_Cap);
+      A7  := new Int_Vec (1 .. New_Cap);
+      A8  := new Int_Vec (1 .. New_Cap);
+      A9  := new Int_Vec (1 .. New_Cap);
+      A10 := new Int_Vec (1 .. New_Cap);
+      A11 := new Int_Vec (1 .. New_Cap);
+      A12 := new Int_Vec (1 .. New_Cap);
+      A13 := new Int_Vec (1 .. New_Cap);
+      for I in 1 .. N_Count - 1 loop
+         A1 (I)  := N_Kind (I);
+         A2 (I)  := N_Op (I);
+         A3 (I)  := N_Int (I);
+         A4 (I)  := N_Str_Off (I);
+         A5 (I)  := N_Str_Len (I);
+         A6 (I)  := N_Left (I);
+         A7 (I)  := N_Right (I);
+         A8 (I)  := N_Arg2 (I);
+         A9 (I)  := N_First (I);
+         A10 (I) := N_Next (I);
+         A11 (I) := N_Aux1 (I);
+         A12 (I) := N_Aux2 (I);
+         A13 (I) := N_Line (I);
+      end loop;
+      N_Kind := A1;
+      N_Op := A2;
+      N_Int := A3;
+      N_Str_Off := A4;
+      N_Str_Len := A5;
+      N_Left := A6;
+      N_Right := A7;
+      N_Arg2 := A8;
+      N_First := A9;
+      N_Next := A10;
+      N_Aux1 := A11;
+      N_Aux2 := A12;
+      N_Line := A13;
+      N_Cap := New_Cap;
+   end Ensure_Node_Cap;
+
    function New_Node (Kind : Integer) return Integer is
       N : Integer;
    begin
+      Ensure_Node_Cap (N_Count);
       N := N_Count;
       N_Count := N_Count + 1;
       N_Kind (N) := Kind;
@@ -922,9 +994,26 @@ procedure Adacomp is
       return N;
    end New_Node;
 
+   --  Grow the AST string pool to hold at least Need characters.
+   procedure Ensure_NPool_Cap (Need : Integer) is
+      New_Cap : Integer;
+      New_Buf : Char_Vec_Ptr;
+   begin
+      if Need <= NPool_Cap then return; end if;
+      New_Cap := NPool_Cap * 2 + 65536;
+      if New_Cap < Need then New_Cap := Need; end if;
+      New_Buf := new Char_Vec (1 .. New_Cap);
+      for I in 1 .. NPool_Len loop
+         New_Buf (I) := NPool (I);
+      end loop;
+      NPool := New_Buf;
+      NPool_Cap := New_Cap;
+   end Ensure_NPool_Cap;
+
    function Pool_Str (Buf : Tok_Buffer; Len : Integer) return Integer is
       Off : Integer;
    begin
+      Ensure_NPool_Cap (NPool_Len + Len);
       Off := NPool_Len + 1;
       for I in 1 .. Len loop
          NPool_Len := NPool_Len + 1;

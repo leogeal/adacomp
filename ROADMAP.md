@@ -317,10 +317,12 @@ In progress.
   compilers. (Declarations remain streamed at program-unit level —
   proc/func decls drive the recursion rather than being nodes — which
   is why their bodies, not the decls themselves, are the trees.)
-- [ ] Replace fixed-size buffers (source, token, name pool, symbol
-  table) with dynamic growth. **In progress** — true dynamic growth in
-  the *self-hosted* compiler needs heap allocation, which the subset
-  lacked, so this was split:
+- [x] Replace fixed-size buffers (source, token, name pool, symbol
+  table) with dynamic growth. Every cap that bites real programs is gone
+  in both compilers; only the per-token length (4096) remains as a
+  deliberate fixed limit. True dynamic growth in the *self-hosted*
+  compiler needed heap allocation, which the subset lacked, so this was
+  split:
   - [x] **Buffers/1: access types.** Added a minimal, C-mappable
     access-type subset to both compilers — unconstrained array types
     (`array (Integer range <>) of E`), access types (`type P is access
@@ -332,7 +334,7 @@ In progress.
     self-hosted stage1 compiles it with byte-identical codegen to the
     bootstrap. adacomp.adb does not use the feature yet, so self-hosting
     stays byte-identical. 16/16 fixtures under both compilers.
-  - [~] **Buffers/2: use it.** Converting adacomp.adb's own fixed
+  - [x] **Buffers/2: use it.** Converted adacomp.adb's own fixed
     buffers to access-typed, grown on demand, one at a time:
     - [x] **Source buffer.** `Src` is now an access-to-`Char_Vec` grown
       geometrically (×2 + 64 KB) in `Read_Source`; the bootstrap's `src`
@@ -350,10 +352,17 @@ In progress.
       lesson). stage1 now compiles a 3000-symbol program (past the old
       2000-symbol / 64 KB name-pool caps); self-hosting verifies, 16/16
       fixtures under both compilers.
-    - [ ] AST node store + NPool (per-unit-body; large bodies).
-      *Next concrete item.*
+    - [x] **AST node store + string pool.** The 13 parallel node arrays
+      grow in lock-step (`Ensure_Node_Cap`, access-to-`Int_Vec`) and the
+      AST string pool via `Ensure_NPool_Cap` (access-to-`Char_Vec`); the
+      bootstrap reallocs its 13 arrays + pool in `grow_nodes`/`pool_str`.
+      `Reset_AST` keeps the grown capacity and only rewinds the lengths,
+      so the per-unit peak is allocated once and reused. stage1 compiles
+      a single ~20 K-node procedure body (past the old 10 K cap);
+      self-hosting verifies, 16/16 fixtures under both compilers.
     - [ ] Token buffer (`Tok_Buffer`) — fixed max token length; lowest
-      priority.
+      priority (a single identifier/string over 4096 chars; not a real
+      constraint, left as a known cap).
 - [ ] Real diagnostics: source locations on every token, error
   recovery, multi-error reports.
 - [x] Test infrastructure: per-feature `.adb` fixtures with expected

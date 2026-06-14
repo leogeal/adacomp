@@ -521,8 +521,7 @@ static void pop_scope(void) {
    declarations — Phase 1 introduces the AST incrementally. Index 0 is
    reserved as "no node"; allocations start at 1. */
 
-#define MAX_NODES   10000
-#define MAX_NPOOL   200000
+/* (former AST caps; the node store and string pool now grow dynamically) */
 
 enum {
     A_INT_LIT=1, A_CHAR_LIT=2, A_STR_LIT=3, A_BOOL_LIT=4,
@@ -571,23 +570,50 @@ enum {
     PKG_CREATE=5, PKG_CLOSE=6, PKG_GET_LINE=7, PKG_GET=8, PKG_GENERIC=9
 };
 
-static int n_kind[MAX_NODES];
-static int n_op[MAX_NODES];
-static int n_int[MAX_NODES];     /* literal value / sym index / sub-name length for DOTTED */
-static int n_str_off[MAX_NODES]; /* name/string pool offset */
-static int n_str_len[MAX_NODES]; /* name/string length */
-static int n_left[MAX_NODES];    /* primary operand: UNARY operand, BINARY lhs, INDEX/INDEX2 base, ATTR arg */
-static int n_right[MAX_NODES];   /* BINARY rhs, INDEX/INDEX2 index expression */
-static int n_arg2[MAX_NODES];    /* INDEX2 second index, DOTTED sub-name offset */
-static int n_first[MAX_NODES];   /* CALL/DOTTED arg list head */
-static int n_next[MAX_NODES];    /* sibling pointer in arg lists */
-static int n_aux1[MAX_NODES];    /* resolved-at-build scratch: inner subtrahend / el type / had-parens */
-static int n_aux2[MAX_NODES];    /* resolved-at-build scratch: outer dim count */
-static int n_line[MAX_NODES];    /* source line at parse time */
-static int n_count = 1;          /* index 0 reserved; first real allocation at 1 */
+/* AST node store: 13 parallel arrays grown in lock-step, plus a string
+   pool. Both grow on demand; reset_ast() only rewinds the lengths and
+   keeps the capacity, so a unit's peak allocation is reached once and
+   reused for every later unit. */
+static int *n_kind = NULL;
+static int *n_op = NULL;       /* literal value / op code / sub-op / subtrahend */
+static int *n_int = NULL;      /* literal value / sym index / sub-name length for DOTTED */
+static int *n_str_off = NULL;  /* name/string pool offset */
+static int *n_str_len = NULL;  /* name/string length */
+static int *n_left = NULL;     /* primary operand: UNARY operand, BINARY lhs, INDEX base, ATTR arg */
+static int *n_right = NULL;    /* BINARY rhs, INDEX/INDEX2 index expression */
+static int *n_arg2 = NULL;     /* INDEX2 second index, DOTTED sub-name offset */
+static int *n_first = NULL;    /* CALL/DOTTED arg list head */
+static int *n_next = NULL;     /* sibling pointer in arg lists */
+static int *n_aux1 = NULL;     /* resolved-at-build scratch: inner subtrahend / el type / had-parens */
+static int *n_aux2 = NULL;     /* resolved-at-build scratch: outer dim count */
+static int *n_line = NULL;     /* source line at parse time */
+static int n_cap = 0;
+static int n_count = 1;        /* index 0 reserved; first real allocation at 1 */
 
-static char npool[MAX_NPOOL];
+static char *npool = NULL;
+static int npool_cap = 0;
 static int npool_len = 0;
+
+/* Grow all node arrays so index `need` is valid. */
+static void grow_nodes(int need) {
+    if (need < n_cap) return;
+    int new_cap = n_cap ? n_cap * 2 : 16384;
+    if (new_cap <= need) new_cap = need + 1;
+    n_kind    = realloc(n_kind, (size_t)new_cap * sizeof(int));
+    n_op      = realloc(n_op, (size_t)new_cap * sizeof(int));
+    n_int     = realloc(n_int, (size_t)new_cap * sizeof(int));
+    n_str_off = realloc(n_str_off, (size_t)new_cap * sizeof(int));
+    n_str_len = realloc(n_str_len, (size_t)new_cap * sizeof(int));
+    n_left    = realloc(n_left, (size_t)new_cap * sizeof(int));
+    n_right   = realloc(n_right, (size_t)new_cap * sizeof(int));
+    n_arg2    = realloc(n_arg2, (size_t)new_cap * sizeof(int));
+    n_first   = realloc(n_first, (size_t)new_cap * sizeof(int));
+    n_next    = realloc(n_next, (size_t)new_cap * sizeof(int));
+    n_aux1    = realloc(n_aux1, (size_t)new_cap * sizeof(int));
+    n_aux2    = realloc(n_aux2, (size_t)new_cap * sizeof(int));
+    n_line    = realloc(n_line, (size_t)new_cap * sizeof(int));
+    n_cap = new_cap;
+}
 
 static void reset_ast(void) {
     n_count = 1;
@@ -595,7 +621,7 @@ static void reset_ast(void) {
 }
 
 static int new_node(int kind) {
-    if (n_count >= MAX_NODES) error("AST node overflow");
+    grow_nodes(n_count);
     int n = n_count++;
     n_kind[n] = kind;
     n_op[n] = 0;
@@ -614,7 +640,12 @@ static int new_node(int kind) {
 }
 
 static int pool_str(const char *s, int len) {
-    if (npool_len + len > MAX_NPOOL) error("AST name pool overflow");
+    if (npool_len + len > npool_cap) {
+        int new_cap = npool_cap ? npool_cap : 65536;
+        while (new_cap < npool_len + len) new_cap *= 2;
+        npool = realloc(npool, (size_t)new_cap);
+        npool_cap = new_cap;
+    }
     int off = npool_len;
     for (int i = 0; i < len; i++) npool[npool_len++] = s[i];
     return off;
