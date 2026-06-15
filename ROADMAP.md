@@ -413,8 +413,19 @@ Started.
     Deferred to stage 2 / later: separate compilation (.c+.h, `with` ->
     #include, linking), package-level variables/types, package init
     `begin`, library-level & child packages, `use` visibility.
-  - [ ] **Stage 2: separate compilation** — package body -> .c + a
-    generated .h; `with P` -> `#include "p.h"`; multi-unit build + link.
+  - [x] **Stage 2: separate compilation.** A compilation unit can now be
+    a library-level package: a spec `package P is ... end P;` compiles to
+    a `.h` (include-guarded prototypes + `#include "ada_runtime.h"`), a
+    body `package body P is ... end P;` to a `.c` (its own `#include
+    "p.h"` + the definitions). A simple `with P;` in any unit emits
+    `#include "p.h"` (dotted `with Ada.Text_IO;` stays a builtin, ignored,
+    so adacomp.adb self-hosts byte-identically). Demo `test/mf/`
+    (mathpkg.ads/.adb + mfmain.adb) builds spec->.h, body->.c, main->.c
+    and links them; `make test-multifile[-stage1]` runs it under both
+    compilers (and in CI). The self-hosted stage1 emits all three units
+    byte-identically to the bootstrap. Deferred: package-level
+    variables/types in specs (need extern handling), package init `begin`,
+    child packages, `use` visibility.
 - [ ] Enumerations (beyond Boolean).
 - [ ] Access types beyond the buffer-growth subset (`.all`, general
   allocators), deallocation.

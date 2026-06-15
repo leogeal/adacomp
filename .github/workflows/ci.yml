@@ -32,8 +32,14 @@ jobs:
       - name: Fixture suite (compiled by bootstrap)
         run: make test
 
+      - name: Separate-compilation demo (bootstrap)
+        run: make test-multifile
+
       - name: Verify self-hosting (stage1 == stage2)
         run: make verify
 
       - name: Fixture suite (compiled by self-hosted stage1)
         run: make test-stage1
+
+      - name: Separate-compilation demo (self-hosted stage1)
+        run: make test-multifile-stage1

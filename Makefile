@@ -5,7 +5,8 @@ CC = gcc
 CFLAGS = -O2 -Wall -Wno-unused-function
 RUNTIME = runtime
 
-.PHONY: all clean bootstrap stage1 stage2 test test-stage1 verify
+.PHONY: all clean bootstrap stage1 stage2 test test-stage1 \
+        test-multifile test-multifile-stage1 verify
 
 all: bootstrap test
 
@@ -40,6 +41,14 @@ test: build/bootstrap
 # catching divergence between the C bootstrap and the Ada self-host.
 test-stage1: build/stage1
 	@COMPILER=stage1 ./test/run.sh
+
+# Separate-compilation demo: a package spec/body compiled to .h/.c and a
+# main unit linked against it (the multi-file analogue of `test`).
+test-multifile: build/bootstrap
+	@./test/run_multifile.sh
+
+test-multifile-stage1: build/stage1
+	@COMPILER=stage1 ./test/run_multifile.sh
 
 build:
 	mkdir -p build

@@ -149,6 +149,14 @@ procedure Adacomp is
    -- via Sym_Arr_Lo so call sites mangle to match.
    Cur_Pkg : Integer := 0;
 
+   -- Simple `with P;` clauses (user packages) collected for #include "p.h".
+   -- Dotted withs (Ada.Text_IO, ...) are builtins and are not collected.
+   -- Anonymous inline arrays (not named types) so the nested 2D indexing
+   -- With_Buf (I) (J) is recognised, as for P_Names elsewhere.
+   With_Buf   : array (1 .. 32) of Tok_Buffer;
+   With_NLen  : array (1 .. 32) of Integer;
+   With_Count : Integer := 0;
+
    -- Output
    Out_File : Ada.Text_IO.File_Type;
 
@@ -285,6 +293,15 @@ procedure Adacomp is
       end if;
       return C;
    end To_Lower;
+
+   -- Helper: uppercase character (for header include guards)
+   function To_Upper (C : Character) return Character is
+   begin
+      if C >= 'a' and C <= 'z' then
+         return Character'Val (Character'Pos (C) - 32);
+      end if;
+      return C;
+   end To_Upper;
 
    function Is_Alpha (C : Character) return Boolean is
    begin
@@ -849,6 +866,23 @@ procedure Adacomp is
          Emit_Ch (To_Lower (Buf (I)));
       end loop;
    end Emit_Lower;
+
+   procedure Emit_Upper (Buf : Tok_Buffer; Len : Integer) is
+   begin
+      for I in 1 .. Len loop
+         Emit_Ch (To_Upper (Buf (I)));
+      end loop;
+   end Emit_Upper;
+
+   -- Emit `#include "<pkg>.h"` for each simple `with` clause collected.
+   procedure Emit_With_Includes is
+   begin
+      for I in 1 .. With_Count loop
+         Emit ("#include """);
+         Emit_Lower (With_Buf (I), With_NLen (I));
+         Emit_Ln (".h""");
+      end loop;
+   end Emit_With_Includes;
 
    -- Emit a symbol's name (held in the Name_Pool) in lowercase.
    procedure Emit_Name_Pool_Lower (Off : Integer; Len : Integer) is
@@ -3423,17 +3457,111 @@ procedure Adacomp is
    procedure Parse_Context is
    begin
       while Tok = TK_WITH or Tok = TK_USE loop
-         Next_Token;
-         while Tok /= TK_SEMI and Tok /= TK_EOF loop
+         declare
+            Is_With : Boolean := (Tok = TK_WITH);
+            Nm : Tok_Buffer;
+            NL : Integer;
+         begin
             Next_Token;
-         end loop;
-         if Tok = TK_SEMI then Next_Token; end if;
+            if Is_With and then Tok = TK_IDENT then
+               NL := Tok_Len;
+               for I in 1 .. Tok_Len loop
+                  Nm (I) := Tok_Val (I);
+               end loop;
+               Next_Token;
+               -- Simple `with Name;` -> user package; dotted `with Ada.X;`
+               -- is a builtin and is ignored.
+               if Tok /= TK_DOT and then With_Count < 32 then
+                  With_Count := With_Count + 1;
+                  for I in 1 .. NL loop
+                     With_Buf (With_Count) (I) := Nm (I);
+                  end loop;
+                  With_NLen (With_Count) := NL;
+               end if;
+            end if;
+            while Tok /= TK_SEMI and Tok /= TK_EOF loop
+               Next_Token;
+            end loop;
+            if Tok = TK_SEMI then Next_Token; end if;
+         end;
       end loop;
    end Parse_Context;
+
+   procedure Emit_Int_To_Str is
+   begin
+      Emit_Ln ("static char *int_to_str(int n) {");
+      Emit_Ln ("    static char buf[20];");
+      Emit_Ln ("    sprintf(buf, ""%d"", n);");
+      Emit_Ln ("    return buf;");
+      Emit_Ln ("}");
+      Emit_Ln ("");
+   end Emit_Int_To_Str;
+
+   -- A library-level package unit (separate compilation):
+   --   spec  package P is <specs> end P;  -> a .h of prototypes
+   --   body  package body P is <bodies> end P; -> a .c of definitions
+   procedure Parse_Package_Unit is
+      PName : Tok_Buffer;
+      PLen  : Integer;
+      Psym  : Integer;
+      Is_Body : Boolean := False;
+   begin
+      Next_Token;   -- consume 'package'
+      if Tok = TK_IDENT and then Tok_Eq_CI ("body") then
+         Is_Body := True;
+         Next_Token;
+      end if;
+      PLen := Tok_Len;
+      for I in 1 .. Tok_Len loop
+         PName (I) := Tok_Val (I);
+      end loop;
+      Add_Sym (SK_PACKAGE, 0);
+      Psym := Sym_Count;
+      Next_Token;
+      Expect (TK_IS);
+      Cur_Pkg := Psym + 1;
+
+      if Is_Body then
+         Emit_Ln ("#include <stdio.h>");
+         Emit_Ln ("#include <stdlib.h>");
+         Emit_Ln ("#include <string.h>");
+         Emit ("#include """); Emit_Lower (PName, PLen); Emit_Ln (".h""");
+         Emit_With_Includes;
+         Emit_Ln ("");
+         Emit_Int_To_Str;
+         Push_Scope;
+         Parse_Declarations;
+         Pop_Scope;
+      else
+         Emit ("#ifndef "); Emit_Upper (PName, PLen); Emit_Ln ("_H");
+         Emit ("#define "); Emit_Upper (PName, PLen); Emit_Ln ("_H");
+         Emit_Ln ("#include ""ada_runtime.h""");
+         Emit_With_Includes;
+         Emit_Ln ("");
+         Push_Scope;
+         Parse_Declarations;
+         Pop_Scope;
+         Emit_Ln ("#endif");
+      end if;
+
+      Cur_Pkg := 0;
+      if Tok = TK_BEGIN then
+         Error ("package initialization (begin) not supported");
+      end if;
+      Expect (TK_END);
+      if Tok = TK_IDENT then Next_Token; end if;
+      Expect (TK_SEMI);
+   end Parse_Package_Unit;
 
    procedure Parse_Program is
    begin
       Parse_Context;
+
+      if Tok = TK_PACKAGE then
+         Parse_Package_Unit;
+         return;
+      end if;
+
       Expect (TK_PROCEDURE);
       Next_Token;
       Expect (TK_IS);
@@ -3442,13 +3570,9 @@ procedure Adacomp is
       Emit_Ln ("#include <stdlib.h>");
       Emit_Ln ("#include <string.h>");
       Emit_Ln ("#include ""ada_runtime.h""");
+      Emit_With_Includes;
       Emit_Ln ("");
-      Emit_Ln ("static char *int_to_str(int n) {");
-      Emit_Ln ("    static char buf[20];");
-      Emit_Ln ("    sprintf(buf, ""%d"", n);");
-      Emit_Ln ("    return buf;");
-      Emit_Ln ("}");
-      Emit_Ln ("");
+      Emit_Int_To_Str;
 
       Push_Scope;
       Parse_Declarations;

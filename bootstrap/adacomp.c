@@ -110,6 +110,13 @@ static int indent_level = 0;
 static char main_name[MAX_NAME];
 static int main_name_len = 0;
 
+/* Simple `with P;` clauses (user packages) collected for #include "p.h".
+   Dotted withs (Ada.Text_IO, ...) are builtins and are not collected. */
+#define MAX_WITHS 32
+static char with_buf[MAX_WITHS][MAX_NAME];
+static int with_nlen[MAX_WITHS];
+static int with_count = 0;
+
 /* True while emitting statements for the outermost program procedure,
    so a bare Ada `return;` translates to `return 0;` in C's int main. */
 static int in_main_proc = 0;
@@ -785,6 +792,19 @@ static void emit_c_type(int typ) {
 
 static void emit_str_lower(const char *s, int len) {
     for (int i = 0; i < len; i++) fputc(tolower((unsigned char)s[i]), out_file);
+}
+
+static void emit_str_upper(const char *s, int len) {
+    for (int i = 0; i < len; i++) fputc(toupper((unsigned char)s[i]), out_file);
+}
+
+/* Emit `#include "<pkg>.h"` for each simple `with` clause collected. */
+static void emit_with_includes(void) {
+    for (int i = 0; i < with_count; i++) {
+        emit("#include \"");
+        emit_str_lower(with_buf[i], with_nlen[i]);
+        emit_line(".h\"");
+    }
 }
 
 /* A subprogram's emitted C name: <pkg>_<name> when declared inside a
@@ -2629,16 +2649,91 @@ static void emit_declaration_chain(int head) {
 
 static void parse_context(void) {
     while (tok == TK_WITH || tok == TK_USE) {
+        int is_with = (tok == TK_WITH);
         next_token();
+        if (is_with && tok == TK_IDENT) {
+            char nm[MAX_NAME];
+            int nl = tok_len;
+            memcpy(nm, tok_val, tok_len);
+            next_token();
+            /* A simple `with Name;` is a user package -> #include "name.h".
+               A dotted `with Ada.Text_IO;` is a builtin -> ignored. */
+            if (tok != TK_DOT && with_count < MAX_WITHS) {
+                memcpy(with_buf[with_count], nm, nl);
+                with_nlen[with_count] = nl;
+                with_count++;
+            }
+        }
         while (tok != TK_SEMI && tok != TK_EOF) next_token();
         if (tok == TK_SEMI) next_token();
     }
 }
 
-/* ---- Parse main program ---- */
+static void emit_int_to_str(void) {
+    emit_line("static char *int_to_str(int n) {");
+    emit_line("    static char buf[20];");
+    emit_line("    sprintf(buf, \"%d\", n);");
+    emit_line("    return buf;");
+    emit_line("}");
+    emit_line("");
+}
+
+/* ---- Parse a library-level package unit (separate compilation) ----
+   A spec  `package P is <subprogram specs> end P;` -> a .h of prototypes.
+   A body  `package body P is <bodies> end P;`      -> a .c of definitions. */
+static void parse_package_unit(void) {
+    next_token();                       /* consume 'package' */
+    int is_body = 0;
+    if (tok == TK_IDENT && tok_eq_ci("body")) { is_body = 1; next_token(); }
+    char pname[MAX_NAME];
+    int plen = tok_len;
+    memcpy(pname, tok_val, tok_len);
+    add_sym(SK_PACKAGE, 0);
+    int psym = sym_count - 1;
+    next_token();
+    expect(TK_IS);
+    cur_pkg = psym + 1;
+
+    if (is_body) {
+        emit_line("#include <stdio.h>");
+        emit_line("#include <stdlib.h>");
+        emit_line("#include <string.h>");
+        emit("#include \""); emit_str_lower(pname, plen); emit_line(".h\"");
+        emit_with_includes();
+        emit_line("");
+        emit_int_to_str();
+        push_scope();
+        parse_declarations();
+        pop_scope();
+    } else {
+        emit("#ifndef "); emit_str_upper(pname, plen); emit_line("_H");
+        emit("#define "); emit_str_upper(pname, plen); emit_line("_H");
+        emit_line("#include \"ada_runtime.h\"");
+        emit_with_includes();
+        emit_line("");
+        push_scope();
+        parse_declarations();
+        pop_scope();
+        emit_line("#endif");
+    }
+
+    cur_pkg = 0;
+    if (tok == TK_BEGIN) error("package initialization (begin) not supported");
+    expect(TK_END);
+    if (tok == TK_IDENT) next_token();
+    expect(TK_SEMI);
+}
+
+/* ---- Parse a compilation unit: a main procedure or a package ---- */
 
 static void parse_program(void) {
     parse_context();
+
+    if (tok == TK_PACKAGE) {
+        parse_package_unit();
+        return;
+    }
+
     expect(TK_PROCEDURE);
 
     main_name_len = tok_len;
@@ -2651,13 +2746,9 @@ static void parse_program(void) {
     emit_line("#include <stdlib.h>");
     emit_line("#include <string.h>");
     emit_line("#include \"ada_runtime.h\"");
+    emit_with_includes();
     emit_line("");
-    emit_line("static char *int_to_str(int n) {");
-    emit_line("    static char buf[20];");
-    emit_line("    sprintf(buf, \"%d\", n);");
-    emit_line("    return buf;");
-    emit_line("}");
-    emit_line("");
+    emit_int_to_str();
 
     push_scope();
     parse_declarations();
