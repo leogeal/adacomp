@@ -42,7 +42,8 @@ enum {
     TK_INTEGER=63, TK_CHARACTER=64, TK_BOOLEAN=65,
     TK_TRUE=66, TK_FALSE=67, TK_DECLARE=68, TK_RAISE=69,
     TK_STRING=70, TK_REVERSE=71, TK_TICK=72,
-    TK_ACCESS=73, TK_NEW=74, TK_RANGE=75, TK_BOX=76, TK_RECORD=77
+    TK_ACCESS=73, TK_NEW=74, TK_RANGE=75, TK_BOX=76, TK_RECORD=77,
+    TK_PACKAGE=78
 };
 
 /* Current token */
@@ -52,7 +53,8 @@ static int tok_len = 0;
 static int tok_int = 0;
 
 /* Symbol kinds */
-enum { SK_VAR=1, SK_CONST=2, SK_PARAM=3, SK_PROC=4, SK_FUNC=5, SK_TYPE=6 };
+enum { SK_VAR=1, SK_CONST=2, SK_PARAM=3, SK_PROC=4, SK_FUNC=5, SK_TYPE=6,
+       SK_PACKAGE=7 };
 
 /* Type kinds */
 enum { TY_INTEGER=1, TY_CHARACTER=2, TY_BOOLEAN=3, TY_ARRAY=4, TY_STRING=5,
@@ -73,6 +75,10 @@ static int *sym_scope = NULL;
 static int sym_cap = 0;
 static int sym_count = 0;
 static int cur_scope = 0;
+/* While compiling a package's declarations, the package's symbol index
+   (0 = not in a package). Subprograms declared here are name-mangled
+   <pkg>_<op> and tagged via sym_arr_lo so call sites mangle to match. */
+static int cur_pkg = 0;
 
 /* Grow all symbol-table arrays so index `need` (0-based) is valid. */
 static void grow_syms(int need) {
@@ -217,6 +223,7 @@ static int check_keyword(void) {
     if (tok_eq_ci("new")) return TK_NEW;
     if (tok_eq_ci("range")) return TK_RANGE;
     if (tok_eq_ci("record")) return TK_RECORD;
+    if (tok_eq_ci("package")) return TK_PACKAGE;
     if (tok_eq_ci("not")) return TK_NOT;
     if (tok_eq_ci("and")) return TK_AND;
     if (tok_eq_ci("or")) return TK_OR;
@@ -694,6 +701,26 @@ static int pool_str(const char *s, int len) {
     return off;
 }
 
+/* Set node n's call name: <pkg>_<name> when the callee is a package
+   subprogram (tagged in sym_arr_lo), else <name>. Resolves the mangling
+   at build time so the walker stays symbol-table-independent. */
+static void set_call_name(int n, const char *name, int len, int sidx) {
+    if (sidx >= 0 && (sym_kind[sidx] == SK_PROC || sym_kind[sidx] == SK_FUNC)
+        && sym_arr_lo[sidx] != 0) {
+        int pk = sym_arr_lo[sidx] - 1;   /* stored as index + 1 */
+        char buf[MAX_TOK + MAX_NAME + 2];
+        int blen = 0;
+        for (int i = 0; i < sym_nlen[pk]; i++) buf[blen++] = sym_name[pk][i];
+        buf[blen++] = '_';
+        for (int i = 0; i < len; i++) buf[blen++] = name[i];
+        n_str_off[n] = pool_str(buf, blen);
+        n_str_len[n] = blen;
+    } else {
+        n_str_off[n] = pool_str(name, len);
+        n_str_len[n] = len;
+    }
+}
+
 /* ---- Forward declarations ---- */
 static void parse_expression(void);
 static int  parse_expression_ast(void);
@@ -758,6 +785,17 @@ static void emit_c_type(int typ) {
 
 static void emit_str_lower(const char *s, int len) {
     for (int i = 0; i < len; i++) fputc(tolower((unsigned char)s[i]), out_file);
+}
+
+/* A subprogram's emitted C name: <pkg>_<name> when declared inside a
+   package, else just <name>. cur_pkg is the package symbol index + 1
+   (0 = not in a package), so package symbol index 0 isn't ambiguous. */
+static void emit_sub_name(const char *s, int len) {
+    if (cur_pkg) {
+        emit_str_lower(sym_name[cur_pkg - 1], sym_nlen[cur_pkg - 1]);
+        emit("_");
+    }
+    emit_str_lower(s, len);
 }
 
 static int parse_primary_ast(void) {
@@ -884,8 +922,7 @@ static int parse_primary_ast(void) {
                 /* Function/procedure call: name(arg, arg, ...) */
                 next_token();
                 n = new_node(A_CALL);
-                n_str_off[n] = pool_str(saved, saved_len);
-                n_str_len[n] = saved_len;
+                set_call_name(n, saved, saved_len, sidx);
                 n_int[n] = sidx;
                 if (tok != TK_RPAREN) {
                     int first = parse_expression_ast();
@@ -1614,8 +1651,7 @@ static int parse_statement_ast(void) {
             next_token();
             if (sidx >= 0 && (sym_kind[sidx]==SK_PROC || sym_kind[sidx]==SK_FUNC)) {
                 n = new_node(S_CALL);
-                n_str_off[n] = pool_str(saved, saved_len);
-                n_str_len[n] = saved_len;
+                set_call_name(n, saved, saved_len, sidx);
                 n_int[n] = sidx;
                 if (tok != TK_RPAREN) {
                     int first = parse_expression_ast();
@@ -1652,8 +1688,7 @@ static int parse_statement_ast(void) {
             }
             /* Unresolved IDENT(...) — treat as call */
             n = new_node(S_CALL);
-            n_str_off[n] = pool_str(saved, saved_len);
-            n_str_len[n] = saved_len;
+            set_call_name(n, saved, saved_len, sidx);
             n_int[n] = sidx;
             if (tok != TK_RPAREN) {
                 int first = parse_expression_ast();
@@ -2064,16 +2099,37 @@ static int parse_declaration_ast(void) {
         return 0;
     }
 
+    if (tok == TK_PACKAGE) {
+        /* package [body] P is <decls> end [P]; — a namespace whose
+           subprograms become <pkg>_<op> C functions. */
+        next_token();
+        if (tok == TK_IDENT && tok_eq_ci("body")) next_token();
+        add_sym(SK_PACKAGE, 0);          /* name = the package name token */
+        int psym = sym_count - 1;
+        next_token();
+        expect(TK_IS);
+        int saved_pkg = cur_pkg;
+        cur_pkg = psym + 1;              /* +1 so index 0 isn't the "none" sentinel */
+        parse_declarations();            /* subprograms tagged + mangled */
+        cur_pkg = saved_pkg;
+        if (tok == TK_BEGIN) error("package initialization (begin) not supported");
+        expect(TK_END);
+        if (tok == TK_IDENT) next_token();   /* optional repeated package name */
+        expect(TK_SEMI);
+        return 0;
+    }
+
     if (tok == TK_PROCEDURE) {
             next_token();
             char pname[MAX_NAME];
             int plen = tok_len;
             memcpy(pname, tok_val, tok_len);
             add_sym(SK_PROC, 0);
+            if (cur_pkg) sym_arr_lo[sym_count-1] = cur_pkg;
             next_token();
 
             emit("void ");
-            emit_str_lower(pname, plen);
+            emit_sub_name(pname, plen);
             emit("(");
 
             push_scope();
@@ -2161,6 +2217,7 @@ static int parse_declaration_ast(void) {
             int flen = tok_len;
             memcpy(fname, tok_val, tok_len);
             add_sym(SK_FUNC, TY_INTEGER);
+            if (cur_pkg) sym_arr_lo[sym_count-1] = cur_pkg;
             next_token();
 
             push_scope();
@@ -2224,7 +2281,7 @@ static int parse_declaration_ast(void) {
 
             emit_c_type(ret_type);
             emit(" ");
-            emit_str_lower(fname, flen);
+            emit_sub_name(fname, flen);
             emit("(");
             for (int i = 0; i < pcount; i++) {
                 if (i > 0) emit(", ");
@@ -2539,7 +2596,7 @@ static int parse_declaration_ast(void) {
    walking it if it's a leaf-decl node, and resetting the pool. */
 static void parse_declarations(void) {
     while (tok == TK_TYPE || tok == TK_PROCEDURE || tok == TK_FUNCTION
-           || tok == TK_IDENT) {
+           || tok == TK_IDENT || tok == TK_PACKAGE) {
         int n = parse_declaration_ast();
         if (n != 0) emit_declaration_ast(n);
         reset_ast();
@@ -2553,7 +2610,7 @@ static void parse_declarations(void) {
 static int parse_var_decl_chain(void) {
     int head = 0, prev = 0;
     while (tok == TK_TYPE || tok == TK_PROCEDURE || tok == TK_FUNCTION
-           || tok == TK_IDENT) {
+           || tok == TK_IDENT || tok == TK_PACKAGE) {
         int d = parse_declaration_ast();
         if (d != 0) {
             if (head == 0) head = d;

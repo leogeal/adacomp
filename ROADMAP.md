@@ -400,8 +400,21 @@ Started.
   self-hosting still verifies (adacomp.adb doesn't use records yet).
   Deferred: nested/array record fields, aggregates (`(X => 1, ...)`),
   `in out` (by-reference) record params, variant records.
-- [ ] Packages with spec/body (multi-file) — the biggest remaining
-  unlock.
+- [~] Packages with spec/body (multi-file) — the biggest remaining
+  unlock. Doing it in two stages:
+  - [x] **Stage 1: packages as namespaces (single file).** `package P is
+    ... end P;` / `package body P is ... end P;` declared in a unit's
+    declarations; subprograms become `<pkg>_<op>` C functions; qualified
+    calls `P.Op(x)` and unqualified intra-package calls both mangle to
+    match (the callee is tagged with its package so call sites resolve at
+    build time). Both compilers; fixture `packages.adb` (Math.Square /
+    Math.Cube, incl. an intra-package call) → 27/25; self-hosted stage1
+    compiles it byte-identically to the bootstrap; self-hosting verifies.
+    Deferred to stage 2 / later: separate compilation (.c+.h, `with` ->
+    #include, linking), package-level variables/types, package init
+    `begin`, library-level & child packages, `use` visibility.
+  - [ ] **Stage 2: separate compilation** — package body -> .c + a
+    generated .h; `with P` -> `#include "p.h"`; multi-unit build + link.
 - [ ] Enumerations (beyond Boolean).
 - [ ] Access types beyond the buffer-growth subset (`.all`, general
   allocators), deallocation.

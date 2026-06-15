@@ -91,6 +91,7 @@ procedure Adacomp is
    TK_RANGE     : constant Integer := 75;
    TK_BOX       : constant Integer := 76;
    TK_RECORD    : constant Integer := 77;
+   TK_PACKAGE   : constant Integer := 78;
 
    -- Current token
    type Tok_Buffer is array (1 .. 4096) of Character;
@@ -106,6 +107,7 @@ procedure Adacomp is
    SK_PROC  : constant Integer := 4;
    SK_FUNC  : constant Integer := 5;
    SK_TYPE  : constant Integer := 6;
+   SK_PACKAGE : constant Integer := 7;
 
    -- Type kinds
    TY_INTEGER   : constant Integer := 1;
@@ -140,6 +142,12 @@ procedure Adacomp is
    type Scope_Buf is array (1 .. 64) of Integer;
    Scope_Saved : Scope_Buf;
    Scope_Depth : Integer := 0;
+
+   -- While compiling a package's declarations: the package symbol index + 1
+   -- (0 = not in a package; +1 so a package at symbol index 0 isn't the
+   -- "none" sentinel). Subprograms here are mangled <pkg>_<op> and tagged
+   -- via Sym_Arr_Lo so call sites mangle to match.
+   Cur_Pkg : Integer := 0;
 
    -- Output
    Out_File : Ada.Text_IO.File_Type;
@@ -449,6 +457,7 @@ procedure Adacomp is
       if Tok_Eq_CI ("new") then return TK_NEW; end if;
       if Tok_Eq_CI ("range") then return TK_RANGE; end if;
       if Tok_Eq_CI ("record") then return TK_RECORD; end if;
+      if Tok_Eq_CI ("package") then return TK_PACKAGE; end if;
       if Tok_Eq_CI ("not") then return TK_NOT; end if;
       if Tok_Eq_CI ("and") then return TK_AND; end if;
       if Tok_Eq_CI ("or") then return TK_OR; end if;
@@ -849,6 +858,17 @@ procedure Adacomp is
       end loop;
    end Emit_Name_Pool_Lower;
 
+   -- A subprogram's emitted C name: <pkg>_<name> inside a package, else
+   -- just <name>. Cur_Pkg is the package symbol index + 1 (0 = none).
+   procedure Emit_Sub_Name (Buf : Tok_Buffer; Len : Integer) is
+   begin
+      if Cur_Pkg /= 0 then
+         Emit_Name_Pool_Lower (Sym_Name_Off (Cur_Pkg - 1), Sym_Name_Len (Cur_Pkg - 1));
+         Emit ("_");
+      end if;
+      Emit_Lower (Buf, Len);
+   end Emit_Sub_Name;
+
    -- Symbol table
    function Pool_Eq (Off : Integer; Len : Integer; Buf : Tok_Buffer; BLen : Integer) return Boolean is
    begin
@@ -1125,6 +1145,36 @@ procedure Adacomp is
       return Off;
    end Pool_Str;
 
+   -- Set node N's call name: <pkg>_<name> when the callee is a package
+   -- subprogram (tagged in Sym_Arr_Lo as index+1), else <name>. Resolved
+   -- at build time so the walker stays symbol-table-independent.
+   procedure Set_Call_Name (N : Integer; Name : Tok_Buffer; Len : Integer; Sidx : Integer) is
+      Buf  : Tok_Buffer;
+      BLen : Integer := 0;
+      Pk   : Integer;
+   begin
+      if Sidx > 0 and then (Sym_Kind (Sidx) = SK_PROC or Sym_Kind (Sidx) = SK_FUNC)
+         and then Sym_Arr_Lo (Sidx) /= 0
+      then
+         Pk := Sym_Arr_Lo (Sidx) - 1;
+         for I in 1 .. Sym_Name_Len (Pk) loop
+            BLen := BLen + 1;
+            Buf (BLen) := Name_Pool (Sym_Name_Off (Pk) + I - 1);
+         end loop;
+         BLen := BLen + 1;
+         Buf (BLen) := '_';
+         for I in 1 .. Len loop
+            BLen := BLen + 1;
+            Buf (BLen) := Name (I);
+         end loop;
+         N_Str_Off (N) := Pool_Str (Buf, BLen);
+         N_Str_Len (N) := BLen;
+      else
+         N_Str_Off (N) := Pool_Str (Name, Len);
+         N_Str_Len (N) := Len;
+      end if;
+   end Set_Call_Name;
+
    function NPool_Eq_CI (Off : Integer; Len : Integer; S : String) return Boolean is
    begin
       if Len /= S'Length then
@@ -1388,8 +1438,7 @@ procedure Adacomp is
                -- Function/procedure call: name (arg, arg, ...)
                Next_Token;
                N := New_Node (A_CALL);
-               N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
-               N_Str_Len (N) := Saved_Len;
+               Set_Call_Name (N, Saved, Saved_Len, Sym_Idx);
                N_Int (N) := Sym_Idx;
                if Tok /= TK_RPAREN then
                   declare
@@ -2236,8 +2285,7 @@ procedure Adacomp is
             Next_Token;
             if Sym_Idx > 0 and then (Sym_Kind (Sym_Idx) = SK_PROC or Sym_Kind (Sym_Idx) = SK_FUNC) then
                N := New_Node (S_CALL);
-               N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
-               N_Str_Len (N) := Saved_Len;
+               Set_Call_Name (N, Saved, Saved_Len, Sym_Idx);
                N_Int (N) := Sym_Idx;
                if Tok /= TK_RPAREN then
                   declare
@@ -2282,8 +2330,7 @@ procedure Adacomp is
             end if;
             -- Unresolved IDENT(...) — treat as call
             N := New_Node (S_CALL);
-            N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
-            N_Str_Len (N) := Saved_Len;
+            Set_Call_Name (N, Saved, Saved_Len, Sym_Idx);
             N_Int (N) := Sym_Idx;
             if Tok /= TK_RPAREN then
                declare
@@ -2754,6 +2801,33 @@ procedure Adacomp is
          return 0;
       end if;
 
+      if Tok = TK_PACKAGE then
+         -- package [body] P is <decls> end [P]; — a namespace whose
+         -- subprograms become <pkg>_<op> C functions.
+         declare
+            Psym : Integer;
+            Saved_Pkg : Integer;
+         begin
+            Next_Token;
+            if Tok = TK_IDENT and then Tok_Eq_CI ("body") then Next_Token; end if;
+            Add_Sym (SK_PACKAGE, 0);          -- name = the package name token
+            Psym := Sym_Count;
+            Next_Token;
+            Expect (TK_IS);
+            Saved_Pkg := Cur_Pkg;
+            Cur_Pkg := Psym + 1;              -- +1 so index isn't the "none" sentinel
+            Parse_Declarations;               -- subprograms tagged + mangled
+            Cur_Pkg := Saved_Pkg;
+            if Tok = TK_BEGIN then
+               Error ("package initialization (begin) not supported");
+            end if;
+            Expect (TK_END);
+            if Tok = TK_IDENT then Next_Token; end if;  -- optional repeated name
+            Expect (TK_SEMI);
+            return 0;
+         end;
+      end if;
+
       if Tok = TK_PROCEDURE then
             Next_Token;
             declare
@@ -2766,9 +2840,10 @@ procedure Adacomp is
                   P_Name (I) := Tok_Val (I);
                end loop;
                Add_Sym (SK_PROC, 0);
+               if Cur_Pkg /= 0 then Sym_Arr_Lo (Sym_Count) := Cur_Pkg; end if;
                Next_Token;
                Emit ("void ");
-               Emit_Lower (P_Name, P_Len);
+               Emit_Sub_Name (P_Name, P_Len);
                Emit ("(");
                Push_Scope;
                if Tok = TK_LPAREN then
@@ -2882,6 +2957,7 @@ procedure Adacomp is
                   F_Name (I) := Tok_Val (I);
                end loop;
                Add_Sym (SK_FUNC, TY_INTEGER);
+               if Cur_Pkg /= 0 then Sym_Arr_Lo (Sym_Count) := Cur_Pkg; end if;
                Next_Token;
                Push_Scope;
                if Tok = TK_LPAREN then
@@ -2941,7 +3017,7 @@ procedure Adacomp is
                Ret := Parse_Type_Ref;
                Emit_C_Type (Ret);
                Emit (" ");
-               Emit_Lower (F_Name, F_Len);
+               Emit_Sub_Name (F_Name, F_Len);
                Emit ("(");
                for I in 1 .. P_Count loop
                   if I > 1 then Emit (", "); end if;
@@ -3300,7 +3376,7 @@ procedure Adacomp is
       N : Integer;
    begin
       while Tok = TK_TYPE or Tok = TK_PROCEDURE
-            or Tok = TK_FUNCTION or Tok = TK_IDENT
+            or Tok = TK_FUNCTION or Tok = TK_IDENT or Tok = TK_PACKAGE
       loop
          N := Parse_Declaration_AST;
          if N /= 0 then
@@ -3319,7 +3395,7 @@ procedure Adacomp is
       D    : Integer;
    begin
       while Tok = TK_TYPE or Tok = TK_PROCEDURE
-            or Tok = TK_FUNCTION or Tok = TK_IDENT
+            or Tok = TK_FUNCTION or Tok = TK_IDENT or Tok = TK_PACKAGE
       loop
          D := Parse_Declaration_AST;
          if D /= 0 then
