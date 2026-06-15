@@ -388,9 +388,29 @@ In progress.
   + stage1 fixtures on every push to main and every PR.
 - [ ] Documented internal IR (one-page schema).
 
-### Phases 2–7
+### Phase 2 — Frontend completeness
 
-Not started. Touched only when Phase 1 is done.
+Started.
+
+- [x] **Records (v1).** `type T is record F : Integer; ... end record;`
+  -> a C `struct`; record variables (`struct t v = {0};`), field read /
+  write (`v.f`), whole-record copy (`v = w;`), and by-value record
+  parameters. Both compilers; fixture `records.adb`; the self-hosted
+  stage1 compiles it with byte-identical codegen to the bootstrap;
+  self-hosting still verifies (adacomp.adb doesn't use records yet).
+  Deferred: nested/array record fields, aggregates (`(X => 1, ...)`),
+  `in out` (by-reference) record params, variant records.
+- [ ] Packages with spec/body (multi-file) — the biggest remaining
+  unlock.
+- [ ] Enumerations (beyond Boolean).
+- [ ] Access types beyond the buffer-growth subset (`.all`, general
+  allocators), deallocation.
+- [ ] Proper exception model (define / raise / handle by class).
+- [ ] Wider numeric types, subtypes with ranges + runtime checks.
+
+### Phases 3–7
+
+Not started.
 
 ### Cross-cutting
 

@@ -90,6 +90,7 @@ procedure Adacomp is
    TK_NEW       : constant Integer := 74;
    TK_RANGE     : constant Integer := 75;
    TK_BOX       : constant Integer := 76;
+   TK_RECORD    : constant Integer := 77;
 
    -- Current token
    type Tok_Buffer is array (1 .. 4096) of Character;
@@ -113,6 +114,7 @@ procedure Adacomp is
    TY_ARRAY     : constant Integer := 4;
    TY_STRING    : constant Integer := 5;
    TY_ACCESS    : constant Integer := 6;
+   TY_RECORD    : constant Integer := 7;
 
    -- Symbol table (dynamically grown). Names live in a growable character
    -- pool addressed by offset+length; the per-symbol fields are growable
@@ -170,6 +172,7 @@ procedure Adacomp is
    A_ATTR_TYPE : constant Integer := 12;
    A_ATTR_VAR  : constant Integer := 13;
    A_NEW       : constant Integer := 14;
+   A_FIELD     : constant Integer := 15;
 
    -- Operator codes (for UNARY / BINARY)
    OP_ADD : constant Integer := 1;
@@ -205,6 +208,7 @@ procedure Adacomp is
    S_CALL         : constant Integer := 25;
    S_PARAMLESS    : constant Integer := 26;
    S_ARRAY_ASSIGN : constant Integer := 27;
+   S_FIELD_ASSIGN : constant Integer := 28;
 
    -- Compound statements and dotted package calls (Pass B.2): full
    -- subtree nodes, so a program unit's body is one tree walked after
@@ -238,6 +242,7 @@ procedure Adacomp is
    D_VAR_FILE        : constant Integer := 34;
    D_VAR_DOTTED      : constant Integer := 35;
    D_VAR_ACCESS      : constant Integer := 36;
+   D_VAR_RECORD      : constant Integer := 37;
 
    -- Node storage: 13 parallel growable arrays (access-to-Int_Vec, the
    -- type introduced for the symbol table). Reset_AST only rewinds the
@@ -443,6 +448,7 @@ procedure Adacomp is
       if Tok_Eq_CI ("access") then return TK_ACCESS; end if;
       if Tok_Eq_CI ("new") then return TK_NEW; end if;
       if Tok_Eq_CI ("range") then return TK_RANGE; end if;
+      if Tok_Eq_CI ("record") then return TK_RECORD; end if;
       if Tok_Eq_CI ("not") then return TK_NOT; end if;
       if Tok_Eq_CI ("and") then return TK_AND; end if;
       if Tok_Eq_CI ("or") then return TK_OR; end if;
@@ -834,6 +840,14 @@ procedure Adacomp is
          Emit_Ch (To_Lower (Buf (I)));
       end loop;
    end Emit_Lower;
+
+   -- Emit a symbol's name (held in the Name_Pool) in lowercase.
+   procedure Emit_Name_Pool_Lower (Off : Integer; Len : Integer) is
+   begin
+      for I in 1 .. Len loop
+         Emit_Ch (To_Lower (Name_Pool (Off + I - 1)));
+      end loop;
+   end Emit_Name_Pool_Lower;
 
    -- Symbol table
    function Pool_Eq (Off : Integer; Len : Integer; Buf : Tok_Buffer; BLen : Integer) return Boolean is
@@ -1423,6 +1437,22 @@ procedure Adacomp is
             return N;
          end if;
 
+         if Tok = TK_DOT and then Sym_Idx > 0
+            and then (Sym_Kind (Sym_Idx) = SK_VAR or Sym_Kind (Sym_Idx) = SK_PARAM
+                      or Sym_Kind (Sym_Idx) = SK_CONST)
+            and then Sym_Type (Sym_Idx) = TY_RECORD
+         then
+            -- Record field access: var.field -> var.field
+            Next_Token;   -- consume '.'
+            N := New_Node (A_FIELD);
+            N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+            N_Str_Len (N) := Saved_Len;
+            N_Arg2 (N) := Pool_Str (Tok_Val, Tok_Len);
+            N_Int (N) := Tok_Len;
+            Next_Token;   -- consume field name
+            return N;
+         end if;
+
          if Tok = TK_DOT then
             Next_Token;
             declare
@@ -1735,6 +1765,11 @@ procedure Adacomp is
          Emit (" + 1) * sizeof(");
          Emit_C_Type (N_Op (N));
          Emit ("))");
+      elsif Kind = A_FIELD then
+         -- record field access: base.field
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit (".");
+         Emit_Pool_Lower (N_Arg2 (N), N_Int (N));
       elsif Kind = A_DOTTED then
          Sub_Off := N_Arg2 (N);
          Sub_Len := N_Int (N);
@@ -1857,6 +1892,15 @@ procedure Adacomp is
          end if;
          Emit (" = ");
          Emit_Expression_AST (N_First (N));
+         Emit_Ln (";");
+      elsif Kind = S_FIELD_ASSIGN then
+         -- record field assignment: base.field = rhs;
+         Emit_Indent;
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit (".");
+         Emit_Pool_Lower (N_Arg2 (N), N_Int (N));
+         Emit (" = ");
+         Emit_Expression_AST (N_Right (N));
          Emit_Ln (";");
       elsif Kind = S_IF then
          Emit_Indent; Emit ("if (");
@@ -2270,6 +2314,24 @@ procedure Adacomp is
             return N;
          end if;
 
+         if Tok = TK_DOT and then Sym_Idx > 0
+            and then (Sym_Kind (Sym_Idx) = SK_VAR or Sym_Kind (Sym_Idx) = SK_PARAM)
+            and then Sym_Type (Sym_Idx) = TY_RECORD
+         then
+            -- Record field assignment: var.field := expr;
+            Next_Token;   -- consume '.'
+            N := New_Node (S_FIELD_ASSIGN);
+            N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+            N_Str_Len (N) := Saved_Len;
+            N_Arg2 (N) := Pool_Str (Tok_Val, Tok_Len);
+            N_Int (N) := Tok_Len;
+            Next_Token;   -- consume field name
+            Expect (TK_ASSIGN);
+            N_Right (N) := Parse_Expression_AST;
+            Expect (TK_SEMI);
+            return N;
+         end if;
+
          if Tok = TK_DOT then
             -- Package-qualified call → S_PKG subtree node.
             Next_Token;
@@ -2537,6 +2599,21 @@ procedure Adacomp is
             Emit (" = NULL");
          end if;
          Emit_Ln (";");
+      elsif Kind = D_VAR_RECORD then
+         -- struct <typename> name [= <other record>] (default {0}).
+         Emit_Indent;
+         if Is_Const = 1 then Emit ("const "); end if;
+         Emit ("struct ");
+         Emit_Name_Pool_Lower (N_Arg2 (N), N_Int (N));   -- record type name
+         Emit (" ");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         if N_Left (N) /= 0 then
+            Emit (" = ");
+            Emit_Expression_AST (N_Left (N));
+         else
+            Emit (" = {0}");
+         end if;
+         Emit_Ln (";");
       elsif Kind = D_VAR_DOTTED then
          Emit_Indent;
          if Is_Const = 1 then Emit ("const "); end if;
@@ -2634,6 +2711,40 @@ procedure Adacomp is
                Sym_Arr_Hi (Sym_Count) := 0;
                Sym_Arr_El (Sym_Count) := El;
             end;
+         elsif Tok = TK_RECORD then
+            -- `record F1 : T1; ... end record;` -> a C struct, emitted here.
+            declare
+               FTy : Integer;
+            begin
+               Sym_Type (Sym_Count) := TY_RECORD;
+               Emit ("struct ");
+               Emit_Name_Pool_Lower (Sym_Name_Off (Sym_Count), Sym_Name_Len (Sym_Count));
+               Emit (" {");
+               Next_Token;   -- consume 'record'
+               while Tok /= TK_END and Tok /= TK_EOF loop
+                  declare
+                     FName : Tok_Buffer;
+                     FNLen : Integer;
+                  begin
+                     FNLen := Tok_Len;
+                     for I in 1 .. Tok_Len loop
+                        FName (I) := Tok_Val (I);
+                     end loop;
+                     Next_Token;
+                     Expect (TK_COLON);
+                     FTy := Parse_Type_Ref;
+                     Emit (" ");
+                     Emit_C_Type (FTy);
+                     Emit (" ");
+                     Emit_Lower (FName, FNLen);
+                     Emit (";");
+                     Expect (TK_SEMI);
+                  end;
+               end loop;
+               Emit_Ln (" };");
+               Expect (TK_END);
+               Expect (TK_RECORD);
+            end;
          else
             while Tok /= TK_SEMI and Tok /= TK_EOF loop
                Next_Token;
@@ -2667,6 +2778,7 @@ procedure Adacomp is
                      Parm : Tok_Buffer;
                      Parm_Len : Integer;
                      Arr_Idx : Integer;
+                     Rec_Idx : Integer;
                   begin
                      while Tok /= TK_RPAREN and Tok /= TK_EOF loop
                         if not First then Emit (", "); end if;
@@ -2679,9 +2791,15 @@ procedure Adacomp is
                         Next_Token;
                         Expect (TK_COLON);
                         Arr_Idx := 0;
+                        Rec_Idx := 0;
                         if Tok = TK_IDENT then
                            Arr_Idx := Find_Sym (Tok_Val, Tok_Len);
-                           if Arr_Idx > 0 and then
+                           if Arr_Idx > 0 and then Sym_Kind (Arr_Idx) = SK_TYPE
+                              and then Sym_Type (Arr_Idx) = TY_RECORD
+                           then
+                              Rec_Idx := Arr_Idx;
+                              Arr_Idx := 0;
+                           elsif Arr_Idx > 0 and then
                               (Sym_Kind (Arr_Idx) /= SK_TYPE or Sym_Type (Arr_Idx) /= TY_ARRAY)
                            then
                               Arr_Idx := 0;
@@ -2694,6 +2812,13 @@ procedure Adacomp is
                            Sym_Arr_El (Sym_Count) := Sym_Arr_El (Arr_Idx);
                            Emit_C_Type (Sym_Arr_El (Arr_Idx));
                            Emit (" *");
+                           Emit_Lower (Parm, Parm_Len);
+                           Next_Token;
+                        elsif Rec_Idx > 0 then
+                           Sym_Type (Sym_Count) := TY_RECORD;
+                           Emit ("struct ");
+                           Emit_Name_Pool_Lower (Sym_Name_Off (Rec_Idx), Sym_Name_Len (Rec_Idx));
+                           Emit (" ");
                            Emit_Lower (Parm, Parm_Len);
                            Next_Token;
                         else
@@ -2746,9 +2871,11 @@ procedure Adacomp is
                P_Lens  : array (1 .. 20) of Integer;
                P_Types : array (1 .. 20) of Integer;
                P_El    : array (1 .. 20) of Integer;
+               P_Rec   : array (1 .. 20) of Integer;  -- record type sym idx, else 0
                P_Count : Integer := 0;
                Is_Fwd  : Boolean := False;
                Arr_Idx : Integer;
+               Rec_Idx : Integer;
             begin
                F_Len := Tok_Len;
                for I in 1 .. Tok_Len loop
@@ -2769,9 +2896,16 @@ procedure Adacomp is
                      Next_Token;
                      Expect (TK_COLON);
                      Arr_Idx := 0;
+                     Rec_Idx := 0;
+                     P_Rec (P_Count) := 0;
                      if Tok = TK_IDENT then
                         Arr_Idx := Find_Sym (Tok_Val, Tok_Len);
-                        if Arr_Idx > 0 and then
+                        if Arr_Idx > 0 and then Sym_Kind (Arr_Idx) = SK_TYPE
+                           and then Sym_Type (Arr_Idx) = TY_RECORD
+                        then
+                           Rec_Idx := Arr_Idx;
+                           Arr_Idx := 0;
+                        elsif Arr_Idx > 0 and then
                            (Sym_Kind (Arr_Idx) /= SK_TYPE or Sym_Type (Arr_Idx) /= TY_ARRAY)
                         then
                            Arr_Idx := 0;
@@ -2784,6 +2918,12 @@ procedure Adacomp is
                         Sym_Arr_Lo (Sym_Count) := Sym_Arr_Lo (Arr_Idx);
                         Sym_Arr_Hi (Sym_Count) := Sym_Arr_Hi (Arr_Idx);
                         Sym_Arr_El (Sym_Count) := Sym_Arr_El (Arr_Idx);
+                        Next_Token;
+                     elsif Rec_Idx > 0 then
+                        P_Types (P_Count) := TY_RECORD;
+                        P_El (P_Count) := 0;
+                        P_Rec (P_Count) := Rec_Idx;
+                        Sym_Type (Sym_Count) := TY_RECORD;
                         Next_Token;
                      else
                         P_Types (P_Count) := Parse_Type_Ref;
@@ -2808,6 +2948,10 @@ procedure Adacomp is
                   if P_Types (I) = TY_ARRAY then
                      Emit_C_Type (P_El (I));
                      Emit (" *");
+                  elsif P_Types (I) = TY_RECORD then
+                     Emit ("struct ");
+                     Emit_Name_Pool_Lower (Sym_Name_Off (P_Rec (I)), Sym_Name_Len (P_Rec (I)));
+                     Emit (" ");
                   else
                      Emit_C_Type (P_Types (I));
                      Emit (" ");
@@ -2983,6 +3127,37 @@ procedure Adacomp is
                      if Tok = TK_ASSIGN then
                         Next_Token;
                         N_Left (N) := Parse_Expression_AST;   -- e.g. new ...
+                     end if;
+                     Expect (TK_SEMI);
+                     return N;
+                  end if;
+               end;
+            end if;
+
+            -- Record-typed variable: Name : Some_Record_Type;
+            -- -> struct <typename> name = {0};  (registered TY_RECORD).
+            if Tok = TK_IDENT then
+               declare
+                  Tidx : Integer;
+               begin
+                  Tidx := Find_Sym (Tok_Val, Tok_Len);
+                  if Tidx > 0 and then Sym_Kind (Tidx) = SK_TYPE and then Sym_Type (Tidx) = TY_RECORD then
+                     N := New_Node (D_VAR_RECORD);
+                     -- record type name lives in the Name_Pool at Tidx.
+                     N_Arg2 (N) := Sym_Name_Off (Tidx);
+                     N_Int (N) := Sym_Name_Len (Tidx);
+                     if Is_Const then
+                        Add_Sym_Named (Var_Name, Var_Len, SK_CONST, TY_RECORD);
+                     else
+                        Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_RECORD);
+                     end if;
+                     N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
+                     N_Str_Len (N) := Var_Len;
+                     if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
+                     Next_Token;
+                     if Tok = TK_ASSIGN then     -- init from another record
+                        Next_Token;
+                        N_Left (N) := Parse_Expression_AST;
                      end if;
                      Expect (TK_SEMI);
                      return N;
