@@ -363,12 +363,29 @@ In progress.
     - [ ] Token buffer (`Tok_Buffer`) — fixed max token length; lowest
       priority (a single identifier/string over 4096 chars; not a real
       constraint, left as a known cap).
-- [ ] Real diagnostics: source locations on every token, error
-  recovery, multi-error reports.
-- [x] Test infrastructure: per-feature `.adb` fixtures with expected
-  output, runnable against bootstrap (`make test`) and stage1
-  (`make test-stage1`). 15 fixtures shipped; grows as features land.
-- [ ] CI: matrix build on every push.
+- [~] Real diagnostics. **Located errors done; recovery/multi-error
+  deferred.**
+  - [x] **Located errors with a source caret.** Errors now print in the
+    gcc-style `file:line:col: error: msg` form, followed by the offending
+    source line and a `^` under the column, in both compilers. Every
+    token records its start line/offset (`tok_line`/`tok_pos`); `error()`
+    derives the column and slices the source line out of the (in-memory)
+    source buffer. The error path doesn't touch the emitted C, so
+    self-hosting stays byte-identical. Needed a small language addition —
+    char dispatch for the one-argument `Ada.Text_IO.Put` (`ada_put_char`
+    vs `ada_put_str`) — so the self-host can print the caret line.
+    Two error fixtures (`err_expr`, `err_semi`) regression-test the
+    located output under both compilers.
+  - [ ] Error recovery (sync to `;`/`end`) + multi-error reporting.
+    Harder here: declarations still stream-emit C as they parse, so
+    recovering after an error would emit partial output. Best tackled
+    once declarations are AST-driven like statement bodies are.
+- [x] Test infrastructure: per-feature `.adb` fixtures (valid programs
+  via `.expected`, diagnostics via `.experr`), runnable against bootstrap
+  (`make test`) and stage1 (`make test-stage1`). 18 fixtures; grows as
+  features land.
+- [x] CI: GitHub Actions runs bootstrap + fixtures + self-hosting verify
+  + stage1 fixtures on every push to main and every PR.
 - [ ] Documented internal IR (one-page schema).
 
 ### Phases 2–7

@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # test/run.sh - Run .adb fixtures against a compiler binary.
 #
-# For each test/<name>.adb, compile via the chosen compiler to C,
-# then gcc the C to a binary, run it, and diff stdout/stderr against
-# test/<name>.expected. Pass count and a final summary go to stdout.
+# Two kinds of fixture per test/<name>.adb:
+#   test/<name>.expected  - a VALID program: compile to C, gcc it, run it,
+#                           and diff its stdout/stderr against the file.
+#   test/<name>.experr    - an INVALID program: the compiler must FAIL and
+#                           its combined output must contain this text (a
+#                           diagnostic substring, e.g. the located error
+#                           line). Used to regression-test diagnostics.
+# A name with neither file is skipped.
 #
 # Usage:
 #   test/run.sh [<name>...]            run named tests (or all if none given)
@@ -37,11 +42,31 @@ failed_names=()
 for adb in "${tests[@]}"; do
   name=$(basename "$adb" .adb)
   expected="test/$name.expected"
+  experr="test/$name.experr"
   cfile="build/$name.c"
   bin="build/$name"
 
+  # Error fixture: the compiler must fail with the expected diagnostic.
+  if [[ -f "$experr" ]]; then
+    out=$("$BOOT" "$adb" "$cfile" 2>&1); rc=$?
+    want=$(cat "$experr")
+    if (( rc == 0 )); then
+      echo "FAIL $name (expected a diagnostic, compile succeeded)"
+      failed_names+=("$name"); fail=$((fail+1))
+    elif [[ "$out" == *"$want"* ]]; then
+      echo "PASS $name (diagnostic)"
+      pass=$((pass+1))
+    else
+      echo "FAIL $name (diagnostic mismatch)"
+      echo "    want substring: $want"
+      echo "$out" | sed 's/^/    got: /'
+      failed_names+=("$name"); fail=$((fail+1))
+    fi
+    continue
+  fi
+
   if [[ ! -f "$expected" ]]; then
-    echo "SKIP $name (no $expected)"
+    echo "SKIP $name (no $expected / $experr)"
     missing=$((missing+1))
     continue
   fi

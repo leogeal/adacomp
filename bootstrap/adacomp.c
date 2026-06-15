@@ -21,6 +21,9 @@ static int src_cap = 0;
 static int src_len = 0;
 static int src_pos = 0;
 static int line_num = 1;
+static const char *src_name = "<input>";  /* input file name, for diagnostics */
+static int tok_line = 1;   /* line where the current token starts */
+static int tok_pos = 0;    /* src index where the current token starts */
 
 /* Token types */
 enum {
@@ -125,8 +128,20 @@ static int tok_eq_ci(const char *s) {
     return 1;
 }
 
+/* Report an error located at the current token, in the gcc-style
+   `file:line:col: error: msg` form, followed by the offending source
+   line and a caret under the column. */
 static void error(const char *msg) {
-    fprintf(stderr, "Error at line %d: %s\n", line_num, msg);
+    int ls = tok_pos;
+    while (ls > 0 && src[ls - 1] != '\n') ls--;          /* line start */
+    int le = tok_pos;
+    while (le < src_len && src[le] != '\n') le++;        /* line end */
+    int col = tok_pos - ls + 1;
+    fprintf(stderr, "%s:%d:%d: error: %s\n", src_name, tok_line, col, msg);
+    fprintf(stderr, "  %.*s\n", le - ls, src + ls);
+    fprintf(stderr, "  ");
+    for (int i = ls; i < tok_pos; i++) fputc(' ', stderr);
+    fprintf(stderr, "^\n");
     exit(1);
 }
 
@@ -244,6 +259,8 @@ static int is_attribute_tick(void) {
 
 static void next_token(void) {
     skip_space();
+    tok_line = line_num;   /* record where this token starts, for diagnostics */
+    tok_pos = src_pos;
     tok_len = 0;
     tok_int = 0;
 
@@ -356,8 +373,6 @@ static void next_token(void) {
 
 static void expect(int expected) {
     if (tok != expected) {
-        fprintf(stderr, "Expected token %d, got %d (val='%.*s') at line %d\n",
-                expected, tok, tok_len, tok_val, line_num);
         error("unexpected token");
     }
     next_token();
@@ -454,6 +469,31 @@ static int second_arg_is_char(void) {
                     next_token();
                     if (tok == TK_LPAREN) is_char = 1;
                 }
+            }
+        }
+    }
+    restore_lex(&s);
+    return is_char;
+}
+
+/* Whether the argument at the current position (just past a consumed `(`)
+   is character-typed — used to pick ada_put_char vs ada_put_str for the
+   one-argument Put form. */
+static int first_arg_is_char(void) {
+    LexState s;
+    save_lex(&s);
+    int is_char = 0;
+    if (tok == TK_CHAR_LIT) {
+        is_char = 1;
+    } else if (tok == TK_IDENT) {
+        int idx = find_sym(tok_val, tok_len);
+        if (idx >= 0) {
+            if (sym_type[idx] == TY_CHARACTER) {
+                is_char = 1;
+            } else if (sym_type[idx] == TY_ARRAY &&
+                       sym_arr_el[idx] == TY_CHARACTER) {
+                next_token();
+                if (tok == TK_LPAREN) is_char = 1;
             }
         }
     }
@@ -1347,7 +1387,7 @@ static void emit_statement_ast(int n) {
                 emit(", ");
                 emit_expression_ast(n_right[n]);
             } else {
-                emit("ada_put_str(");
+                emit(n_aux1[n] ? "ada_put_char(" : "ada_put_str(");
                 emit_expression_ast(n_left[n]);
             }
             emit_line(");");
@@ -1642,6 +1682,7 @@ static int parse_statement_ast(void) {
                     expect(TK_COMMA);
                     n_right[n] = parse_expression_ast();
                 } else {
+                    n_aux1[n] = first_arg_is_char() ? 1 : 0;
                     n_left[n] = parse_expression_ast();
                 }
                 expect(TK_RPAREN);
@@ -1720,11 +1761,9 @@ static int parse_statement_ast(void) {
             expect(TK_SEMI);
             return n;
         }
-        fprintf(stderr, "After ident '%.*s', got token %d\n", saved_len, saved, tok);
-        error("expected := or ( after identifier");
+        error("expected ':=' or '(' after identifier");
         return 0;
     }
-    fprintf(stderr, "Got token %d (val='%.*s')\n", tok, tok_len, tok_val);
     error("unexpected token in statement");
     return 0;
 }
@@ -2450,6 +2489,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    src_name = argv[1];
     read_file(argv[1]);
 
     out_file = fopen(argv[2], "w");

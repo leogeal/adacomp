@@ -20,6 +20,9 @@ procedure Adacomp is
    Src_Len  : Integer := 0;
    Src_Pos  : Integer := 1;
    Line_Num : Integer := 1;
+   Src_Name : String := "<input>";  -- input file name, for diagnostics
+   Tok_Line : Integer := 1;         -- line where the current token starts
+   Tok_Pos  : Integer := 1;         -- Src index where the current token starts
 
    -- Token types (constants)
    TK_EOF       : constant Integer := 0;
@@ -285,12 +288,46 @@ procedure Adacomp is
       return Is_Alpha (C) or Is_Digit (C);
    end Is_Alnum;
 
+   -- Report an error located at the current token, in the gcc-style
+   -- `file:line:col: error: msg` form, followed by the offending source
+   -- line and a caret under the column.
    procedure Error (Msg : String) is
+      Pos : Integer;
+      LS  : Integer;
+      LE  : Integer;
+      Col : Integer;
    begin
-      Ada.Text_IO.Put ("Error at line ");
-      Ada.Text_IO.Put (Integer'Image (Line_Num));
-      Ada.Text_IO.Put (": ");
+      Pos := Tok_Pos;
+      if Pos > Src_Len then Pos := Src_Len; end if;
+      if Pos < 1 then Pos := 1; end if;
+      LS := Pos;
+      while LS > 1 and then Src (LS - 1) /= Character'Val (10) loop
+         LS := LS - 1;
+      end loop;
+      LE := Pos;
+      while LE <= Src_Len and then Src (LE) /= Character'Val (10) loop
+         LE := LE + 1;
+      end loop;
+      Col := Pos - LS + 1;
+      Ada.Text_IO.Put (Src_Name);
+      Ada.Text_IO.Put (":");
+      Ada.Text_IO.Put (Integer'Image (Tok_Line));
+      Ada.Text_IO.Put (":");
+      Ada.Text_IO.Put (Integer'Image (Col));
+      Ada.Text_IO.Put (": error: ");
       Ada.Text_IO.Put_Line (Msg);
+      if Src_Len > 0 then
+         Ada.Text_IO.Put ("  ");
+         for I in LS .. LE - 1 loop
+            Ada.Text_IO.Put (Src (I));
+         end loop;
+         Ada.Text_IO.New_Line;
+         Ada.Text_IO.Put ("  ");
+         for I in LS .. Pos - 1 loop
+            Ada.Text_IO.Put (' ');
+         end loop;
+         Ada.Text_IO.Put_Line ("^");
+      end if;
       raise Program_Error;
    end Error;
 
@@ -433,6 +470,8 @@ procedure Adacomp is
    procedure Next_Token is
    begin
       Skip_Space;
+      Tok_Line := Line_Num;   -- record where this token starts, for diagnostics
+      Tok_Pos := Src_Pos;
       Tok_Len := 0;
       Tok_Int := 0;
 
@@ -680,6 +719,56 @@ procedure Adacomp is
       end loop;
       return Is_Char;
    end Second_Arg_Is_Char;
+
+   -- Whether the argument at the current position (just past a consumed
+   -- "(") is character-typed — picks ada_put_char vs ada_put_str for the
+   -- one-argument Put form.
+   function First_Arg_Is_Char return Boolean is
+      Save_Src_Pos : Integer;
+      Save_Line    : Integer;
+      Save_Tok     : Integer;
+      Save_Tok_Len : Integer;
+      Save_Tok_Int : Integer;
+      Save_Tok_Val : Tok_Buffer;
+      Is_Char      : Boolean := False;
+      Idx          : Integer;
+   begin
+      Save_Src_Pos := Src_Pos;
+      Save_Line    := Line_Num;
+      Save_Tok     := Tok;
+      Save_Tok_Len := Tok_Len;
+      Save_Tok_Int := Tok_Int;
+      for I in 1 .. Tok_Len loop
+         Save_Tok_Val (I) := Tok_Val (I);
+      end loop;
+
+      if Tok = TK_CHAR_LIT then
+         Is_Char := True;
+      elsif Tok = TK_IDENT then
+         Idx := Find_Sym (Tok_Val, Tok_Len);
+         if Idx > 0 then
+            if Sym_Type (Idx) = TY_CHARACTER then
+               Is_Char := True;
+            elsif Sym_Type (Idx) = TY_ARRAY
+                  and then Sym_Arr_El (Idx) = TY_CHARACTER then
+               Next_Token;
+               if Tok = TK_LPAREN then
+                  Is_Char := True;
+               end if;
+            end if;
+         end if;
+      end if;
+
+      Src_Pos  := Save_Src_Pos;
+      Line_Num := Save_Line;
+      Tok      := Save_Tok;
+      Tok_Len  := Save_Tok_Len;
+      Tok_Int  := Save_Tok_Int;
+      for I in 1 .. Save_Tok_Len loop
+         Tok_Val (I) := Save_Tok_Val (I);
+      end loop;
+      return Is_Char;
+   end First_Arg_Is_Char;
 
    -- Emitter helpers
    procedure Emit (S : String) is
@@ -1881,7 +1970,11 @@ procedure Adacomp is
                Emit (", ");
                Emit_Expression_AST (N_Right (N));
             else
-               Emit ("ada_put_str(");
+               if N_Aux1 (N) = 1 then
+                  Emit ("ada_put_char(");
+               else
+                  Emit ("ada_put_str(");
+               end if;
                Emit_Expression_AST (N_Left (N));
             end if;
             Emit_Ln (");");
@@ -2218,6 +2311,11 @@ procedure Adacomp is
                   Expect (TK_COMMA);
                   N_Right (N) := Parse_Expression_AST;
                else
+                  if First_Arg_Is_Char then
+                     N_Aux1 (N) := 1;
+                  else
+                     N_Aux1 (N) := 0;
+                  end if;
                   N_Left (N) := Parse_Expression_AST;
                end if;
                Expect (TK_RPAREN);
@@ -3127,6 +3225,7 @@ begin
       return;
    end if;
 
+   Src_Name := Ada.Command_Line.Argument (1);
    Read_Source (Ada.Command_Line.Argument (1));
    Ada.Text_IO.Create (Out_File, Ada.Text_IO.Out_File,
                         Ada.Command_Line.Argument (2));
