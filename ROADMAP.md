@@ -432,7 +432,16 @@ Started.
   compilers; fixture `enums.adb` (Color/Day, if-comparisons) -> green/
   friday/2; self-hosted stage1 byte-identical to the bootstrap; verify
   passes. Deferred: `'Image`/`'Pos`/`'Val`/`'First`/`'Last` on enums,
-  `case` statements, `for X in T loop`, overloaded literals across types.
+  `for X in T loop`, overloaded literals across types.
+- [x] **Case statements (v1).** `case E is when C1 | C2 => ... when
+  others => ... end case;` -> a C `switch` with each arm in a block and
+  an explicit `break;` (Ada has no fall-through), `when others` ->
+  `default`. New tokens `case`, `=>`, `|`; subtree nodes S_CASE / S_WHEN;
+  arm bodies reuse the statement-chain parser (it already stops at
+  `when`/`end`). Both compilers; fixture `case_stmt.adb` (enum case with
+  alternatives + integer case with others) -> weekday/weekend/two or
+  three; stage1 byte-identical to bootstrap; verify passes. Deferred:
+  range choices (`when 1 .. 5 =>`).
 - [ ] Access types beyond the buffer-growth subset (`.all`, general
   allocators), deallocation.
 - [ ] Proper exception model (define / raise / handle by class).

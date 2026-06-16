@@ -92,6 +92,9 @@ procedure Adacomp is
    TK_BOX       : constant Integer := 76;
    TK_RECORD    : constant Integer := 77;
    TK_PACKAGE   : constant Integer := 78;
+   TK_CASE      : constant Integer := 79;
+   TK_ARROW     : constant Integer := 80;
+   TK_BAR       : constant Integer := 81;
 
    -- Current token
    type Tok_Buffer is array (1 .. 4096) of Character;
@@ -238,6 +241,8 @@ procedure Adacomp is
    S_DECLARE : constant Integer := 45;
    S_BLOCK   : constant Integer := 46;
    S_PKG     : constant Integer := 47;
+   S_CASE    : constant Integer := 48;
+   S_WHEN    : constant Integer := 49;
 
    -- Sub-ops for S_PKG (dotted Ada.Text_IO.* statement calls).
    PKG_PUT_LINE : constant Integer := 1;
@@ -476,6 +481,7 @@ procedure Adacomp is
       if Tok_Eq_CI ("range") then return TK_RANGE; end if;
       if Tok_Eq_CI ("record") then return TK_RECORD; end if;
       if Tok_Eq_CI ("package") then return TK_PACKAGE; end if;
+      if Tok_Eq_CI ("case") then return TK_CASE; end if;
       if Tok_Eq_CI ("not") then return TK_NOT; end if;
       if Tok_Eq_CI ("and") then return TK_AND; end if;
       if Tok_Eq_CI ("or") then return TK_OR; end if;
@@ -618,9 +624,15 @@ procedure Adacomp is
          elsif C = '+' then Tok := TK_PLUS;
          elsif C = '-' then Tok := TK_MINUS;
          elsif C = '*' then Tok := TK_STAR;
-         elsif C = '=' then Tok := TK_EQ;
+         elsif C = '=' then
+            if Src_Pos <= Src_Len and then Peek = '>' then
+               Advance; Tok := TK_ARROW;
+            else
+               Tok := TK_EQ;
+            end if;
          elsif C = '&' then Tok := TK_AMP;
          elsif C = ''' then Tok := TK_TICK;
+         elsif C = '|' then Tok := TK_BAR;
          else
             Error ("unexpected character");
          end if;
@@ -2012,6 +2024,42 @@ procedure Adacomp is
             Indent_Level := Indent_Level - 1;
          end if;
          Emit_Indent; Emit_Ln ("}");
+      elsif Kind = S_CASE then
+         Emit_Indent; Emit ("switch (");
+         Emit_Expression_AST (N_Left (N));
+         Emit_Ln (") {");
+         Indent_Level := Indent_Level + 1;
+         declare
+            Arm : Integer;
+            C   : Integer;
+         begin
+            Arm := N_First (N);
+            while Arm /= 0 loop
+               if N_Op (Arm) = 1 then
+                  Emit_Indent; Emit_Ln ("default: {");
+               else
+                  C := N_First (Arm);
+                  while C /= 0 loop
+                     Emit_Indent; Emit ("case ");
+                     Emit_Expression_AST (C);
+                     if N_Next (C) = 0 then
+                        Emit_Ln (": {");
+                     else
+                        Emit_Ln (":");
+                     end if;
+                     C := N_Next (C);
+                  end loop;
+               end if;
+               Indent_Level := Indent_Level + 1;
+               Emit_Statement_Chain (N_Arg2 (Arm));
+               Emit_Indent; Emit_Ln ("break;");
+               Indent_Level := Indent_Level - 1;
+               Emit_Indent; Emit_Ln ("}");
+               Arm := N_Next (Arm);
+            end loop;
+         end;
+         Indent_Level := Indent_Level - 1;
+         Emit_Indent; Emit_Ln ("}");
       elsif Kind = S_WHILE then
          Emit_Indent; Emit ("while (");
          Emit_Expression_AST (N_Left (N));
@@ -2243,6 +2291,52 @@ procedure Adacomp is
             N_Arg2 (N) := Parse_Statement_Chain;
          end if;
          Expect (TK_END); Expect (TK_IF); Expect (TK_SEMI);
+         return N;
+      end if;
+      if Tok = TK_CASE then
+         -- case Sel is when C|C => stmts ... when others => stmts end case;
+         N := New_Node (S_CASE);
+         Next_Token;
+         N_Left (N) := Parse_Expression_AST;   -- selector
+         Expect (TK_IS);
+         declare
+            Prev_Arm : Integer := 0;
+            Arm : Integer;
+         begin
+            while Tok = TK_WHEN loop
+               Next_Token;
+               Arm := New_Node (S_WHEN);
+               if Tok = TK_IDENT and then Tok_Eq_CI ("others") then
+                  N_Op (Arm) := 1;             -- default:
+                  Next_Token;
+               else
+                  declare
+                     First_C : Integer;
+                     Prev_C  : Integer;
+                     C       : Integer;
+                  begin
+                     First_C := Parse_Expression_AST;
+                     N_First (Arm) := First_C;
+                     Prev_C := First_C;
+                     while Tok = TK_BAR loop
+                        Next_Token;
+                        C := Parse_Expression_AST;
+                        N_Next (Prev_C) := C;
+                        Prev_C := C;
+                     end loop;
+                  end;
+               end if;
+               Expect (TK_ARROW);
+               N_Arg2 (Arm) := Parse_Statement_Chain;   -- stops at when/end
+               if Prev_Arm = 0 then
+                  N_First (N) := Arm;
+               else
+                  N_Next (Prev_Arm) := Arm;
+               end if;
+               Prev_Arm := Arm;
+            end loop;
+         end;
+         Expect (TK_END); Expect (TK_CASE); Expect (TK_SEMI);
          return N;
       end if;
       if Tok = TK_WHILE then

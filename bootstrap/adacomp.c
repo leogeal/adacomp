@@ -43,7 +43,7 @@ enum {
     TK_TRUE=66, TK_FALSE=67, TK_DECLARE=68, TK_RAISE=69,
     TK_STRING=70, TK_REVERSE=71, TK_TICK=72,
     TK_ACCESS=73, TK_NEW=74, TK_RANGE=75, TK_BOX=76, TK_RECORD=77,
-    TK_PACKAGE=78
+    TK_PACKAGE=78, TK_CASE=79, TK_ARROW=80, TK_BAR=81
 };
 
 /* Current token */
@@ -231,6 +231,7 @@ static int check_keyword(void) {
     if (tok_eq_ci("range")) return TK_RANGE;
     if (tok_eq_ci("record")) return TK_RECORD;
     if (tok_eq_ci("package")) return TK_PACKAGE;
+    if (tok_eq_ci("case")) return TK_CASE;
     if (tok_eq_ci("not")) return TK_NOT;
     if (tok_eq_ci("and")) return TK_AND;
     if (tok_eq_ci("or")) return TK_OR;
@@ -377,9 +378,13 @@ static void next_token(void) {
         case '+': tok=TK_PLUS; break;
         case '-': tok=TK_MINUS; break;
         case '*': tok=TK_STAR; break;
-        case '=': tok=TK_EQ; break;
+        case '=':
+            if (src_pos < src_len && peek()=='>') { advance(); tok=TK_ARROW; }
+            else tok=TK_EQ;
+            break;
         case '&': tok=TK_AMP; break;
         case '\'': tok=TK_TICK; break;
+        case '|': tok=TK_BAR; break;
         default:
             error("unexpected character");
         }
@@ -595,7 +600,7 @@ enum {
        subtree nodes, so a program unit's body is one tree walked after
        the unit is fully parsed. */
     S_IF=40, S_ELSIF=41, S_WHILE=42, S_LOOP=43, S_FOR=44,
-    S_DECLARE=45, S_BLOCK=46, S_PKG=47,
+    S_DECLARE=45, S_BLOCK=46, S_PKG=47, S_CASE=48, S_WHEN=49,
     /* Variable-declaration leaf nodes. Type definitions and procedure /
        function declarations still emit directly during parse and return
        0 from parse_declaration_ast. */
@@ -1400,6 +1405,30 @@ static void emit_statement_ast(int n) {
             indent_level++; emit_statement_chain(n_arg2[n]); indent_level--;
         }
         emit_indent(); emit_line("}");
+    } else if (kind == S_CASE) {
+        emit_indent(); emit("switch (");
+        emit_expression_ast(n_left[n]);
+        emit_line(") {");
+        indent_level++;
+        for (int arm = n_first[n]; arm != 0; arm = n_next[arm]) {
+            if (n_op[arm]) {
+                emit_indent(); emit_line("default: {");
+            } else {
+                for (int c = n_first[arm]; c != 0; c = n_next[c]) {
+                    emit_indent(); emit("case ");
+                    emit_expression_ast(c);
+                    if (n_next[c] == 0) emit_line(": {");
+                    else emit_line(":");
+                }
+            }
+            indent_level++;
+            emit_statement_chain(n_arg2[arm]);
+            emit_indent(); emit_line("break;");
+            indent_level--;
+            emit_indent(); emit_line("}");
+        }
+        indent_level--;
+        emit_indent(); emit_line("}");
     } else if (kind == S_WHILE) {
         emit_indent(); emit("while (");
         emit_expression_ast(n_left[n]);
@@ -1597,6 +1626,39 @@ static int parse_statement_ast(void) {
             n_arg2[n] = parse_statement_chain();
         }
         expect(TK_END); expect(TK_IF); expect(TK_SEMI);
+        return n;
+    }
+    if (tok == TK_CASE) {
+        /* case Sel is when C|C => stmts ... when others => stmts end case; */
+        n = new_node(S_CASE);
+        next_token();
+        n_left[n] = parse_expression_ast();   /* selector */
+        expect(TK_IS);
+        int prev_arm = 0;
+        while (tok == TK_WHEN) {
+            next_token();
+            int arm = new_node(S_WHEN);
+            if (tok == TK_IDENT && tok_eq_ci("others")) {
+                n_op[arm] = 1;                 /* default: */
+                next_token();
+            } else {
+                int first_c = parse_expression_ast();
+                n_first[arm] = first_c;
+                int prev_c = first_c;
+                while (tok == TK_BAR) {
+                    next_token();
+                    int c = parse_expression_ast();
+                    n_next[prev_c] = c;
+                    prev_c = c;
+                }
+            }
+            expect(TK_ARROW);
+            n_arg2[arm] = parse_statement_chain();   /* stops at when/end */
+            if (prev_arm == 0) n_first[n] = arm;
+            else n_next[prev_arm] = arm;
+            prev_arm = arm;
+        }
+        expect(TK_END); expect(TK_CASE); expect(TK_SEMI);
         return n;
     }
     if (tok == TK_WHILE) {
