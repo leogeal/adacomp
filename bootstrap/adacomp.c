@@ -58,7 +58,7 @@ enum { SK_VAR=1, SK_CONST=2, SK_PARAM=3, SK_PROC=4, SK_FUNC=5, SK_TYPE=6,
 
 /* Type kinds */
 enum { TY_INTEGER=1, TY_CHARACTER=2, TY_BOOLEAN=3, TY_ARRAY=4, TY_STRING=5,
-       TY_ACCESS=6, TY_RECORD=7 };
+       TY_ACCESS=6, TY_RECORD=7, TY_ENUM=8 };
 
 /* Symbol table (dynamically grown; MAX_NAME caps a single name's length,
    but the number of symbols grows without bound). */
@@ -784,6 +784,7 @@ static void emit_c_type(int typ) {
     case TY_CHARACTER: emit("char"); break;
     case TY_BOOLEAN:   emit("int"); break;
     case TY_STRING:    emit("const char *"); break;
+    case TY_ENUM:      emit("int"); break;   /* enums are plain ints */
     default:           emit("int"); break;
     }
 }
@@ -2112,6 +2113,25 @@ static int parse_declaration_ast(void) {
             emit_line(" };");
             expect(TK_END);
             expect(TK_RECORD);
+        } else if (tok == TK_LPAREN) {
+            /* enumeration: `type T is (A, B, C);` -> a C enum whose
+               constants are the lowercased literals (a=0, b=1, ...).
+               Each literal is registered as a constant so its use emits
+               the matching C name; the type itself is an int. */
+            sym_type[sym_count-1] = TY_ENUM;
+            emit("enum { ");
+            next_token();   /* consume '(' */
+            int first = 1;
+            while (tok != TK_RPAREN && tok != TK_EOF) {
+                if (!first) emit(", ");
+                first = 0;
+                emit_str_lower(tok_val, tok_len);   /* literal -> C constant */
+                add_sym(SK_CONST, TY_ENUM);          /* register the literal */
+                next_token();
+                if (tok == TK_COMMA) next_token();
+            }
+            emit_line(" };");
+            expect(TK_RPAREN);
         } else {
             while (tok != TK_SEMI && tok != TK_EOF) next_token();
         }

@@ -426,7 +426,13 @@ Started.
     byte-identically to the bootstrap. Deferred: package-level
     variables/types in specs (need extern handling), package init `begin`,
     child packages, `use` visibility.
-- [ ] Enumerations (beyond Boolean).
+- [x] **Enumerations (v1).** `type T is (A, B, C);` -> a C `enum { a, b,
+  c };`; the type is an int, literals are registered constants that emit
+  their lowercased C name, so assignment and comparison just work. Both
+  compilers; fixture `enums.adb` (Color/Day, if-comparisons) -> green/
+  friday/2; self-hosted stage1 byte-identical to the bootstrap; verify
+  passes. Deferred: `'Image`/`'Pos`/`'Val`/`'First`/`'Last` on enums,
+  `case` statements, `for X in T loop`, overloaded literals across types.
 - [ ] Access types beyond the buffer-growth subset (`.all`, general
   allocators), deallocation.
 - [ ] Proper exception model (define / raise / handle by class).

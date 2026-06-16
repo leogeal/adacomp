@@ -117,6 +117,7 @@ procedure Adacomp is
    TY_STRING    : constant Integer := 5;
    TY_ACCESS    : constant Integer := 6;
    TY_RECORD    : constant Integer := 7;
+   TY_ENUM      : constant Integer := 8;
 
    -- Symbol table (dynamically grown). Names live in a growable character
    -- pool addressed by offset+length; the per-symbol fields are growable
@@ -1295,6 +1296,8 @@ procedure Adacomp is
          Emit ("int");
       elsif Typ = TY_STRING then
          Emit ("const char *");
+      elsif Typ = TY_ENUM then
+         Emit ("int");   -- enums are plain ints
       else
          Emit ("int");
       end if;
@@ -2825,6 +2828,27 @@ procedure Adacomp is
                Emit_Ln (" };");
                Expect (TK_END);
                Expect (TK_RECORD);
+            end;
+         elsif Tok = TK_LPAREN then
+            -- enumeration: `type T is (A, B, C);` -> a C enum whose
+            -- constants are the lowercased literals (a=0, b=1, ...). Each
+            -- literal is registered as a constant; the type is an int.
+            declare
+               First : Boolean := True;
+            begin
+               Sym_Type (Sym_Count) := TY_ENUM;
+               Emit ("enum { ");
+               Next_Token;   -- consume '('
+               while Tok /= TK_RPAREN and Tok /= TK_EOF loop
+                  if not First then Emit (", "); end if;
+                  First := False;
+                  Emit_Lower (Tok_Val, Tok_Len);     -- literal -> C constant
+                  Add_Sym (SK_CONST, TY_ENUM);        -- register the literal
+                  Next_Token;
+                  if Tok = TK_COMMA then Next_Token; end if;
+               end loop;
+               Emit_Ln (" };");
+               Expect (TK_RPAREN);
             end;
          else
             while Tok /= TK_SEMI and Tok /= TK_EOF loop
