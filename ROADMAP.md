@@ -444,7 +444,29 @@ Started.
   range choices (`when 1 .. 5 =>`).
 - [ ] Access types beyond the buffer-growth subset (`.all`, general
   allocators), deallocation.
-- [ ] Proper exception model (define / raise / handle by class).
+- [x] **Exceptions (v1).** `Name : exception;` declarations, `raise E`,
+  bare `raise;` (re-raise), and `begin ... exception when E1 | E2 => ...
+  when others => ... end` handlers on block statements, subprogram
+  bodies, and the main unit. Modelled on `setjmp`/`longjmp`: a handled
+  frame pushes an `ada_handler` onto a global stack and runs its body
+  under `setjmp`; `raise` sets the in-flight exception id/name and
+  `longjmp`s to the top frame (printing + `exit(1)` if none is
+  installed). Handler dispatch is an if/else-if chain on `ada_cur_exc`;
+  `when others` is the final `else`; an unmatched exception
+  re-propagates. The four predefined exceptions (Constraint_Error,
+  Program_Error, Storage_Error, Tasking_Error) are seeded with fixed ids
+  1..4; user exceptions take ids from 5. New token `exception`, symbol
+  kind SK_EXCEPTION, node kind S_EXC_ID; runtime support in
+  `ada_runtime.h`. Both compilers; fixture `exceptions.adb` (user +
+  predefined exceptions, by-name and alternative dispatch, `when others`,
+  re-raise, cross-procedure unwinding) -> ok / caught my_error in risky /
+  caught constraint_error / caught alt / logged, re-raising / outer
+  caught reraised / caught others. Stage1 byte-identical to the
+  bootstrap; verify passes; 23/23 fixtures under both compilers.
+  Deferred: exception messages (`raise E with "msg"` is parsed but the
+  message is discarded), `Exception_Message`/`Exception_Name`, and a
+  `return`/`exit`/`goto` that leaves a handled region while a handler is
+  still installed (it would skip the stack pop — fixtures avoid this).
 - [ ] Wider numeric types, subtypes with ranges + runtime checks.
 
 ### Phases 3–7

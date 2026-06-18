@@ -1,0 +1,7 @@
+ok
+caught my_error in risky
+caught constraint_error
+caught alt
+logged, re-raising
+outer caught reraised
+caught others

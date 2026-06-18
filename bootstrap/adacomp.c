@@ -43,7 +43,7 @@ enum {
     TK_TRUE=66, TK_FALSE=67, TK_DECLARE=68, TK_RAISE=69,
     TK_STRING=70, TK_REVERSE=71, TK_TICK=72,
     TK_ACCESS=73, TK_NEW=74, TK_RANGE=75, TK_BOX=76, TK_RECORD=77,
-    TK_PACKAGE=78, TK_CASE=79, TK_ARROW=80, TK_BAR=81
+    TK_PACKAGE=78, TK_CASE=79, TK_ARROW=80, TK_BAR=81, TK_EXCEPTION=82
 };
 
 /* Current token */
@@ -54,7 +54,7 @@ static int tok_int = 0;
 
 /* Symbol kinds */
 enum { SK_VAR=1, SK_CONST=2, SK_PARAM=3, SK_PROC=4, SK_FUNC=5, SK_TYPE=6,
-       SK_PACKAGE=7 };
+       SK_PACKAGE=7, SK_EXCEPTION=8 };
 
 /* Type kinds */
 enum { TY_INTEGER=1, TY_CHARACTER=2, TY_BOOLEAN=3, TY_ARRAY=4, TY_STRING=5,
@@ -79,6 +79,11 @@ static int cur_scope = 0;
    (0 = not in a package). Subprograms declared here are name-mangled
    <pkg>_<op> and tagged via sym_arr_lo so call sites mangle to match. */
 static int cur_pkg = 0;
+
+/* Exception ids: 1..4 are the predefined Ada exceptions (seeded at
+   startup); user-declared exceptions take ids from 5 upward. The id is
+   stored in sym_arr_lo of an SK_EXCEPTION symbol. */
+static int next_exc_id = 5;
 
 /* Grow all symbol-table arrays so index `need` (0-based) is valid. */
 static void grow_syms(int need) {
@@ -252,6 +257,7 @@ static int check_keyword(void) {
     if (tok_eq_ci("false")) return TK_FALSE;
     if (tok_eq_ci("declare")) return TK_DECLARE;
     if (tok_eq_ci("raise")) return TK_RAISE;
+    if (tok_eq_ci("exception")) return TK_EXCEPTION;
     if (tok_eq_ci("Natural")) return TK_INTEGER;
     if (tok_eq_ci("Positive")) return TK_INTEGER;
     if (tok_eq_ci("String")) return TK_STRING;
@@ -564,6 +570,32 @@ static void add_sym(int kind, int typ) {
     sym_count++;
 }
 
+/* Register an exception by explicit name and id (no current token). Used
+   to seed the predefined exceptions before parsing begins. */
+static void seed_exception(const char *name, int id) {
+    grow_syms(sym_count);
+    int i = 0;
+    while (name[i] && i < MAX_NAME) { sym_name[sym_count][i] = name[i]; i++; }
+    sym_nlen[sym_count] = i;
+    sym_kind[sym_count] = SK_EXCEPTION;
+    sym_type[sym_count] = 0;
+    sym_arr_lo[sym_count] = id;
+    sym_arr_hi[sym_count] = 0;
+    sym_arr_el[sym_count] = 0;
+    sym_arr_inner_lo[sym_count] = 0;
+    sym_arr_inner_hi[sym_count] = 0;
+    sym_scope[sym_count] = 0;
+    sym_count++;
+}
+
+/* The four predefined Ada exceptions, with fixed ids 1..4. */
+static void seed_predefined_exceptions(void) {
+    seed_exception("Constraint_Error", 1);
+    seed_exception("Program_Error", 2);
+    seed_exception("Storage_Error", 3);
+    seed_exception("Tasking_Error", 4);
+}
+
 static void push_scope(void) {
     scope_saved[scope_depth++] = sym_count;
     cur_scope++;
@@ -601,6 +633,7 @@ enum {
        the unit is fully parsed. */
     S_IF=40, S_ELSIF=41, S_WHILE=42, S_LOOP=43, S_FOR=44,
     S_DECLARE=45, S_BLOCK=46, S_PKG=47, S_CASE=48, S_WHEN=49,
+    S_EXC_ID=50,
     /* Variable-declaration leaf nodes. Type definitions and procedure /
        function declarations still emit directly during parse and return
        0 from parse_declaration_ast. */
@@ -745,7 +778,15 @@ static int  parse_statement_ast(void);
 static void emit_statement_ast(int n);
 static int  parse_statement_chain(void);
 static void emit_statement_chain(int head);
+static int  parse_handler_arms(void);
+static void emit_handled(int body, int handlers);
 static void parse_statements(void);
+
+/* Handler-arm chain produced by the most recently completed
+   parse_statement_chain() that ended at an `exception` keyword (else 0).
+   Read immediately by the enclosing begin/end frame; see
+   parse_statement_chain. */
+static int g_pending_handlers = 0;
 static void parse_declarations(void);
 static int  parse_declaration_ast(void);
 static void emit_declaration_ast(int n);
@@ -1135,6 +1176,13 @@ static void emit_pool_lower(int off, int len) {
         fputc(tolower((unsigned char)npool[off + i]), out_file);
 }
 
+/* Emit pooled text verbatim (original case) — used for the exception
+   name carried into the unhandled-exception message. */
+static void emit_pool_raw(int off, int len) {
+    for (int i = 0; i < len; i++)
+        fputc(npool[off + i], out_file);
+}
+
 static void emit_expression_ast(int n) {
     if (n == 0) return;
     int kind = n_kind[n];
@@ -1330,9 +1378,15 @@ static void emit_statement_ast(int n) {
         emit_line(";");
     } else if (kind == S_RAISE) {
         emit_indent();
-        emit("{ fprintf(stderr, \"Exception raised at line %d\\n\", ");
-        emit_int(n_int[n]);
-        emit_line("); exit(1); }");
+        if (n_op[n] == 1) {
+            emit_line("ada_raise(ada_cur_exc, ada_cur_exc_name);");
+        } else {
+            emit("ada_raise(");
+            emit_int(n_aux1[n]);
+            emit(", \"");
+            emit_pool_raw(n_str_off[n], n_str_len[n]);
+            emit_line("\");");
+        }
     } else if (kind == S_EXIT) {
         if (n_left[n] != 0) {
             emit_indent(); emit("if (");
@@ -1475,13 +1529,15 @@ static void emit_statement_ast(int n) {
         emit_indent(); emit_line("{");
         indent_level++;
         emit_declaration_chain(n_first[n]);
-        emit_statement_chain(n_arg2[n]);
+        if (n_right[n] != 0) emit_handled(n_arg2[n], n_right[n]);
+        else emit_statement_chain(n_arg2[n]);
         indent_level--;
         emit_indent(); emit_line("}");
     } else if (kind == S_BLOCK) {
         emit_indent(); emit_line("{");
         indent_level++;
-        emit_statement_chain(n_first[n]);
+        if (n_arg2[n] != 0) emit_handled(n_first[n], n_arg2[n]);
+        else emit_statement_chain(n_first[n]);
         indent_level--;
         emit_indent(); emit_line("}");
     } else if (kind == S_PKG) {
@@ -1588,7 +1644,19 @@ static int parse_statement_ast(void) {
         n = new_node(S_RAISE);
         n_int[n] = line_num;
         next_token();
-        while (tok != TK_SEMI && tok != TK_EOF) next_token();
+        if (tok == TK_SEMI) {
+            n_op[n] = 1;                 /* bare `raise;` -> re-raise */
+        } else {
+            /* raise Name [with "msg"];  resolve Name to its exception id;
+               unknown names default to Program_Error (id 2). */
+            int idx = find_sym(tok_val, tok_len);
+            n_aux1[n] = (idx >= 0 && sym_kind[idx] == SK_EXCEPTION)
+                        ? sym_arr_lo[idx] : 2;
+            n_str_off[n] = pool_str(tok_val, tok_len);
+            n_str_len[n] = tok_len;
+            next_token();
+            while (tok != TK_SEMI && tok != TK_EOF) next_token();
+        }
         expect(TK_SEMI);
         return n;
     }
@@ -1699,6 +1767,7 @@ static int parse_statement_ast(void) {
         n_first[n] = parse_var_decl_chain();
         expect(TK_BEGIN);
         n_arg2[n] = parse_statement_chain();
+        n_right[n] = g_pending_handlers;     /* handler arms, or 0 */
         expect(TK_END); expect(TK_SEMI);
         return n;
     }
@@ -1706,6 +1775,7 @@ static int parse_statement_ast(void) {
         n = new_node(S_BLOCK);
         next_token();
         n_first[n] = parse_statement_chain();
+        n_arg2[n] = g_pending_handlers;      /* handler arms, or 0 */
         expect(TK_END); expect(TK_SEMI);
         return n;
     }
@@ -1939,19 +2009,114 @@ static int parse_statement_ast(void) {
 static int parse_statement_chain(void) {
     int head = 0, prev = 0;
     while (tok != TK_END && tok != TK_ELSIF && tok != TK_ELSE &&
-           tok != TK_EOF && tok != TK_WHEN) {
-        /* Skip 'exception' handler blocks: stop the chain at the handler. */
-        if (tok == TK_IDENT && tok_eq_ci("exception")) {
-            next_token();
-            while (tok != TK_END && tok != TK_EOF) next_token();
-            break;
-        }
+           tok != TK_EOF && tok != TK_WHEN && tok != TK_EXCEPTION) {
         int s = parse_statement_ast();
         if (head == 0) head = s;
         else n_next[prev] = s;
         prev = s;
     }
+    /* If this sequence is the protected part of a begin/end frame, the
+       `exception` keyword follows; parse its handler arms and publish them
+       in g_pending_handlers for the enclosing frame to pick up. Reset to 0
+       first so a frame with no handlers reads 0 regardless of any nested
+       block that set it earlier. */
+    g_pending_handlers = 0;
+    if (tok == TK_EXCEPTION) {
+        next_token();
+        g_pending_handlers = parse_handler_arms();
+    }
     return head;
+}
+
+/* Parse the handler arms after `exception`:
+     when E1 | E2 => stmts   when others => stmts   ...   (until `end`)
+   Each arm is an S_WHEN node: n_op=1 marks `when others`; otherwise
+   n_first chains S_EXC_ID nodes (one per exception name, n_aux1 = id);
+   n_arg2 is the handler body statement chain. */
+static int parse_handler_arms(void) {
+    int head = 0, prev = 0;
+    while (tok == TK_WHEN) {
+        next_token();
+        int arm = new_node(S_WHEN);
+        if (tok == TK_IDENT && tok_eq_ci("others")) {
+            n_op[arm] = 1;
+            next_token();
+        } else {
+            int prev_c = 0;
+            while (1) {
+                int idx = find_sym(tok_val, tok_len);
+                int id = (idx >= 0 && sym_kind[idx] == SK_EXCEPTION)
+                         ? sym_arr_lo[idx] : 2;
+                int c = new_node(S_EXC_ID);
+                n_aux1[c] = id;
+                if (prev_c == 0) n_first[arm] = c;
+                else n_next[prev_c] = c;
+                prev_c = c;
+                next_token();
+                if (tok != TK_BAR) break;
+                next_token();
+            }
+        }
+        expect(TK_ARROW);
+        n_arg2[arm] = parse_statement_chain();   /* body, stops at when/end */
+        if (head == 0) head = arm;
+        else n_next[prev] = arm;
+        prev = arm;
+    }
+    return head;
+}
+
+/* Emit the handler dispatch (inside the `else` of a setjmp wrapper):
+   a chain of if / else-if on ada_cur_exc, with `when others` becoming a
+   bare else. If no `others`, an unmatched exception re-propagates to the
+   enclosing frame via ada_raise. */
+static void emit_handlers(int arms) {
+    int first = 1, has_others = 0;
+    for (int arm = arms; arm != 0; arm = n_next[arm]) {
+        emit_indent();
+        if (n_op[arm] == 1) {
+            has_others = 1;
+            emit_line(first ? "if (1) {" : "else {");
+        } else {
+            emit(first ? "if (" : "else if (");
+            int fc = 1;
+            for (int c = n_first[arm]; c != 0; c = n_next[c]) {
+                if (!fc) emit(" || ");
+                emit("ada_cur_exc == ");
+                emit_int(n_aux1[c]);
+                fc = 0;
+            }
+            emit_line(") {");
+        }
+        indent_level++;
+        emit_statement_chain(n_arg2[arm]);
+        indent_level--;
+        emit_indent(); emit_line("}");
+        first = 0;
+    }
+    if (!has_others) {
+        emit_indent();
+        emit_line("else { ada_raise(ada_cur_exc, ada_cur_exc_name); }");
+    }
+}
+
+/* Emit a begin/end frame that has exception handlers: push a handler,
+   run the protected body under setjmp, and on a longjmp pop the handler
+   and dispatch. The handler is also popped on normal fall-through. */
+static void emit_handled(int body, int handlers) {
+    emit_indent(); emit_line("ada_handler _h;");
+    emit_indent(); emit_line("_h.prev = ada_handler_top; ada_handler_top = &_h;");
+    emit_indent(); emit_line("if (setjmp(_h.buf) == 0) {");
+    indent_level++;
+    emit_statement_chain(body);
+    emit_indent(); emit_line("ada_handler_top = _h.prev;");
+    indent_level--;
+    emit_indent(); emit_line("} else {");
+    indent_level++;
+    emit_indent(); emit_line("ada_handler_top = _h.prev;");
+    emit_handlers(handlers);
+    indent_level--;
+    emit_indent(); emit_line("}");
 }
 
 /* Walk a statement chain. */
@@ -1964,7 +2129,9 @@ static void emit_statement_chain(int head) {
    function bodies (after their local declarations are emitted). */
 static void parse_statements(void) {
     int head = parse_statement_chain();
-    emit_statement_chain(head);
+    int handlers = g_pending_handlers;
+    if (handlers != 0) emit_handled(head, handlers);
+    else emit_statement_chain(head);
     reset_ast();
 }
 
@@ -2438,6 +2605,19 @@ static int parse_declaration_ast(void) {
             int is_const = 0;
             if (tok == TK_CONSTANT) { is_const = 1; next_token(); }
 
+            /* Exception declaration: Name : exception;  -> register an
+               SK_EXCEPTION symbol with a fresh id; emits no C (ids are
+               compile-time constants used at raise/handler sites). */
+            if (tok == TK_EXCEPTION) {
+                next_token();
+                expect(TK_SEMI);
+                add_sym(SK_EXCEPTION, 0);
+                memcpy(sym_name[sym_count-1], vname, vlen);
+                sym_nlen[sym_count-1] = vlen;
+                sym_arr_lo[sym_count-1] = next_exc_id++;
+                return 0;
+            }
+
             int n;
 
             /* Anonymous inline array: Name : array (lo .. hi) of T; */
@@ -2870,6 +3050,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    seed_predefined_exceptions();
     next_token();
     parse_program();
 

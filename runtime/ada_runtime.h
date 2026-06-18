@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
 
 /* Ada Integer type */
 typedef int Integer;
@@ -46,5 +47,29 @@ static const char *ada_argument(int argc, char **argv, int n) {
 
 static int ada_char_val(char c) { return (int)c; }
 static char ada_char_chr(int n) { return (char)n; }
+
+/* ---- Exception support (setjmp/longjmp model) ----
+   A `begin ... exception ... end` frame pushes an ada_handler onto a
+   global stack; `raise E` sets the current exception and longjmps to the
+   top frame. With no frame installed, an unhandled exception prints to
+   stderr and exits 1 (matching Ada's default behaviour). Exceptions are
+   identified by small integer ids assigned by the compiler; the name is
+   carried alongside purely for the unhandled-exception message. */
+typedef struct ada_handler {
+    jmp_buf buf;
+    struct ada_handler *prev;
+} ada_handler;
+
+static ada_handler *ada_handler_top = 0;
+static int ada_cur_exc = 0;                 /* id of exception in flight */
+static const char *ada_cur_exc_name = "";
+
+static void ada_raise(int id, const char *name) {
+    ada_cur_exc = id;
+    ada_cur_exc_name = name;
+    if (ada_handler_top) longjmp(ada_handler_top->buf, 1);
+    fprintf(stderr, "\nraised %s : unhandled exception\n", name);
+    exit(1);
+}
 
 #endif

@@ -95,6 +95,7 @@ procedure Adacomp is
    TK_CASE      : constant Integer := 79;
    TK_ARROW     : constant Integer := 80;
    TK_BAR       : constant Integer := 81;
+   TK_EXCEPTION : constant Integer := 82;
 
    -- Current token
    type Tok_Buffer is array (1 .. 4096) of Character;
@@ -111,6 +112,7 @@ procedure Adacomp is
    SK_FUNC  : constant Integer := 5;
    SK_TYPE  : constant Integer := 6;
    SK_PACKAGE : constant Integer := 7;
+   SK_EXCEPTION : constant Integer := 8;
 
    -- Type kinds
    TY_INTEGER   : constant Integer := 1;
@@ -152,6 +154,16 @@ procedure Adacomp is
    -- "none" sentinel). Subprograms here are mangled <pkg>_<op> and tagged
    -- via Sym_Arr_Lo so call sites mangle to match.
    Cur_Pkg : Integer := 0;
+
+   -- Exception ids: 1..4 are the predefined Ada exceptions (seeded at
+   -- startup); user-declared exceptions take ids from 5 upward. The id is
+   -- stored in Sym_Arr_Lo of an SK_EXCEPTION symbol.
+   Next_Exc_Id : Integer := 5;
+
+   -- Handler-arm chain produced by the most recently completed
+   -- Parse_Statement_Chain that ended at an `exception` keyword (else 0).
+   -- Read immediately by the enclosing begin/end frame.
+   G_Pending_Handlers : Integer := 0;
 
    -- Simple `with P;` clauses (user packages) collected for #include "p.h".
    -- Dotted withs (Ada.Text_IO, ...) are builtins and are not collected.
@@ -243,6 +255,7 @@ procedure Adacomp is
    S_PKG     : constant Integer := 47;
    S_CASE    : constant Integer := 48;
    S_WHEN    : constant Integer := 49;
+   S_EXC_ID  : constant Integer := 50;
 
    -- Sub-ops for S_PKG (dotted Ada.Text_IO.* statement calls).
    PKG_PUT_LINE : constant Integer := 1;
@@ -492,6 +505,7 @@ procedure Adacomp is
       if Tok_Eq_CI ("when") then return TK_WHEN; end if;
       if Tok_Eq_CI ("declare") then return TK_DECLARE; end if;
       if Tok_Eq_CI ("raise") then return TK_RAISE; end if;
+      if Tok_Eq_CI ("exception") then return TK_EXCEPTION; end if;
       if Tok_Eq_CI ("Integer") then return TK_INTEGER; end if;
       if Tok_Eq_CI ("Natural") then return TK_INTEGER; end if;
       if Tok_Eq_CI ("Positive") then return TK_INTEGER; end if;
@@ -1054,6 +1068,27 @@ procedure Adacomp is
       Sym_Arr_Inner_Hi (Sym_Count) := 0;
    end Add_Sym_Named;
 
+   -- Register an exception by explicit name and id (no current token).
+   -- Used to seed the predefined exceptions before parsing begins.
+   procedure Seed_Exception (Name : String; Id : Integer) is
+      Buf : Tok_Buffer;
+   begin
+      for I in 1 .. Name'Length loop
+         Buf (I) := Name (Name'First + I - 1);
+      end loop;
+      Add_Sym_Named (Buf, Name'Length, SK_EXCEPTION, 0);
+      Sym_Arr_Lo (Sym_Count) := Id;
+   end Seed_Exception;
+
+   -- The four predefined Ada exceptions, with fixed ids 1..4.
+   procedure Seed_Predefined_Exceptions is
+   begin
+      Seed_Exception ("Constraint_Error", 1);
+      Seed_Exception ("Program_Error", 2);
+      Seed_Exception ("Storage_Error", 3);
+      Seed_Exception ("Tasking_Error", 4);
+   end Seed_Predefined_Exceptions;
+
    procedure Push_Scope is
    begin
       Scope_Depth := Scope_Depth + 1;
@@ -1242,6 +1277,15 @@ procedure Adacomp is
       end loop;
    end Emit_Pool_Lower;
 
+   -- Emit pooled text verbatim (original case) -- used for the exception
+   -- name carried into the unhandled-exception message.
+   procedure Emit_Pool_Raw (Off : Integer; Len : Integer) is
+   begin
+      for I in 1 .. Len loop
+         Emit_Ch (NPool (Off + I - 1));
+      end loop;
+   end Emit_Pool_Raw;
+
    -- Forward declarations
    procedure Parse_Expression;
    procedure Parse_Statements;
@@ -1254,6 +1298,8 @@ procedure Adacomp is
    function  Parse_Statement_AST return Integer;
    function  Parse_Statement_Chain return Integer;
    procedure Emit_Statement_Chain (Head : Integer);
+   function  Parse_Handler_Arms return Integer;
+   procedure Emit_Handled (Body_Head : Integer; Handlers : Integer);
    function  Parse_Declaration_AST return Integer;
    function  Parse_Var_Decl_Chain return Integer;
    procedure Emit_Declaration_Chain (Head : Integer);
@@ -1940,9 +1986,15 @@ procedure Adacomp is
          Emit_Ln (";");
       elsif Kind = S_RAISE then
          Emit_Indent;
-         Emit ("{ fprintf(stderr, ""Exception raised at line %d\n"", ");
-         Emit_Int (N_Int (N));
-         Emit_Ln ("); exit(1); }");
+         if N_Op (N) = 1 then
+            Emit_Ln ("ada_raise(ada_cur_exc, ada_cur_exc_name);");
+         else
+            Emit ("ada_raise(");
+            Emit_Int (N_Aux1 (N));
+            Emit (", """);
+            Emit_Pool_Raw (N_Str_Off (N), N_Str_Len (N));
+            Emit_Ln (""");");
+         end if;
       elsif Kind = S_EXIT then
          if N_Left (N) /= 0 then
             Emit_Indent; Emit ("if (");
@@ -2114,13 +2166,21 @@ procedure Adacomp is
          Emit_Indent; Emit_Ln ("{");
          Indent_Level := Indent_Level + 1;
          Emit_Declaration_Chain (N_First (N));
-         Emit_Statement_Chain (N_Arg2 (N));
+         if N_Right (N) /= 0 then
+            Emit_Handled (N_Arg2 (N), N_Right (N));
+         else
+            Emit_Statement_Chain (N_Arg2 (N));
+         end if;
          Indent_Level := Indent_Level - 1;
          Emit_Indent; Emit_Ln ("}");
       elsif Kind = S_BLOCK then
          Emit_Indent; Emit_Ln ("{");
          Indent_Level := Indent_Level + 1;
-         Emit_Statement_Chain (N_First (N));
+         if N_Arg2 (N) /= 0 then
+            Emit_Handled (N_First (N), N_Arg2 (N));
+         else
+            Emit_Statement_Chain (N_First (N));
+         end if;
          Indent_Level := Indent_Level - 1;
          Emit_Indent; Emit_Ln ("}");
       elsif Kind = S_PKG then
@@ -2244,9 +2304,27 @@ procedure Adacomp is
          N := New_Node (S_RAISE);
          N_Int (N) := Line_Num;
          Next_Token;
-         while Tok /= TK_SEMI and Tok /= TK_EOF loop
+         if Tok = TK_SEMI then
+            N_Op (N) := 1;                 -- bare `raise;` -> re-raise
+         else
+            -- raise Name [with "msg"];  resolve Name to its exception id;
+            -- unknown names default to Program_Error (id 2).
+            declare
+               Idx : Integer := Find_Sym (Tok_Val, Tok_Len);
+            begin
+               if Idx > 0 and then Sym_Kind (Idx) = SK_EXCEPTION then
+                  N_Aux1 (N) := Sym_Arr_Lo (Idx);
+               else
+                  N_Aux1 (N) := 2;
+               end if;
+            end;
+            N_Str_Off (N) := Pool_Str (Tok_Val, Tok_Len);
+            N_Str_Len (N) := Tok_Len;
             Next_Token;
-         end loop;
+            while Tok /= TK_SEMI and Tok /= TK_EOF loop
+               Next_Token;
+            end loop;
+         end if;
          Expect (TK_SEMI);
          return N;
       end if;
@@ -2380,6 +2458,7 @@ procedure Adacomp is
          N_First (N) := Parse_Var_Decl_Chain;
          Expect (TK_BEGIN);
          N_Arg2 (N) := Parse_Statement_Chain;
+         N_Right (N) := G_Pending_Handlers;    -- handler arms, or 0
          Expect (TK_END); Expect (TK_SEMI);
          return N;
       end if;
@@ -2387,6 +2466,7 @@ procedure Adacomp is
          N := New_Node (S_BLOCK);
          Next_Token;
          N_First (N) := Parse_Statement_Chain;
+         N_Arg2 (N) := G_Pending_Handlers;      -- handler arms, or 0
          Expect (TK_END); Expect (TK_SEMI);
          return N;
       end if;
@@ -2657,15 +2737,9 @@ procedure Adacomp is
       S    : Integer;
    begin
       while Tok /= TK_END and Tok /= TK_ELSIF and
-            Tok /= TK_ELSE and Tok /= TK_EOF and Tok /= TK_WHEN
+            Tok /= TK_ELSE and Tok /= TK_EOF and Tok /= TK_WHEN and
+            Tok /= TK_EXCEPTION
       loop
-         if Tok = TK_IDENT and then Tok_Eq_CI ("exception") then
-            Next_Token;
-            while Tok /= TK_END and Tok /= TK_EOF loop
-               Next_Token;
-            end loop;
-            exit;
-         end if;
          S := Parse_Statement_AST;
          if Head = 0 then
             Head := S;
@@ -2674,8 +2748,151 @@ procedure Adacomp is
          end if;
          Prev := S;
       end loop;
+      -- If this sequence is the protected part of a begin/end frame, the
+      -- `exception` keyword follows; parse its handler arms and publish
+      -- them in G_Pending_Handlers for the enclosing frame. Reset to 0
+      -- first so a frame with no handlers reads 0 regardless of any nested
+      -- block that set it earlier.
+      G_Pending_Handlers := 0;
+      if Tok = TK_EXCEPTION then
+         Next_Token;
+         G_Pending_Handlers := Parse_Handler_Arms;
+      end if;
       return Head;
    end Parse_Statement_Chain;
+
+   -- Parse the handler arms after `exception`:
+   --   when E1 | E2 => stmts   when others => stmts   ...   (until `end`)
+   -- Each arm is an S_WHEN node: N_Op=1 marks `when others`; otherwise
+   -- N_First chains S_EXC_ID nodes (one per exception name, N_Aux1 = id);
+   -- N_Arg2 is the handler body statement chain.
+   function Parse_Handler_Arms return Integer is
+      Head : Integer := 0;
+      Prev : Integer := 0;
+      Arm  : Integer;
+   begin
+      while Tok = TK_WHEN loop
+         Next_Token;
+         Arm := New_Node (S_WHEN);
+         if Tok = TK_IDENT and then Tok_Eq_CI ("others") then
+            N_Op (Arm) := 1;
+            Next_Token;
+         else
+            declare
+               Prev_C : Integer := 0;
+               Idx    : Integer;
+               Id     : Integer;
+               C      : Integer;
+               Done   : Boolean := False;
+            begin
+               while not Done loop
+                  Idx := Find_Sym (Tok_Val, Tok_Len);
+                  if Idx > 0 and then Sym_Kind (Idx) = SK_EXCEPTION then
+                     Id := Sym_Arr_Lo (Idx);
+                  else
+                     Id := 2;
+                  end if;
+                  C := New_Node (S_EXC_ID);
+                  N_Aux1 (C) := Id;
+                  if Prev_C = 0 then
+                     N_First (Arm) := C;
+                  else
+                     N_Next (Prev_C) := C;
+                  end if;
+                  Prev_C := C;
+                  Next_Token;
+                  if Tok = TK_BAR then
+                     Next_Token;
+                  else
+                     Done := True;
+                  end if;
+               end loop;
+            end;
+         end if;
+         Expect (TK_ARROW);
+         N_Arg2 (Arm) := Parse_Statement_Chain;   -- body, stops at when/end
+         if Head = 0 then
+            Head := Arm;
+         else
+            N_Next (Prev) := Arm;
+         end if;
+         Prev := Arm;
+      end loop;
+      return Head;
+   end Parse_Handler_Arms;
+
+   -- Emit the handler dispatch (inside the `else` of a setjmp wrapper):
+   -- a chain of if / else-if on ada_cur_exc, with `when others` becoming a
+   -- bare else. If no `others`, an unmatched exception re-propagates to
+   -- the enclosing frame via ada_raise.
+   procedure Emit_Handlers (Arms : Integer) is
+      First      : Boolean := True;
+      Has_Others : Boolean := False;
+      Arm        : Integer;
+      C          : Integer;
+      First_C    : Boolean;
+   begin
+      Arm := Arms;
+      while Arm /= 0 loop
+         Emit_Indent;
+         if N_Op (Arm) = 1 then
+            Has_Others := True;
+            if First then
+               Emit_Ln ("if (1) {");
+            else
+               Emit_Ln ("else {");
+            end if;
+         else
+            if First then
+               Emit ("if (");
+            else
+               Emit ("else if (");
+            end if;
+            First_C := True;
+            C := N_First (Arm);
+            while C /= 0 loop
+               if not First_C then
+                  Emit (" || ");
+               end if;
+               Emit ("ada_cur_exc == ");
+               Emit_Int (N_Aux1 (C));
+               First_C := False;
+               C := N_Next (C);
+            end loop;
+            Emit_Ln (") {");
+         end if;
+         Indent_Level := Indent_Level + 1;
+         Emit_Statement_Chain (N_Arg2 (Arm));
+         Indent_Level := Indent_Level - 1;
+         Emit_Indent; Emit_Ln ("}");
+         First := False;
+         Arm := N_Next (Arm);
+      end loop;
+      if not Has_Others then
+         Emit_Indent;
+         Emit_Ln ("else { ada_raise(ada_cur_exc, ada_cur_exc_name); }");
+      end if;
+   end Emit_Handlers;
+
+   -- Emit a begin/end frame that has exception handlers: push a handler,
+   -- run the protected body under setjmp, and on a longjmp pop the handler
+   -- and dispatch. The handler is also popped on normal fall-through.
+   procedure Emit_Handled (Body_Head : Integer; Handlers : Integer) is
+   begin
+      Emit_Indent; Emit_Ln ("ada_handler _h;");
+      Emit_Indent; Emit_Ln ("_h.prev = ada_handler_top; ada_handler_top = &_h;");
+      Emit_Indent; Emit_Ln ("if (setjmp(_h.buf) == 0) {");
+      Indent_Level := Indent_Level + 1;
+      Emit_Statement_Chain (Body_Head);
+      Emit_Indent; Emit_Ln ("ada_handler_top = _h.prev;");
+      Indent_Level := Indent_Level - 1;
+      Emit_Indent; Emit_Ln ("} else {");
+      Indent_Level := Indent_Level + 1;
+      Emit_Indent; Emit_Ln ("ada_handler_top = _h.prev;");
+      Emit_Handlers (Handlers);
+      Indent_Level := Indent_Level - 1;
+      Emit_Indent; Emit_Ln ("}");
+   end Emit_Handled;
 
    procedure Emit_Statement_Chain (Head : Integer) is
       N : Integer;
@@ -2690,10 +2907,16 @@ procedure Adacomp is
    -- Parse one program-unit body: build its statement tree, walk it,
    -- then reset the shared node pool.
    procedure Parse_Statements is
-      Head : Integer;
+      Head     : Integer;
+      Handlers : Integer;
    begin
       Head := Parse_Statement_Chain;
-      Emit_Statement_Chain (Head);
+      Handlers := G_Pending_Handlers;
+      if Handlers /= 0 then
+         Emit_Handled (Head, Handlers);
+      else
+         Emit_Statement_Chain (Head);
+      end if;
       Reset_AST;
    end Parse_Statements;
 
@@ -3225,6 +3448,18 @@ procedure Adacomp is
                Next_Token;
             end if;
 
+            -- Exception declaration: Name : exception;  -> register an
+            -- SK_EXCEPTION symbol with a fresh id; emits no C (ids are
+            -- compile-time constants used at raise/handler sites).
+            if Tok = TK_EXCEPTION then
+               Next_Token;
+               Expect (TK_SEMI);
+               Add_Sym_Named (Var_Name, Var_Len, SK_EXCEPTION, 0);
+               Sym_Arr_Lo (Sym_Count) := Next_Exc_Id;
+               Next_Exc_Id := Next_Exc_Id + 1;
+               return 0;
+            end if;
+
             -- Anonymous inline array: Name : array (lo..hi) of T;
             if Tok = TK_ARRAY then
                Next_Token;
@@ -3723,6 +3958,7 @@ begin
    Ada.Text_IO.Create (Out_File, Ada.Text_IO.Out_File,
                         Ada.Command_Line.Argument (2));
 
+   Seed_Predefined_Exceptions;
    Next_Token;
    Parse_Program;
 
