@@ -467,7 +467,28 @@ Started.
   message is discarded), `Exception_Message`/`Exception_Name`, and a
   `return`/`exit`/`goto` that leaves a handled region while a handler is
   still installed (it would skip the stack pop — fixtures avoid this).
-- [ ] Wider numeric types, subtypes with ranges + runtime checks.
+- [x] **Subtypes / ranges with checks (v1).** `subtype S is Integer
+  range L .. H;`, `type T is range L .. H;`, and inline `X : Integer
+  range L .. H;` constraints, plus variables of a named ranged subtype
+  (`X : S;`). The constraint rides on the symbol (sym_has_range /
+  sym_range_lo / sym_range_hi) and is resolved onto the assignment /
+  declaration node at build time. Assigning or initializing such a
+  variable emits `ada_range_check(v, lo, hi)`, a runtime helper that
+  returns `v` if it lies in `[lo, hi]` and otherwise raises
+  Constraint_Error (id 1) — so the bad store never happens and the
+  exception machinery catches it. This makes Constraint_Error fire for
+  real. New token `subtype`; integer subtypes map to C `int` (no C type
+  emitted). Both compilers; fixture `subtypes.adb` (subtype + `type ...
+  is range` + inline range + named-subtype var, in-range assigns, two
+  out-of-range assigns caught by handlers) -> 5 / 10 / 75 / 100 / x out
+  of range / z out of range / 10. Stage1 byte-identical to the
+  bootstrap; verify passes; 24/24 fixtures under both compilers.
+  Deferred: dynamic / named-constant bounds (bounds must be static
+  integer literals); range checks on array indexing, parameter passing,
+  and subtype conversions; ranged subtypes of enum / character types;
+  `Natural` / `Positive` implicit constraints; `'First` / `'Last` /
+  `'Range` on subtypes; initializer checks on main-level locals (emitted
+  as C globals, so the check is skipped there).
 
 ### Phases 3–7
 

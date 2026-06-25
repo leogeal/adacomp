@@ -96,6 +96,7 @@ procedure Adacomp is
    TK_ARROW     : constant Integer := 80;
    TK_BAR       : constant Integer := 81;
    TK_EXCEPTION : constant Integer := 82;
+   TK_SUBTYPE   : constant Integer := 83;
 
    -- Current token
    type Tok_Buffer is array (1 .. 4096) of Character;
@@ -141,6 +142,12 @@ procedure Adacomp is
    Sym_Arr_El        : Int_Vec_Ptr;
    Sym_Arr_Inner_Lo  : Int_Vec_Ptr;
    Sym_Arr_Inner_Hi  : Int_Vec_Ptr;
+   --  Scalar range constraint (subtypes and `X : Integer range L..H`):
+   --  Sym_Has_Range = 1 means values are checked against
+   --  [Sym_Range_Lo, Sym_Range_Hi] on assignment/initialization.
+   Sym_Has_Range     : Int_Vec_Ptr;
+   Sym_Range_Lo      : Int_Vec_Ptr;
+   Sym_Range_Hi      : Int_Vec_Ptr;
    Sym_Cap           : Integer := 0;
    Sym_Count         : Integer := 0;
 
@@ -487,6 +494,7 @@ procedure Adacomp is
       if Tok_Eq_CI ("reverse") then return TK_REVERSE; end if;
       if Tok_Eq_CI ("return") then return TK_RETURN; end if;
       if Tok_Eq_CI ("type") then return TK_TYPE; end if;
+      if Tok_Eq_CI ("subtype") then return TK_SUBTYPE; end if;
       if Tok_Eq_CI ("array") then return TK_ARRAY; end if;
       if Tok_Eq_CI ("of") then return TK_OF; end if;
       if Tok_Eq_CI ("access") then return TK_ACCESS; end if;
@@ -982,6 +990,9 @@ procedure Adacomp is
       A7 : Int_Vec_Ptr;
       A8 : Int_Vec_Ptr;
       A9 : Int_Vec_Ptr;
+      A10 : Int_Vec_Ptr;
+      A11 : Int_Vec_Ptr;
+      A12 : Int_Vec_Ptr;
    begin
       if Need <= Sym_Cap then return; end if;
       New_Cap := Sym_Cap * 2;
@@ -996,6 +1007,9 @@ procedure Adacomp is
       A7 := new Int_Vec (1 .. New_Cap);
       A8 := new Int_Vec (1 .. New_Cap);
       A9 := new Int_Vec (1 .. New_Cap);
+      A10 := new Int_Vec (1 .. New_Cap);
+      A11 := new Int_Vec (1 .. New_Cap);
+      A12 := new Int_Vec (1 .. New_Cap);
       for I in 1 .. Sym_Count loop
          A1 (I) := Sym_Name_Off (I);
          A2 (I) := Sym_Name_Len (I);
@@ -1006,6 +1020,9 @@ procedure Adacomp is
          A7 (I) := Sym_Arr_El (I);
          A8 (I) := Sym_Arr_Inner_Lo (I);
          A9 (I) := Sym_Arr_Inner_Hi (I);
+         A10 (I) := Sym_Has_Range (I);
+         A11 (I) := Sym_Range_Lo (I);
+         A12 (I) := Sym_Range_Hi (I);
       end loop;
       Sym_Name_Off := A1;
       Sym_Name_Len := A2;
@@ -1016,6 +1033,9 @@ procedure Adacomp is
       Sym_Arr_El := A7;
       Sym_Arr_Inner_Lo := A8;
       Sym_Arr_Inner_Hi := A9;
+      Sym_Has_Range := A10;
+      Sym_Range_Lo := A11;
+      Sym_Range_Hi := A12;
       Sym_Cap := New_Cap;
    end Ensure_Sym_Cap;
 
@@ -1042,6 +1062,9 @@ procedure Adacomp is
       Sym_Arr_El (Sym_Count) := 0;
       Sym_Arr_Inner_Lo (Sym_Count) := 0;
       Sym_Arr_Inner_Hi (Sym_Count) := 0;
+      Sym_Has_Range (Sym_Count) := 0;
+      Sym_Range_Lo (Sym_Count) := 0;
+      Sym_Range_Hi (Sym_Count) := 0;
    end Add_Sym;
 
    procedure Add_Sym_Named (Buf : Tok_Buffer; BLen : Integer; Kind : Integer; Typ : Integer) is
@@ -1066,6 +1089,9 @@ procedure Adacomp is
       Sym_Arr_El (Sym_Count) := 0;
       Sym_Arr_Inner_Lo (Sym_Count) := 0;
       Sym_Arr_Inner_Hi (Sym_Count) := 0;
+      Sym_Has_Range (Sym_Count) := 0;
+      Sym_Range_Lo (Sym_Count) := 0;
+      Sym_Range_Hi (Sym_Count) := 0;
    end Add_Sym_Named;
 
    -- Register an exception by explicit name and id (no current token).
@@ -2007,7 +2033,14 @@ procedure Adacomp is
          Emit_Indent;
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit (" = ");
-         Emit_Expression_AST (N_Right (N));
+         if N_Op (N) = 1 then            -- range-constrained target
+            Emit ("ada_range_check(");
+            Emit_Expression_AST (N_Right (N));
+            Emit (", "); Emit_Int (N_Aux1 (N));
+            Emit (", "); Emit_Int (N_Aux2 (N)); Emit (")");
+         else
+            Emit_Expression_AST (N_Right (N));
+         end if;
          Emit_Ln (";");
       elsif Kind = S_CALL then
          Emit_Indent;
@@ -2486,6 +2519,13 @@ procedure Adacomp is
             N := New_Node (S_ASSIGN);
             N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
             N_Str_Len (N) := Saved_Len;
+            -- If the target is a range-constrained variable, resolve its
+            -- bounds now so the walker can wrap the rhs in a check.
+            if Sym_Idx > 0 and then Sym_Has_Range (Sym_Idx) = 1 then
+               N_Op (N) := 1;
+               N_Aux1 (N) := Sym_Range_Lo (Sym_Idx);
+               N_Aux2 (N) := Sym_Range_Hi (Sym_Idx);
+            end if;
             Next_Token;
             N_Right (N) := Parse_Expression_AST;
             Expect (TK_SEMI);
@@ -2937,7 +2977,17 @@ procedure Adacomp is
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          if N_Left (N) /= 0 then
             Emit (" = ");
-            Emit_Expression_AST (N_Left (N));
+            -- Wrap the initializer in a range check, but only inside a
+            -- real C function — a main-level local is emitted as a C
+            -- global, whose initializer must be constant (no call).
+            if N_Aux1 (N) = 1 and then Indent_Level > 0 then
+               Emit ("ada_range_check(");
+               Emit_Expression_AST (N_Left (N));
+               Emit (", "); Emit_Int (N_Aux2 (N));
+               Emit (", "); Emit_Int (N_Right (N)); Emit (")");
+            else
+               Emit_Expression_AST (N_Left (N));
+            end if;
          elsif N_Int (N) = TY_STRING then
             Emit (" = """"");
          else
@@ -3034,6 +3084,25 @@ procedure Adacomp is
    -- Variables become AST nodes; type definitions and procedure/function
    -- declarations direct-emit and return 0. Returning 0 also signals
    -- "this isn't a declaration we recognise" so the wrapper stops.
+   -- Parse one bound of a range constraint: an optionally-signed integer
+   -- literal. (v1 restricts bounds to static literals.)
+   function Parse_Range_Bound return Integer is
+      Neg : Boolean := False;
+      V   : Integer;
+   begin
+      if Tok = TK_MINUS then
+         Neg := True;
+         Next_Token;
+      end if;
+      V := Tok_Int;
+      Next_Token;
+      if Neg then
+         return -V;
+      else
+         return V;
+      end if;
+   end Parse_Range_Bound;
+
    function Parse_Declaration_AST return Integer is
       Var_Name : Tok_Buffer;
       Var_Len  : Integer;
@@ -3167,6 +3236,22 @@ procedure Adacomp is
                Emit_Ln (" };");
                Expect (TK_RPAREN);
             end;
+         elsif Tok = TK_RANGE then
+            -- `type T is range L .. H;` -> an integer type carrying a
+            -- range constraint (no C emission; the type is a plain int).
+            declare
+               Lo : Integer;
+               Hi : Integer;
+            begin
+               Next_Token;
+               Lo := Parse_Range_Bound;
+               Expect (TK_DOTDOT);
+               Hi := Parse_Range_Bound;
+               Sym_Type (Sym_Count) := TY_INTEGER;
+               Sym_Has_Range (Sym_Count) := 1;
+               Sym_Range_Lo (Sym_Count) := Lo;
+               Sym_Range_Hi (Sym_Count) := Hi;
+            end;
          else
             while Tok /= TK_SEMI and Tok /= TK_EOF loop
                Next_Token;
@@ -3174,6 +3259,40 @@ procedure Adacomp is
          end if;
          Expect (TK_SEMI);
          return 0;
+      end if;
+
+      if Tok = TK_SUBTYPE then
+         -- `subtype S is Base range L .. H;` -> a constrained integer
+         -- subtype. Base is consumed (only integer subtypes are checked
+         -- in v1); the bounds are stored for assignment/init checks.
+         declare
+            Lo : Integer;
+            Hi : Integer;
+         begin
+            Next_Token;
+            Add_Sym (SK_TYPE, TY_INTEGER);
+            Next_Token;                  -- subtype name
+            Expect (TK_IS);
+            if Tok = TK_INTEGER then
+               Next_Token;
+            elsif Tok = TK_IDENT then
+               Next_Token;               -- a base subtype name
+            end if;
+            if Tok = TK_RANGE then
+               Next_Token;
+               Lo := Parse_Range_Bound;
+               Expect (TK_DOTDOT);
+               Hi := Parse_Range_Bound;
+               Sym_Has_Range (Sym_Count) := 1;
+               Sym_Range_Lo (Sym_Count) := Lo;
+               Sym_Range_Hi (Sym_Count) := Hi;
+            end if;
+            while Tok /= TK_SEMI and Tok /= TK_EOF loop
+               Next_Token;
+            end loop;
+            Expect (TK_SEMI);
+            return 0;
+         end;
       end if;
 
       if Tok = TK_PACKAGE then
@@ -3718,11 +3837,20 @@ procedure Adacomp is
                   else
                      Add_Sym_Named (Var_Name, Var_Len, SK_VAR, Typ2);
                   end if;
+                  -- A constrained integer subtype carries its range to the var.
+                  if Tidx > 0 and then Sym_Has_Range (Tidx) = 1 then
+                     Sym_Has_Range (Sym_Count) := 1;
+                     Sym_Range_Lo (Sym_Count) := Sym_Range_Lo (Tidx);
+                     Sym_Range_Hi (Sym_Count) := Sym_Range_Hi (Tidx);
+                  end if;
                   N := New_Node (D_VAR_SIMPLE);
                   N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
                   N_Str_Len (N) := Var_Len;
                   N_Int (N) := Typ2;
                   if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
+                  N_Aux1 (N) := Sym_Has_Range (Sym_Count);
+                  N_Aux2 (N) := Sym_Range_Lo (Sym_Count);
+                  N_Right (N) := Sym_Range_Hi (Sym_Count);
                   if Tok = TK_ASSIGN then
                      Next_Token;
                      N_Left (N) := Parse_Expression_AST;
@@ -3732,24 +3860,46 @@ procedure Adacomp is
                end;
             end if;
 
-            -- Generic typed variable (Integer/Character/Boolean keyword)
+            -- Generic typed variable (Integer/Character/Boolean keyword),
+            -- with an optional `range L .. H` constraint on Integer.
             Typ := Parse_Type_Ref;
-            if Is_Const then
-               Add_Sym_Named (Var_Name, Var_Len, SK_CONST, Typ);
-            else
-               Add_Sym_Named (Var_Name, Var_Len, SK_VAR, Typ);
-            end if;
-            N := New_Node (D_VAR_SIMPLE);
-            N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
-            N_Str_Len (N) := Var_Len;
-            N_Int (N) := Typ;
-            if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
-            if Tok = TK_ASSIGN then
-               Next_Token;
-               N_Left (N) := Parse_Expression_AST;
-            end if;
-            Expect (TK_SEMI);
-            return N;
+            declare
+               Rlo   : Integer := 0;
+               Rhi   : Integer := 0;
+               Has_R : Boolean := False;
+            begin
+               if Typ = TY_INTEGER and then Tok = TK_RANGE then
+                  Next_Token;
+                  Rlo := Parse_Range_Bound;
+                  Expect (TK_DOTDOT);
+                  Rhi := Parse_Range_Bound;
+                  Has_R := True;
+               end if;
+               if Is_Const then
+                  Add_Sym_Named (Var_Name, Var_Len, SK_CONST, Typ);
+               else
+                  Add_Sym_Named (Var_Name, Var_Len, SK_VAR, Typ);
+               end if;
+               if Has_R then
+                  Sym_Has_Range (Sym_Count) := 1;
+                  Sym_Range_Lo (Sym_Count) := Rlo;
+                  Sym_Range_Hi (Sym_Count) := Rhi;
+               end if;
+               N := New_Node (D_VAR_SIMPLE);
+               N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
+               N_Str_Len (N) := Var_Len;
+               N_Int (N) := Typ;
+               if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
+               N_Aux1 (N) := Sym_Has_Range (Sym_Count);
+               N_Aux2 (N) := Sym_Range_Lo (Sym_Count);
+               N_Right (N) := Sym_Range_Hi (Sym_Count);
+               if Tok = TK_ASSIGN then
+                  Next_Token;
+                  N_Left (N) := Parse_Expression_AST;
+               end if;
+               Expect (TK_SEMI);
+               return N;
+            end;
          end if;
 
          -- Not a declaration we recognise — signal "stop".
@@ -3762,7 +3912,7 @@ procedure Adacomp is
    procedure Parse_Declarations is
       N : Integer;
    begin
-      while Tok = TK_TYPE or Tok = TK_PROCEDURE
+      while Tok = TK_TYPE or Tok = TK_SUBTYPE or Tok = TK_PROCEDURE
             or Tok = TK_FUNCTION or Tok = TK_IDENT or Tok = TK_PACKAGE
       loop
          N := Parse_Declaration_AST;
@@ -3781,7 +3931,7 @@ procedure Adacomp is
       Prev : Integer := 0;
       D    : Integer;
    begin
-      while Tok = TK_TYPE or Tok = TK_PROCEDURE
+      while Tok = TK_TYPE or Tok = TK_SUBTYPE or Tok = TK_PROCEDURE
             or Tok = TK_FUNCTION or Tok = TK_IDENT or Tok = TK_PACKAGE
       loop
          D := Parse_Declaration_AST;

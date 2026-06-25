@@ -43,7 +43,8 @@ enum {
     TK_TRUE=66, TK_FALSE=67, TK_DECLARE=68, TK_RAISE=69,
     TK_STRING=70, TK_REVERSE=71, TK_TICK=72,
     TK_ACCESS=73, TK_NEW=74, TK_RANGE=75, TK_BOX=76, TK_RECORD=77,
-    TK_PACKAGE=78, TK_CASE=79, TK_ARROW=80, TK_BAR=81, TK_EXCEPTION=82
+    TK_PACKAGE=78, TK_CASE=79, TK_ARROW=80, TK_BAR=81, TK_EXCEPTION=82,
+    TK_SUBTYPE=83
 };
 
 /* Current token */
@@ -71,6 +72,12 @@ static int *sym_arr_hi = NULL;
 static int *sym_arr_el = NULL;
 static int *sym_arr_inner_lo = NULL;
 static int *sym_arr_inner_hi = NULL;
+/* Scalar range constraint (subtypes and `X : Integer range L..H`):
+   sym_has_range=1 means values are checked against [sym_range_lo,
+   sym_range_hi] on assignment/initialization. */
+static int *sym_has_range = NULL;
+static int *sym_range_lo = NULL;
+static int *sym_range_hi = NULL;
 static int *sym_scope = NULL;
 static int sym_cap = 0;
 static int sym_count = 0;
@@ -99,6 +106,9 @@ static void grow_syms(int need) {
     sym_arr_el      = realloc(sym_arr_el, (size_t)new_cap * sizeof(int));
     sym_arr_inner_lo = realloc(sym_arr_inner_lo, (size_t)new_cap * sizeof(int));
     sym_arr_inner_hi = realloc(sym_arr_inner_hi, (size_t)new_cap * sizeof(int));
+    sym_has_range   = realloc(sym_has_range, (size_t)new_cap * sizeof(int));
+    sym_range_lo    = realloc(sym_range_lo, (size_t)new_cap * sizeof(int));
+    sym_range_hi    = realloc(sym_range_hi, (size_t)new_cap * sizeof(int));
     sym_scope       = realloc(sym_scope, (size_t)new_cap * sizeof(int));
     sym_cap = new_cap;
 }
@@ -229,6 +239,7 @@ static int check_keyword(void) {
     if (tok_eq_ci("reverse")) return TK_REVERSE;
     if (tok_eq_ci("return")) return TK_RETURN;
     if (tok_eq_ci("type")) return TK_TYPE;
+    if (tok_eq_ci("subtype")) return TK_SUBTYPE;
     if (tok_eq_ci("array")) return TK_ARRAY;
     if (tok_eq_ci("of")) return TK_OF;
     if (tok_eq_ci("access")) return TK_ACCESS;
@@ -566,6 +577,9 @@ static void add_sym(int kind, int typ) {
     sym_arr_el[sym_count] = 0;
     sym_arr_inner_lo[sym_count] = 0;
     sym_arr_inner_hi[sym_count] = 0;
+    sym_has_range[sym_count] = 0;
+    sym_range_lo[sym_count] = 0;
+    sym_range_hi[sym_count] = 0;
     sym_scope[sym_count] = cur_scope;
     sym_count++;
 }
@@ -584,6 +598,9 @@ static void seed_exception(const char *name, int id) {
     sym_arr_el[sym_count] = 0;
     sym_arr_inner_lo[sym_count] = 0;
     sym_arr_inner_hi[sym_count] = 0;
+    sym_has_range[sym_count] = 0;
+    sym_range_lo[sym_count] = 0;
+    sym_range_hi[sym_count] = 0;
     sym_scope[sym_count] = 0;
     sym_count++;
 }
@@ -1399,7 +1416,14 @@ static void emit_statement_ast(int n) {
         emit_indent();
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit(" = ");
-        emit_expression_ast(n_right[n]);
+        if (n_op[n]) {                   /* range-constrained target */
+            emit("ada_range_check(");
+            emit_expression_ast(n_right[n]);
+            emit(", "); emit_int(n_aux1[n]);
+            emit(", "); emit_int(n_aux2[n]); emit(")");
+        } else {
+            emit_expression_ast(n_right[n]);
+        }
         emit_line(";");
     } else if (kind == S_CALL) {
         emit_indent();
@@ -1794,6 +1818,13 @@ static int parse_statement_ast(void) {
             n = new_node(S_ASSIGN);
             n_str_off[n] = pool_str(saved, saved_len);
             n_str_len[n] = saved_len;
+            /* If the target is a range-constrained variable, resolve its
+               bounds now so the walker can wrap the rhs in a check. */
+            if (sidx >= 0 && sym_has_range[sidx]) {
+                n_op[n] = 1;
+                n_aux1[n] = sym_range_lo[sidx];
+                n_aux2[n] = sym_range_hi[sidx];
+            }
             next_token();
             n_right[n] = parse_expression_ast();
             expect(TK_SEMI);
@@ -2154,7 +2185,17 @@ static void emit_declaration_ast(int n) {
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         if (n_left[n] != 0) {
             emit(" = ");
-            emit_expression_ast(n_left[n]);
+            /* Wrap the initializer in a range check, but only inside a real
+               C function — a main-level local is emitted as a C global,
+               whose initializer must be a constant (no call allowed). */
+            if (n_aux1[n] && indent_level > 0) {
+                emit("ada_range_check(");
+                emit_expression_ast(n_left[n]);
+                emit(", "); emit_int(n_aux2[n]);
+                emit(", "); emit_int(n_right[n]); emit(")");
+            } else {
+                emit_expression_ast(n_left[n]);
+            }
         } else if (n_int[n] == TY_STRING) {
             emit(" = \"\"");
         } else {
@@ -2245,6 +2286,17 @@ static void emit_declaration_ast(int n) {
         }
         emit_line(";");
     }
+}
+
+/* Parse one bound of a range constraint: an optionally-signed integer
+   literal. (v1 restricts bounds to static literals; named-constant and
+   dynamic bounds are deferred.) */
+static int parse_range_bound(void) {
+    int neg = 0;
+    if (tok == TK_MINUS) { neg = 1; next_token(); }
+    int v = tok_int;
+    next_token();
+    return neg ? -v : v;
 }
 
 /* Parse one declaration. Variable declarations become AST nodes; type
@@ -2361,9 +2413,44 @@ static int parse_declaration_ast(void) {
             }
             emit_line(" };");
             expect(TK_RPAREN);
+        } else if (tok == TK_RANGE) {
+            /* `type T is range L .. H;` -> an integer type carrying a
+               range constraint (no C emission; the type is a plain int). */
+            next_token();
+            int lo = parse_range_bound();
+            expect(TK_DOTDOT);
+            int hi = parse_range_bound();
+            sym_type[sym_count-1] = TY_INTEGER;
+            sym_has_range[sym_count-1] = 1;
+            sym_range_lo[sym_count-1] = lo;
+            sym_range_hi[sym_count-1] = hi;
         } else {
             while (tok != TK_SEMI && tok != TK_EOF) next_token();
         }
+        expect(TK_SEMI);
+        return 0;
+    }
+
+    if (tok == TK_SUBTYPE) {
+        /* `subtype S is Base range L .. H;` -> a constrained integer
+           subtype. Base is consumed (only integer subtypes are checked in
+           v1); the bounds are stored for assignment/init range checks. */
+        next_token();
+        add_sym(SK_TYPE, TY_INTEGER);
+        next_token();                   /* subtype name */
+        expect(TK_IS);
+        if (tok == TK_INTEGER) next_token();
+        else if (tok == TK_IDENT) next_token();   /* a base subtype name */
+        if (tok == TK_RANGE) {
+            next_token();
+            int lo = parse_range_bound();
+            expect(TK_DOTDOT);
+            int hi = parse_range_bound();
+            sym_has_range[sym_count-1] = 1;
+            sym_range_lo[sym_count-1] = lo;
+            sym_range_hi[sym_count-1] = hi;
+        }
+        while (tok != TK_SEMI && tok != TK_EOF) next_token();
         expect(TK_SEMI);
         return 0;
     }
@@ -2831,16 +2918,29 @@ static int parse_declaration_ast(void) {
                 int tidx2 = find_sym(first_ident, first_len);
                 int typ2 = TY_INTEGER;
                 if (tidx2 >= 0 && sym_kind[tidx2] == SK_TYPE) typ2 = sym_type[tidx2];
+                /* A constrained integer subtype carries its range to the var. */
+                int hr2 = 0, rlo2 = 0, rhi2 = 0;
+                if (tidx2 >= 0 && sym_has_range[tidx2]) {
+                    hr2 = 1; rlo2 = sym_range_lo[tidx2]; rhi2 = sym_range_hi[tidx2];
+                }
 
                 if (is_const) add_sym(SK_CONST, typ2);
                 else add_sym(SK_VAR, typ2);
                 memcpy(sym_name[sym_count-1], vname, vlen);
                 sym_nlen[sym_count-1] = vlen;
+                if (hr2) {
+                    sym_has_range[sym_count-1] = 1;
+                    sym_range_lo[sym_count-1] = rlo2;
+                    sym_range_hi[sym_count-1] = rhi2;
+                }
                 n = new_node(D_VAR_SIMPLE);
                 n_str_off[n] = pool_str(vname, vlen);
                 n_str_len[n] = vlen;
                 n_int[n] = typ2;
                 n_op[n] = is_const;
+                n_aux1[n] = hr2;
+                n_aux2[n] = rlo2;
+                n_right[n] = rhi2;
                 if (tok == TK_ASSIGN) {
                     next_token();
                     n_left[n] = parse_expression_ast();
@@ -2849,18 +2949,35 @@ static int parse_declaration_ast(void) {
                 return n;
             }
 
-            /* Generic typed variable (Integer / Character / Boolean keyword). */
+            /* Generic typed variable (Integer / Character / Boolean keyword),
+               with an optional `range L .. H` constraint on Integer. */
             {
                 int typ = parse_type_ref();
+                int hr = 0, rlo = 0, rhi = 0;
+                if (typ == TY_INTEGER && tok == TK_RANGE) {
+                    next_token();
+                    rlo = parse_range_bound();
+                    expect(TK_DOTDOT);
+                    rhi = parse_range_bound();
+                    hr = 1;
+                }
                 if (is_const) add_sym(SK_CONST, typ);
                 else add_sym(SK_VAR, typ);
                 memcpy(sym_name[sym_count-1], vname, vlen);
                 sym_nlen[sym_count-1] = vlen;
+                if (hr) {
+                    sym_has_range[sym_count-1] = 1;
+                    sym_range_lo[sym_count-1] = rlo;
+                    sym_range_hi[sym_count-1] = rhi;
+                }
                 n = new_node(D_VAR_SIMPLE);
                 n_str_off[n] = pool_str(vname, vlen);
                 n_str_len[n] = vlen;
                 n_int[n] = typ;
                 n_op[n] = is_const;
+                n_aux1[n] = hr;
+                n_aux2[n] = rlo;
+                n_right[n] = rhi;
                 if (tok == TK_ASSIGN) {
                     next_token();
                     n_left[n] = parse_expression_ast();
@@ -2877,8 +2994,8 @@ static int parse_declaration_ast(void) {
 /* Public wrapper: loop, building one declaration's AST at a time,
    walking it if it's a leaf-decl node, and resetting the pool. */
 static void parse_declarations(void) {
-    while (tok == TK_TYPE || tok == TK_PROCEDURE || tok == TK_FUNCTION
-           || tok == TK_IDENT || tok == TK_PACKAGE) {
+    while (tok == TK_TYPE || tok == TK_SUBTYPE || tok == TK_PROCEDURE
+           || tok == TK_FUNCTION || tok == TK_IDENT || tok == TK_PACKAGE) {
         int n = parse_declaration_ast();
         if (n != 0) emit_declaration_ast(n);
         reset_ast();
@@ -2891,8 +3008,8 @@ static void parse_declarations(void) {
    node) still register their symbol as a side effect. */
 static int parse_var_decl_chain(void) {
     int head = 0, prev = 0;
-    while (tok == TK_TYPE || tok == TK_PROCEDURE || tok == TK_FUNCTION
-           || tok == TK_IDENT || tok == TK_PACKAGE) {
+    while (tok == TK_TYPE || tok == TK_SUBTYPE || tok == TK_PROCEDURE
+           || tok == TK_FUNCTION || tok == TK_IDENT || tok == TK_PACKAGE) {
         int d = parse_declaration_ast();
         if (d != 0) {
             if (head == 0) head = d;

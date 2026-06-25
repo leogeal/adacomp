@@ -72,4 +72,11 @@ static void ada_raise(int id, const char *name) {
     exit(1);
 }
 
+/* Scalar range check for constrained subtypes. Returns the value if it
+   lies in [lo, hi], else raises Constraint_Error (id 1). */
+static int ada_range_check(int v, int lo, int hi) {
+    if (v < lo || v > hi) ada_raise(1, "Constraint_Error");
+    return v;
+}
+
 #endif
