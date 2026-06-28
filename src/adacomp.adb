@@ -1330,6 +1330,7 @@ procedure Adacomp is
    function  Parse_Var_Decl_Chain return Integer;
    procedure Emit_Declaration_Chain (Head : Integer);
    procedure Emit_Expression_AST (N : Integer);
+   procedure Emit_Checked_Index (Idx : Integer; Lo : Integer; Hi : Integer);
    procedure Emit_Statement_AST (N : Integer);
    procedure Emit_Declaration_AST (N : Integer);
 
@@ -1590,8 +1591,11 @@ procedure Adacomp is
             N_Str_Len (N) := Saved_Len;
             if Sym_Idx > 0 then
                N_Op (N) := Sym_Arr_Lo (Sym_Idx);
+               --  Outer high bound (0 = no static bound -> no check).
+               N_Aux2 (N) := Sym_Arr_Hi (Sym_Idx);
             else
                N_Op (N) := 1;
+               N_Aux2 (N) := 0;
             end if;
             N_Right (N) := Parse_Expression_AST;
             Expect (TK_RPAREN);
@@ -1601,6 +1605,7 @@ procedure Adacomp is
                Next_Token;
                N_Kind (N) := A_INDEX2;
                N_Aux1 (N) := Sym_Arr_Inner_Lo (Sym_Idx);
+               N_Int (N) := Sym_Arr_Inner_Hi (Sym_Idx);   -- inner high bound
                N_Arg2 (N) := Parse_Expression_AST;
                Expect (TK_RPAREN);
             end if;
@@ -1804,6 +1809,24 @@ procedure Adacomp is
    -- get wrapped in `(...)` so source-explicit groupings survive and
    -- C-precedence ambiguities are impossible.
 
+   -- Emit one array subscript as C: the Ada index expression,
+   -- bounds-checked against [Lo, Hi] when Hi /= 0 (a statically-known
+   -- upper bound), then the `- Lo` that converts to a 0-based C index.
+   -- Hi = 0 means no static bound (access types, strings, unresolved
+   -- names) -> no check.
+   procedure Emit_Checked_Index (Idx : Integer; Lo : Integer; Hi : Integer) is
+   begin
+      if Hi /= 0 then
+         Emit ("ada_range_check(");
+         Emit_Expression_AST (Idx);
+         Emit (", "); Emit_Int (Lo);
+         Emit (", "); Emit_Int (Hi); Emit (")");
+      else
+         Emit_Expression_AST (Idx);
+      end if;
+      Emit (" - "); Emit_Int (Lo);
+   end Emit_Checked_Index;
+
    procedure Emit_Expression_AST (N : Integer) is
       Kind : Integer;
       C : Character;
@@ -1880,17 +1903,14 @@ procedure Adacomp is
       elsif Kind = A_INDEX then
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit ("[");
-         Emit_Expression_AST (N_Right (N));
-         Emit (" - "); Emit_Int (N_Op (N));   -- resolved outer subtrahend
+         Emit_Checked_Index (N_Right (N), N_Op (N), N_Aux2 (N));
          Emit ("]");
       elsif Kind = A_INDEX2 then
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit ("[");
-         Emit_Expression_AST (N_Right (N));
-         Emit (" - "); Emit_Int (N_Op (N));     -- resolved outer subtrahend
+         Emit_Checked_Index (N_Right (N), N_Op (N), N_Aux2 (N));
          Emit ("][");
-         Emit_Expression_AST (N_Arg2 (N));
-         Emit (" - "); Emit_Int (N_Aux1 (N));   -- resolved inner subtrahend
+         Emit_Checked_Index (N_Arg2 (N), N_Aux1 (N), N_Int (N));
          Emit ("]");
       elsif Kind = A_CALL then
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
@@ -2063,14 +2083,11 @@ procedure Adacomp is
          Emit_Indent;
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit ("[");
-         Emit_Expression_AST (N_Right (N));
-         Emit (" - "); Emit_Int (N_Op (N));    -- resolved outer subtrahend
+         Emit_Checked_Index (N_Right (N), N_Op (N), N_Aux2 (N));
          Emit ("]");
          if N_Arg2 (N) /= 0 then
             Emit ("[");
-            Emit_Expression_AST (N_Arg2 (N));
-            Emit (" - ");
-            Emit_Int (N_Aux1 (N));             -- resolved inner subtrahend
+            Emit_Checked_Index (N_Arg2 (N), N_Aux1 (N), N_Int (N));
             Emit ("]");
          end if;
          Emit (" = ");
@@ -2567,6 +2584,8 @@ procedure Adacomp is
                N_Str_Len (N) := Saved_Len;
                N_Op (N) := Sym_Arr_Lo (Sym_Idx);         -- resolved outer subtrahend
                N_Aux1 (N) := Sym_Arr_Inner_Lo (Sym_Idx); -- resolved inner subtrahend
+               N_Aux2 (N) := Sym_Arr_Hi (Sym_Idx);       -- outer high bound (0 = none)
+               N_Int (N) := Sym_Arr_Inner_Hi (Sym_Idx);  -- inner high bound (0 = none)
                N_Right (N) := Parse_Expression_AST;
                Expect (TK_RPAREN);
                if Tok = TK_LPAREN and then Sym_Arr_Inner_Hi (Sym_Idx) /= 0 then

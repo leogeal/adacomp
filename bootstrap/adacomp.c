@@ -1032,12 +1032,16 @@ static int parse_primary_ast(void) {
             n_str_off[n] = pool_str(saved, saved_len);
             n_str_len[n] = saved_len;
             n_op[n] = (sidx >= 0) ? sym_arr_lo[sidx] : 1;
+            /* Outer high bound (n_aux2): 0 means "no static bound" (access
+               types, strings, unresolved names) and skips the check. */
+            n_aux2[n] = (sidx >= 0) ? sym_arr_hi[sidx] : 0;
             n_right[n] = parse_expression_ast();
             expect(TK_RPAREN);
             if (tok == TK_LPAREN && sidx >= 0 && sym_arr_inner_hi[sidx] != 0) {
                 next_token();
                 n_kind[n] = A_INDEX2;
                 n_aux1[n] = sym_arr_inner_lo[sidx];
+                n_int[n] = sym_arr_inner_hi[sidx];   /* inner high bound */
                 n_arg2[n] = parse_expression_ast();
                 expect(TK_RPAREN);
             }
@@ -1200,6 +1204,22 @@ static void emit_pool_raw(int off, int len) {
         fputc(npool[off + i], out_file);
 }
 
+/* Emit one array subscript as C: the Ada index expression, bounds-checked
+   against [lo, hi] when hi != 0 (a statically-known upper bound), then the
+   `- lo` that converts the Ada index to a 0-based C index. hi == 0 means
+   no static bound (access types, strings, unresolved names) -> no check. */
+static void emit_checked_index(int idx, int lo, int hi) {
+    if (hi != 0) {
+        emit("ada_range_check(");
+        emit_expression_ast(idx);
+        emit(", "); emit_int(lo);
+        emit(", "); emit_int(hi); emit(")");
+    } else {
+        emit_expression_ast(idx);
+    }
+    emit(" - "); emit_int(lo);
+}
+
 static void emit_expression_ast(int n) {
     if (n == 0) return;
     int kind = n_kind[n];
@@ -1256,17 +1276,14 @@ static void emit_expression_ast(int n) {
     } else if (kind == A_INDEX) {
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit("[");
-        emit_expression_ast(n_right[n]);
-        emit(" - "); emit_int(n_op[n]);   /* resolved outer subtrahend */
+        emit_checked_index(n_right[n], n_op[n], n_aux2[n]);
         emit("]");
     } else if (kind == A_INDEX2) {
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit("[");
-        emit_expression_ast(n_right[n]);
-        emit(" - "); emit_int(n_op[n]);    /* resolved outer subtrahend */
+        emit_checked_index(n_right[n], n_op[n], n_aux2[n]);
         emit("][");
-        emit_expression_ast(n_arg2[n]);
-        emit(" - "); emit_int(n_aux1[n]);  /* resolved inner subtrahend */
+        emit_checked_index(n_arg2[n], n_aux1[n], n_int[n]);
         emit("]");
     } else if (kind == A_CALL) {
         emit_pool_lower(n_str_off[n], n_str_len[n]);
@@ -1446,13 +1463,11 @@ static void emit_statement_ast(int n) {
         emit_indent();
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit("[");
-        emit_expression_ast(n_right[n]);
-        emit(" - "); emit_int(n_op[n]);    /* resolved outer subtrahend */
+        emit_checked_index(n_right[n], n_op[n], n_aux2[n]);
         emit("]");
         if (n_arg2[n] != 0) {
             emit("[");
-            emit_expression_ast(n_arg2[n]);
-            emit(" - "); emit_int(n_aux1[n]);  /* resolved inner subtrahend */
+            emit_checked_index(n_arg2[n], n_aux1[n], n_int[n]);
             emit("]");
         }
         emit(" = ");
@@ -1858,6 +1873,8 @@ static int parse_statement_ast(void) {
                 n_str_len[n] = saved_len;
                 n_op[n] = sym_arr_lo[sidx];          /* resolved outer subtrahend */
                 n_aux1[n] = sym_arr_inner_lo[sidx];  /* resolved inner subtrahend */
+                n_aux2[n] = sym_arr_hi[sidx];        /* outer high bound (0 = none) */
+                n_int[n] = sym_arr_inner_hi[sidx];   /* inner high bound (0 = none) */
                 n_right[n] = parse_expression_ast();
                 expect(TK_RPAREN);
                 if (tok == TK_LPAREN && sym_arr_inner_hi[sidx] != 0) {

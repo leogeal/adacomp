@@ -484,11 +484,31 @@ Started.
   of range / z out of range / 10. Stage1 byte-identical to the
   bootstrap; verify passes; 24/24 fixtures under both compilers.
   Deferred: dynamic / named-constant bounds (bounds must be static
-  integer literals); range checks on array indexing, parameter passing,
-  and subtype conversions; ranged subtypes of enum / character types;
-  `Natural` / `Positive` implicit constraints; `'First` / `'Last` /
-  `'Range` on subtypes; initializer checks on main-level locals (emitted
-  as C globals, so the check is skipped there).
+  integer literals); range checks on parameter passing and subtype
+  conversions; ranged subtypes of enum / character types; `Natural` /
+  `Positive` implicit constraints; `'First` / `'Last` / `'Range` on
+  subtypes; initializer checks on main-level locals (emitted as C
+  globals, so the check is skipped there).
+- [x] **Array index bounds checks (v1).** Indexing a fixed-size array —
+  on read (`A (I)`), 2D read (`M (I)(J)`), and write (`A (I) := ...`) —
+  now emits `ada_range_check(idx, lo, hi)` against the array's
+  statically-known bounds before the `- lo` that forms the 0-based C
+  index, so an out-of-bounds subscript raises Constraint_Error instead
+  of corrupting memory. Bounds (high stored in N_Aux2 / inner high in
+  N_Int) are resolved onto the index/assign node at build time, reusing
+  the same `ada_range_check` helper and the existing subtrahend
+  machinery via a shared `emit_checked_index`. Arrays with no static
+  upper bound (access-type/dynamic buffers, strings, unresolved names —
+  all carrying hi = 0) are left unchecked, as are arrays whose declared
+  high bound is exactly 0. Both compilers; fixture `array_bounds.adb`
+  (fill 1..5, read back, then a write at 6 and a read at 0 each caught
+  by a handler) -> 1 / 4 / 9 / 16 / 25 / write out of bounds / read out
+  of bounds / 9 / 0. Notably the self-host now bounds-checks its own
+  fixed arrays (`Tok_Buffer`, scope stack, ...) and still self-compiles
+  byte-identically: stage1 == stage2, 25/25 fixtures under both
+  compilers. Deferred: comma-form 2D array *types* (`array (1..N,
+  1..M)`, whose inner bound isn't tracked), and bounds checks on
+  slices.
 
 ### Phases 3–7
 
