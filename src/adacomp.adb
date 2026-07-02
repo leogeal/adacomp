@@ -927,6 +927,13 @@ procedure Adacomp is
       end loop;
    end Emit_Name_Pool_Lower;
 
+   procedure Emit_Name_Pool_Upper (Off : Integer; Len : Integer) is
+   begin
+      for I in 1 .. Len loop
+         Emit_Ch (To_Upper (Name_Pool (Off + I - 1)));
+      end loop;
+   end Emit_Name_Pool_Upper;
+
    -- A subprogram's emitted C name: <pkg>_<name> inside a package, else
    -- just <name>. Cur_Pkg is the package symbol index + 1 (0 = none).
    procedure Emit_Sub_Name (Buf : Tok_Buffer; Len : Integer) is
@@ -1528,17 +1535,55 @@ procedure Adacomp is
          Next_Token;
 
          if Tok = TK_TICK then
-            -- Variable-prefix attribute: S'Length, S'First, S'Last
+            -- Attribute: S'Length / S'First / S'Last on a variable, or an
+            -- enum-type attribute T'First / T'Last / T'Pos (X) / T'Val (N)
+            -- / T'Image (X).
             Next_Token;
             declare
                Attr : Tok_Buffer;
                Attr_Len : Integer;
+               Is_Enum_Type : Boolean;
             begin
                Attr_Len := Tok_Len;
                for I in 1 .. Tok_Len loop
                   Attr (I) := Tok_Val (I);
                end loop;
                Next_Token;
+               Is_Enum_Type := Sym_Idx > 0
+                  and then Sym_Kind (Sym_Idx) = SK_TYPE
+                  and then Sym_Type (Sym_Idx) = TY_ENUM;
+               if Is_Enum_Type then
+                  if Name_Eq (Attr, Attr_Len, "First") then
+                     N := New_Node (A_INT_LIT);
+                     N_Int (N) := Sym_Range_Lo (Sym_Idx);
+                     return N;
+                  elsif Name_Eq (Attr, Attr_Len, "Last") then
+                     N := New_Node (A_INT_LIT);
+                     N_Int (N) := Sym_Range_Hi (Sym_Idx);
+                     return N;
+                  elsif Name_Eq (Attr, Attr_Len, "Pos")
+                     or else Name_Eq (Attr, Attr_Len, "Val")
+                  then
+                     -- Pos and Val are identities for an int-backed enum;
+                     -- return the argument unchanged. A bad Val is caught
+                     -- by the target's range check on assignment.
+                     Expect (TK_LPAREN);
+                     N := Parse_Expression_AST;
+                     Expect (TK_RPAREN);
+                     return N;
+                  elsif Name_Eq (Attr, Attr_Len, "Image") then
+                     N := New_Node (A_ATTR_TYPE);
+                     N_Op (N) := ATTR_IMAGE;
+                     N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+                     N_Str_Len (N) := Saved_Len;
+                     Expect (TK_LPAREN);
+                     N_Left (N) := Parse_Expression_AST;
+                     Expect (TK_RPAREN);
+                     return N;
+                  else
+                     Error ("unsupported enum attribute");
+                  end if;
+               end if;
                N := New_Node (A_ATTR_VAR);
                N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
                N_Str_Len (N) := Saved_Len;
@@ -1926,9 +1971,16 @@ procedure Adacomp is
          Emit (")");
       elsif Kind = A_ATTR_TYPE then
          if N_Op (N) = ATTR_IMAGE then
-            Emit ("int_to_str(");
-            Emit_Expression_AST (N_Left (N));
-            Emit (")");
+            if N_Str_Len (N) /= 0 then         -- enum: <type>_image(v)
+               Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+               Emit ("_image(");
+               Emit_Expression_AST (N_Left (N));
+               Emit (")");
+            else                               -- Integer'Image
+               Emit ("int_to_str(");
+               Emit_Expression_AST (N_Left (N));
+               Emit (")");
+            end if;
          elsif N_Op (N) = ATTR_POS then
             Emit ("((int)(");
             Emit_Expression_AST (N_Left (N));
@@ -2494,9 +2546,35 @@ procedure Adacomp is
             N_Op (N) := 1;
             Next_Token;
          end if;
-         N_Left (N) := Parse_Expression_AST;
-         Expect (TK_DOTDOT);
-         N_Right (N) := Parse_Expression_AST;
+         -- Enum iteration: `for X in T ['Range] loop` over an enum type T
+         -- becomes a numeric loop across the type's position range.
+         declare
+            Eidx : Integer := -1;
+            Lo_N : Integer;
+            Hi_N : Integer;
+         begin
+            if Tok = TK_IDENT then
+               Eidx := Find_Sym (Tok_Val, Tok_Len);
+            end if;
+            if Eidx > 0 and then Sym_Kind (Eidx) = SK_TYPE
+               and then Sym_Type (Eidx) = TY_ENUM
+            then
+               Next_Token;                       -- consume type name
+               if Tok = TK_TICK then
+                  Next_Token; Next_Token;        -- 'Range
+               end if;
+               Lo_N := New_Node (A_INT_LIT);
+               N_Int (Lo_N) := Sym_Range_Lo (Eidx);
+               Hi_N := New_Node (A_INT_LIT);
+               N_Int (Hi_N) := Sym_Range_Hi (Eidx);
+               N_Left (N) := Lo_N;
+               N_Right (N) := Hi_N;
+            else
+               N_Left (N) := Parse_Expression_AST;
+               Expect (TK_DOTDOT);
+               N_Right (N) := Parse_Expression_AST;
+            end if;
+         end;
          Expect (TK_LOOP);
          N_First (N) := Parse_Statement_Chain;
          Expect (TK_END); Expect (TK_LOOP); Expect (TK_SEMI);
@@ -3239,9 +3317,12 @@ procedure Adacomp is
             -- constants are the lowercased literals (a=0, b=1, ...). Each
             -- literal is registered as a constant; the type is an int.
             declare
-               First : Boolean := True;
+               First     : Boolean := True;
+               Type_Idx  : Integer := Sym_Count;
+               First_Lit : Integer := Sym_Count + 1;
+               Nlits     : Integer;
             begin
-               Sym_Type (Sym_Count) := TY_ENUM;
+               Sym_Type (Type_Idx) := TY_ENUM;
                Emit ("enum { ");
                Next_Token;   -- consume '('
                while Tok /= TK_RPAREN and Tok /= TK_EOF loop
@@ -3254,6 +3335,31 @@ procedure Adacomp is
                end loop;
                Emit_Ln (" };");
                Expect (TK_RPAREN);
+               Nlits := Sym_Count - Type_Idx;
+               -- The type carries its position range [0, Nlits-1] so
+               -- 'First / 'Last, enum iteration, and assignment checks work.
+               Sym_Has_Range (Type_Idx) := 1;
+               Sym_Range_Lo (Type_Idx) := 0;
+               Sym_Range_Hi (Type_Idx) := Nlits - 1;
+               -- T'Image support: <type>_image(v) returning the uppercased
+               -- literal name. Only emit at file scope (a nested C function
+               -- would be illegal; proc-local enum 'Image is deferred).
+               if Indent_Level = 0 then
+                  Emit ("static const char *");
+                  Emit_Name_Pool_Lower (Sym_Name_Off (Type_Idx),
+                                        Sym_Name_Len (Type_Idx));
+                  Emit_Ln ("_image(int v) {");
+                  Emit_Ln ("    switch (v) {");
+                  for I in 0 .. Nlits - 1 loop
+                     Emit ("    case "); Emit_Int (I); Emit (": return """);
+                     Emit_Name_Pool_Upper (Sym_Name_Off (First_Lit + I),
+                                           Sym_Name_Len (First_Lit + I));
+                     Emit_Ln (""";");
+                  end loop;
+                  Emit_Ln ("    default: return ""?"";");
+                  Emit_Ln ("    }");
+                  Emit_Ln ("}");
+               end if;
             end;
          elsif Tok = TK_RANGE then
             -- `type T is range L .. H;` -> an integer type carrying a

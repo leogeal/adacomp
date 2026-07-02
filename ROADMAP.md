@@ -431,8 +431,8 @@ Started.
   their lowercased C name, so assignment and comparison just work. Both
   compilers; fixture `enums.adb` (Color/Day, if-comparisons) -> green/
   friday/2; self-hosted stage1 byte-identical to the bootstrap; verify
-  passes. Deferred: `'Image`/`'Pos`/`'Val`/`'First`/`'Last` on enums,
-  `for X in T loop`, overloaded literals across types.
+  passes. Deferred: overloaded literals across types (see enum
+  attributes / iteration below for `'Image` etc.).
 - [x] **Case statements (v1).** `case E is when C1 | C2 => ... when
   others => ... end case;` -> a C `switch` with each arm in a block and
   an explicit `break;` (Ada has no fall-through), `when others` ->
@@ -509,6 +509,26 @@ Started.
   compilers. Deferred: comma-form 2D array *types* (`array (1..N,
   1..M)`, whose inner bound isn't tracked), and bounds checks on
   slices.
+- [x] **Enum attributes + iteration (v1).** `T'First` / `T'Last` /
+  `T'Pos (X)` / `T'Val (N)` / `T'Image (X)` on enumeration types, and
+  `for X in T loop` / `for X in reverse T loop` (also `T'Range`). An
+  enum type now records its position range [0, n-1] by reusing the
+  subtype machinery (sym_has_range / lo / hi), so `'First` / `'Last`
+  resolve to integer literals, iteration lowers to the existing numeric
+  for-loop, and — as a bonus — enum *variables* inherit the range and
+  get Constraint_Error checks on assignment (so a bad `T'Val` is
+  caught). Since the C representation is `int`, `'Pos` and `'Val` are
+  identities (the argument passes through unchanged). `'Image` emits a
+  per-type `static const char *<type>_image(int v)` switch returning the
+  upper-cased literal name, generated at the enum's definition (file
+  scope only — a nested C function would be illegal). Both compilers;
+  fixture `enum_attrs.adb` (First/Last, forward + reverse iteration with
+  Image, Pos, Val) -> 0 / 2 / RED / GREEN / BLUE / 1 / BLUE / BLUE /
+  GREEN / RED. Stage1 byte-identical to the bootstrap; verify passes;
+  26/26 fixtures under both compilers. Deferred: `'Image` on a
+  proc-local enum type (would need a hoisted or nested function),
+  `'Succ` / `'Pred`, `'Value` (string -> enum), and range-checking
+  `'Val` itself (only the assignment target is checked).
 
 ### Phases 3–7
 

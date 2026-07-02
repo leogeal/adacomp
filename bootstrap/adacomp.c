@@ -984,13 +984,48 @@ static int parse_primary_ast(void) {
         int sidx = find_sym(tok_val, tok_len);
         next_token();
 
-        /* Variable-prefix attribute: S'Length, S'First, S'Last */
+        /* Attribute: S'Length / S'First / S'Last on a variable, or an
+           enum-type attribute T'First / T'Last / T'Pos (X) / T'Val (N) /
+           T'Image (X). */
         if (tok == TK_TICK) {
             next_token();
             char attr[MAX_NAME];
             int attr_len = tok_len;
             memcpy(attr, tok_val, tok_len);
             next_token();
+            int is_enum_type = (sidx >= 0 && sym_kind[sidx] == SK_TYPE
+                                && sym_type[sidx] == TY_ENUM);
+            if (is_enum_type) {
+                if (attr_len == 5 && strncasecmp(attr, "First", 5) == 0) {
+                    n = new_node(A_INT_LIT); n_int[n] = sym_range_lo[sidx];
+                    return n;
+                }
+                if (attr_len == 4 && strncasecmp(attr, "Last", 4) == 0) {
+                    n = new_node(A_INT_LIT); n_int[n] = sym_range_hi[sidx];
+                    return n;
+                }
+                if ((attr_len == 3 && strncasecmp(attr, "Pos", 3) == 0)
+                    || (attr_len == 3 && strncasecmp(attr, "Val", 3) == 0)) {
+                    /* For an int-backed enum, Pos and Val are identities;
+                       return the argument expression unchanged. A bad Val
+                       is caught by the target's range check on assignment. */
+                    expect(TK_LPAREN);
+                    n = parse_expression_ast();
+                    expect(TK_RPAREN);
+                    return n;
+                }
+                if (attr_len == 5 && strncasecmp(attr, "Image", 5) == 0) {
+                    n = new_node(A_ATTR_TYPE);
+                    n_op[n] = ATTR_IMAGE;
+                    n_str_off[n] = pool_str(saved, saved_len);  /* enum type name */
+                    n_str_len[n] = saved_len;
+                    expect(TK_LPAREN);
+                    n_left[n] = parse_expression_ast();
+                    expect(TK_RPAREN);
+                    return n;
+                }
+                error("unsupported enum attribute");
+            }
             n = new_node(A_ATTR_VAR);
             n_str_off[n] = pool_str(saved, saved_len);
             n_str_len[n] = saved_len;
@@ -1299,9 +1334,16 @@ static void emit_expression_ast(int n) {
         emit(")");
     } else if (kind == A_ATTR_TYPE) {
         if (n_op[n] == ATTR_IMAGE) {
-            emit("int_to_str(");
-            emit_expression_ast(n_left[n]);
-            emit(")");
+            if (n_str_len[n] != 0) {            /* enum: <type>_image(v) */
+                emit_pool_lower(n_str_off[n], n_str_len[n]);
+                emit("_image(");
+                emit_expression_ast(n_left[n]);
+                emit(")");
+            } else {                            /* Integer'Image */
+                emit("int_to_str(");
+                emit_expression_ast(n_left[n]);
+                emit(")");
+            }
         } else if (n_op[n] == ATTR_POS) {
             emit("((int)(");
             emit_expression_ast(n_left[n]);
@@ -1792,9 +1834,19 @@ static int parse_statement_ast(void) {
         next_token();
         expect(TK_IN);
         if (tok == TK_REVERSE) { n_op[n] = 1; next_token(); }
-        n_left[n] = parse_expression_ast();
-        expect(TK_DOTDOT);
-        n_right[n] = parse_expression_ast();
+        /* Enum iteration: `for X in T [‘Range] loop` over an enum type T
+           becomes a numeric loop across the type's position range. */
+        int eidx = (tok == TK_IDENT) ? find_sym(tok_val, tok_len) : -1;
+        if (eidx >= 0 && sym_kind[eidx] == SK_TYPE && sym_type[eidx] == TY_ENUM) {
+            next_token();                       /* consume type name */
+            if (tok == TK_TICK) { next_token(); next_token(); }  /* 'Range */
+            n_left[n] = new_node(A_INT_LIT);  n_int[n_left[n]]  = sym_range_lo[eidx];
+            n_right[n] = new_node(A_INT_LIT); n_int[n_right[n]] = sym_range_hi[eidx];
+        } else {
+            n_left[n] = parse_expression_ast();
+            expect(TK_DOTDOT);
+            n_right[n] = parse_expression_ast();
+        }
         expect(TK_LOOP);
         n_first[n] = parse_statement_chain();
         expect(TK_END); expect(TK_LOOP); expect(TK_SEMI);
@@ -2416,10 +2468,12 @@ static int parse_declaration_ast(void) {
                constants are the lowercased literals (a=0, b=1, ...).
                Each literal is registered as a constant so its use emits
                the matching C name; the type itself is an int. */
-            sym_type[sym_count-1] = TY_ENUM;
+            int type_idx = sym_count - 1;
+            sym_type[type_idx] = TY_ENUM;
             emit("enum { ");
             next_token();   /* consume '(' */
             int first = 1;
+            int first_lit = sym_count;
             while (tok != TK_RPAREN && tok != TK_EOF) {
                 if (!first) emit(", ");
                 first = 0;
@@ -2430,6 +2484,31 @@ static int parse_declaration_ast(void) {
             }
             emit_line(" };");
             expect(TK_RPAREN);
+            int nlits = sym_count - first_lit;
+            /* The type carries its position range [0, nlits-1] so 'First /
+               'Last, enum iteration, and assignment checks all work. */
+            sym_has_range[type_idx] = 1;
+            sym_range_lo[type_idx] = 0;
+            sym_range_hi[type_idx] = nlits - 1;
+            /* T'Image support: a <type>_image(v) that returns the
+               uppercased literal name. Only emit at file scope — a nested
+               C function would be illegal (proc-local enum 'Image is
+               deferred). The function is static, so if unused it is fine
+               under -Wno-unused-function. */
+            if (indent_level == 0) {
+                emit("static const char *");
+                emit_str_lower(sym_name[type_idx], sym_nlen[type_idx]);
+                emit_line("_image(int v) {");
+                emit_line("    switch (v) {");
+                for (int i = 0; i < nlits; i++) {
+                    emit("    case "); emit_int(i); emit(": return \"");
+                    emit_str_upper(sym_name[first_lit + i], sym_nlen[first_lit + i]);
+                    emit_line("\";");
+                }
+                emit_line("    default: return \"?\";");
+                emit_line("    }");
+                emit_line("}");
+            }
         } else if (tok == TK_RANGE) {
             /* `type T is range L .. H;` -> an integer type carrying a
                range constraint (no C emission; the type is a plain int). */
