@@ -471,6 +471,21 @@ Started.
   (`P.all.Field` — use `P.Field`), general access (`'Access` /
   `'Unchecked_Access`), and dereference null-checks (a null `P.Field`
   is a C segfault, not Constraint_Error).
+- [x] **use-clauses (v1: Ada.Text_IO).** `use Ada.Text_IO;` in the
+  context clause makes the statement-level Text_IO builtins (Put_Line,
+  Put, New_Line, Get_Line, Get, Open, Close, Create) visible without
+  the package prefix; bare and dotted forms coexist, and a
+  user-declared subprogram with the same name still wins (the bare
+  path only fires for unresolved identifiers). Implemented by
+  extracting the dotted builtin dispatch into a shared
+  `build_pkg_stmt` used by both paths — dotted output is unchanged.
+  Both compilers; fixture `use_textio.adb` (bare Put_Line / Put with
+  int and char args / New_Line alongside a dotted call) -> hello /
+  n =7 / x / dotted. Stage1 byte-identical to the bootstrap; verify
+  passes; 28/28 fixtures under both compilers. Deferred: `use` of user
+  packages (bare calls into a with'ed package), `use` in declarative
+  parts (context clause only), expression-side builtins via use, and
+  `use type`.
 - [x] **Exceptions (v1).** `Name : exception;` declarations, `raise E`,
   bare `raise;` (re-raise), and `begin ... exception when E1 | E2 => ...
   when others => ... end` handlers on block statements, subprogram

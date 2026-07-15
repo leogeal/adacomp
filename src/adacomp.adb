@@ -180,6 +180,10 @@ procedure Adacomp is
    With_NLen  : array (1 .. 32) of Integer;
    With_Count : Integer := 0;
 
+   -- Set by `use Ada.Text_IO;` in the context clause: bare Put_Line /
+   -- Put / New_Line / ... statements then resolve to the Text_IO builtins.
+   Use_Text_IO : Boolean := False;
+
    -- Output
    Out_File : Ada.Text_IO.File_Type;
 
@@ -2546,6 +2550,148 @@ procedure Adacomp is
       end if;
    end Emit_Statement_AST;
 
+   -- Build an S_PKG statement node for a Text_IO-style builtin call. The
+   -- caller has consumed the subprogram name; Sub is that name and Saved
+   -- the original prefix (equal to Sub for a bare call made visible by
+   -- `use Ada.Text_IO`). Positioned at '(' or ';'; leaves the trailing
+   -- ';' for the caller. Unknown names become PKG_GENERIC (a dotted
+   -- user-package call, mangled <pkg>_<sub>).
+   function Build_Pkg_Stmt (Saved : Tok_Buffer; Saved_Len : Integer;
+                            Sub : Tok_Buffer; Sub_Len : Integer)
+      return Integer
+   is
+      N : Integer;
+   begin
+      N := New_Node (S_PKG);
+      if Name_Eq (Sub, Sub_Len, "Put_Line") then
+         N_Op (N) := PKG_PUT_LINE;
+         Expect (TK_LPAREN);
+         if Has_Arg_Separator_Ahead then
+            N_Left (N) := Parse_Expression_AST;
+            Expect (TK_COMMA);
+            N_Right (N) := Parse_Expression_AST;
+         else
+            N_Left (N) := Parse_Expression_AST;
+         end if;
+         Expect (TK_RPAREN);
+      elsif Name_Eq (Sub, Sub_Len, "Put") then
+         N_Op (N) := PKG_PUT;
+         Expect (TK_LPAREN);
+         if Has_Arg_Separator_Ahead then
+            if Second_Arg_Is_Char then
+               N_Aux1 (N) := 1;
+            else
+               N_Aux1 (N) := 0;
+            end if;
+            N_Left (N) := Parse_Expression_AST;
+            Expect (TK_COMMA);
+            N_Right (N) := Parse_Expression_AST;
+         else
+            if First_Arg_Is_Char then
+               N_Aux1 (N) := 1;
+            else
+               N_Aux1 (N) := 0;
+            end if;
+            N_Left (N) := Parse_Expression_AST;
+         end if;
+         Expect (TK_RPAREN);
+      elsif Name_Eq (Sub, Sub_Len, "New_Line") then
+         N_Op (N) := PKG_NEW_LINE;
+         if Tok = TK_LPAREN then
+            Expect (TK_LPAREN);
+            if Tok /= TK_RPAREN then
+               N_Left (N) := Parse_Expression_AST;
+            end if;
+            Expect (TK_RPAREN);
+         end if;
+      elsif Name_Eq (Sub, Sub_Len, "Open") then
+         N_Op (N) := PKG_OPEN;
+         Expect (TK_LPAREN);
+         N_Left (N) := Parse_Expression_AST;   -- file var
+         Expect (TK_COMMA);
+         while Tok /= TK_COMMA and Tok /= TK_RPAREN and Tok /= TK_EOF loop
+            if Tok_Eq_CI ("Out_File") then N_Int (N) := 1; end if;
+            Next_Token;
+            if Tok = TK_DOT then Next_Token; Next_Token; end if;
+         end loop;
+         if Tok = TK_COMMA then Next_Token; end if;
+         N_Right (N) := Parse_Expression_AST;   -- name
+         Expect (TK_RPAREN);
+      elsif Name_Eq (Sub, Sub_Len, "Create") then
+         N_Op (N) := PKG_CREATE;
+         Expect (TK_LPAREN);
+         N_Left (N) := Parse_Expression_AST;
+         Expect (TK_COMMA);
+         while Tok /= TK_COMMA and Tok /= TK_RPAREN and Tok /= TK_EOF loop
+            Next_Token;
+            if Tok = TK_DOT then Next_Token; Next_Token; end if;
+         end loop;
+         if Tok = TK_COMMA then Next_Token; end if;
+         N_Right (N) := Parse_Expression_AST;
+         Expect (TK_RPAREN);
+      elsif Name_Eq (Sub, Sub_Len, "Close") then
+         N_Op (N) := PKG_CLOSE;
+         Expect (TK_LPAREN);
+         N_Left (N) := Parse_Expression_AST;
+         Expect (TK_RPAREN);
+      elsif Name_Eq (Sub, Sub_Len, "Get_Line") then
+         N_Op (N) := PKG_GET_LINE;
+         Expect (TK_LPAREN);
+         N_Left (N) := Parse_Expression_AST;
+         Expect (TK_RPAREN);
+      elsif Name_Eq (Sub, Sub_Len, "Get") then
+         N_Op (N) := PKG_GET;
+         Expect (TK_LPAREN);
+         N_Left (N) := Parse_Expression_AST;   -- file
+         Expect (TK_COMMA);
+         N_Right (N) := Parse_Expression_AST;   -- char var
+         Expect (TK_RPAREN);
+      else
+         N_Op (N) := PKG_GENERIC;
+         N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+         N_Str_Len (N) := Saved_Len;
+         N_Arg2 (N) := Pool_Str (Sub, Sub_Len);
+         N_Int (N) := Sub_Len;
+         if Tok = TK_LPAREN then
+            N_Aux1 (N) := 1;
+            Next_Token;
+            if Tok /= TK_RPAREN then
+               declare
+                  First : Integer;
+                  Prev : Integer;
+                  Arg : Integer;
+               begin
+                  First := Parse_Expression_AST;
+                  N_First (N) := First;
+                  Prev := First;
+                  while Tok = TK_COMMA loop
+                     Next_Token;
+                     Arg := Parse_Expression_AST;
+                     N_Next (Prev) := Arg;
+                     Prev := Arg;
+                  end loop;
+               end;
+            end if;
+            Expect (TK_RPAREN);
+         end if;
+      end if;
+      return N;
+   end Build_Pkg_Stmt;
+
+   -- The statement-level Text_IO builtins that `use Ada.Text_IO;` makes
+   -- visible without a prefix.
+   function Is_Textio_Sub (S : Tok_Buffer; Len : Integer) return Boolean is
+   begin
+      return Name_Eq (S, Len, "Put_Line")
+         or else Name_Eq (S, Len, "Put")
+         or else Name_Eq (S, Len, "New_Line")
+         or else Name_Eq (S, Len, "Get_Line")
+         or else Name_Eq (S, Len, "Get")
+         or else Name_Eq (S, Len, "Open")
+         or else Name_Eq (S, Len, "Close")
+         or else Name_Eq (S, Len, "Create");
+   end Is_Textio_Sub;
+
    function Parse_Statement_AST return Integer is
       N : Integer;
       Saved : Tok_Buffer;
@@ -2795,6 +2941,19 @@ procedure Adacomp is
             return N;
          end if;
 
+         -- Bare Text_IO builtin made visible by `use Ada.Text_IO;`:
+         -- Put_Line ("x"); / New_Line; / ... without the package prefix.
+         -- Only for names that don't resolve to a user symbol, so a
+         -- user-defined Put_Line still wins.
+         if Use_Text_IO and then Sym_Idx <= 0
+            and then (Tok = TK_LPAREN or Tok = TK_SEMI)
+            and then Is_Textio_Sub (Saved, Saved_Len)
+         then
+            N := Build_Pkg_Stmt (Saved, Saved_Len, Saved, Saved_Len);
+            Expect (TK_SEMI);
+            return N;
+         end if;
+
          if Tok = TK_LPAREN then
             Next_Token;
             if Sym_Idx > 0 and then Sym_Kind (Sym_Idx) = SK_PROC
@@ -2940,119 +3099,7 @@ procedure Adacomp is
                end loop;
                Next_Token;
             end loop;
-            N := New_Node (S_PKG);
-            if Name_Eq (Sub, Sub_Len, "Put_Line") then
-               N_Op (N) := PKG_PUT_LINE;
-               Expect (TK_LPAREN);
-               if Has_Arg_Separator_Ahead then
-                  N_Left (N) := Parse_Expression_AST;
-                  Expect (TK_COMMA);
-                  N_Right (N) := Parse_Expression_AST;
-               else
-                  N_Left (N) := Parse_Expression_AST;
-               end if;
-               Expect (TK_RPAREN);
-            elsif Name_Eq (Sub, Sub_Len, "Put") then
-               N_Op (N) := PKG_PUT;
-               Expect (TK_LPAREN);
-               if Has_Arg_Separator_Ahead then
-                  if Second_Arg_Is_Char then
-                     N_Aux1 (N) := 1;
-                  else
-                     N_Aux1 (N) := 0;
-                  end if;
-                  N_Left (N) := Parse_Expression_AST;
-                  Expect (TK_COMMA);
-                  N_Right (N) := Parse_Expression_AST;
-               else
-                  if First_Arg_Is_Char then
-                     N_Aux1 (N) := 1;
-                  else
-                     N_Aux1 (N) := 0;
-                  end if;
-                  N_Left (N) := Parse_Expression_AST;
-               end if;
-               Expect (TK_RPAREN);
-            elsif Name_Eq (Sub, Sub_Len, "New_Line") then
-               N_Op (N) := PKG_NEW_LINE;
-               if Tok = TK_LPAREN then
-                  Expect (TK_LPAREN);
-                  if Tok /= TK_RPAREN then
-                     N_Left (N) := Parse_Expression_AST;
-                  end if;
-                  Expect (TK_RPAREN);
-               end if;
-            elsif Name_Eq (Sub, Sub_Len, "Open") then
-               N_Op (N) := PKG_OPEN;
-               Expect (TK_LPAREN);
-               N_Left (N) := Parse_Expression_AST;   -- file var
-               Expect (TK_COMMA);
-               while Tok /= TK_COMMA and Tok /= TK_RPAREN and Tok /= TK_EOF loop
-                  if Tok_Eq_CI ("Out_File") then N_Int (N) := 1; end if;
-                  Next_Token;
-                  if Tok = TK_DOT then Next_Token; Next_Token; end if;
-               end loop;
-               if Tok = TK_COMMA then Next_Token; end if;
-               N_Right (N) := Parse_Expression_AST;   -- name
-               Expect (TK_RPAREN);
-            elsif Name_Eq (Sub, Sub_Len, "Create") then
-               N_Op (N) := PKG_CREATE;
-               Expect (TK_LPAREN);
-               N_Left (N) := Parse_Expression_AST;
-               Expect (TK_COMMA);
-               while Tok /= TK_COMMA and Tok /= TK_RPAREN and Tok /= TK_EOF loop
-                  Next_Token;
-                  if Tok = TK_DOT then Next_Token; Next_Token; end if;
-               end loop;
-               if Tok = TK_COMMA then Next_Token; end if;
-               N_Right (N) := Parse_Expression_AST;
-               Expect (TK_RPAREN);
-            elsif Name_Eq (Sub, Sub_Len, "Close") then
-               N_Op (N) := PKG_CLOSE;
-               Expect (TK_LPAREN);
-               N_Left (N) := Parse_Expression_AST;
-               Expect (TK_RPAREN);
-            elsif Name_Eq (Sub, Sub_Len, "Get_Line") then
-               N_Op (N) := PKG_GET_LINE;
-               Expect (TK_LPAREN);
-               N_Left (N) := Parse_Expression_AST;
-               Expect (TK_RPAREN);
-            elsif Name_Eq (Sub, Sub_Len, "Get") then
-               N_Op (N) := PKG_GET;
-               Expect (TK_LPAREN);
-               N_Left (N) := Parse_Expression_AST;   -- file
-               Expect (TK_COMMA);
-               N_Right (N) := Parse_Expression_AST;   -- char var
-               Expect (TK_RPAREN);
-            else
-               N_Op (N) := PKG_GENERIC;
-               N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
-               N_Str_Len (N) := Saved_Len;
-               N_Arg2 (N) := Pool_Str (Sub, Sub_Len);
-               N_Int (N) := Sub_Len;
-               if Tok = TK_LPAREN then
-                  N_Aux1 (N) := 1;
-                  Next_Token;
-                  if Tok /= TK_RPAREN then
-                     declare
-                        First : Integer;
-                        Prev : Integer;
-                        Arg : Integer;
-                     begin
-                        First := Parse_Expression_AST;
-                        N_First (N) := First;
-                        Prev := First;
-                        while Tok = TK_COMMA loop
-                           Next_Token;
-                           Arg := Parse_Expression_AST;
-                           N_Next (Prev) := Arg;
-                           Prev := Arg;
-                        end loop;
-                     end;
-                  end if;
-                  Expect (TK_RPAREN);
-               end if;
-            end if;
+            N := Build_Pkg_Stmt (Saved, Saved_Len, Sub, Sub_Len);
             Expect (TK_SEMI);
             return N;
          end if;
@@ -4398,6 +4445,16 @@ procedure Adacomp is
                      With_Buf (With_Count) (I) := Nm (I);
                   end loop;
                   With_NLen (With_Count) := NL;
+               end if;
+            end if;
+            if not Is_With and then Tok = TK_IDENT and then Tok_Eq_CI ("Ada") then
+               -- `use Ada.Text_IO;` makes the Text_IO builtins visible bare.
+               Next_Token;
+               if Tok = TK_DOT then
+                  Next_Token;
+                  if Tok = TK_IDENT and then Tok_Eq_CI ("Text_IO") then
+                     Use_Text_IO := True;
+                  end if;
                end if;
             end if;
             while Tok /= TK_SEMI and Tok /= TK_EOF loop

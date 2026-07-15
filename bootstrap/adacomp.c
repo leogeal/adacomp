@@ -132,6 +132,10 @@ static char with_buf[MAX_WITHS][MAX_NAME];
 static int with_nlen[MAX_WITHS];
 static int with_count = 0;
 
+/* Set by `use Ada.Text_IO;` in the context clause: bare Put_Line / Put /
+   New_Line / ... statements then resolve to the Text_IO builtins. */
+static int use_text_io = 0;
+
 /* True while emitting statements for the outermost program procedure,
    so a bare Ada `return;` translates to `return 0;` in C's int main. */
 static int in_main_proc = 0;
@@ -1781,6 +1785,123 @@ static void emit_statement_ast(int n) {
     }
 }
 
+/* Build an S_PKG statement node for a Text_IO-style builtin call. The
+   caller has consumed the subprogram name; `sub` is that name and
+   `saved` the original prefix (equal to `sub` for a bare call made
+   visible by `use Ada.Text_IO`). Positioned at '(' or ';'; leaves the
+   trailing ';' for the caller. Unknown names become PKG_GENERIC
+   (a dotted user-package call, mangled <pkg>_<sub>). */
+static int build_pkg_stmt(const char *saved, int saved_len,
+                          const char *sub, int sub_len) {
+    int n = new_node(S_PKG);
+    if (name_eq_ci(sub, sub_len, "Put_Line")) {
+        n_op[n] = PKG_PUT_LINE;
+        expect(TK_LPAREN);
+        if (has_arg_separator_ahead()) {
+            n_left[n] = parse_expression_ast();
+            expect(TK_COMMA);
+            n_right[n] = parse_expression_ast();
+        } else {
+            n_left[n] = parse_expression_ast();
+        }
+        expect(TK_RPAREN);
+    } else if (name_eq_ci(sub, sub_len, "Put")) {
+        n_op[n] = PKG_PUT;
+        expect(TK_LPAREN);
+        if (has_arg_separator_ahead()) {
+            n_aux1[n] = second_arg_is_char() ? 1 : 0;
+            n_left[n] = parse_expression_ast();
+            expect(TK_COMMA);
+            n_right[n] = parse_expression_ast();
+        } else {
+            n_aux1[n] = first_arg_is_char() ? 1 : 0;
+            n_left[n] = parse_expression_ast();
+        }
+        expect(TK_RPAREN);
+    } else if (name_eq_ci(sub, sub_len, "New_Line")) {
+        n_op[n] = PKG_NEW_LINE;
+        if (tok == TK_LPAREN) {
+            expect(TK_LPAREN);
+            if (tok != TK_RPAREN) n_left[n] = parse_expression_ast();
+            expect(TK_RPAREN);
+        }
+    } else if (name_eq_ci(sub, sub_len, "Open")) {
+        n_op[n] = PKG_OPEN;
+        expect(TK_LPAREN);
+        n_left[n] = parse_expression_ast();   /* file var */
+        expect(TK_COMMA);
+        while (tok != TK_COMMA && tok != TK_RPAREN && tok != TK_EOF) {
+            if (tok_eq_ci("Out_File")) n_int[n] = 1;
+            next_token();
+            if (tok == TK_DOT) { next_token(); next_token(); }
+        }
+        if (tok == TK_COMMA) next_token();
+        n_right[n] = parse_expression_ast();   /* name */
+        expect(TK_RPAREN);
+    } else if (name_eq_ci(sub, sub_len, "Create")) {
+        n_op[n] = PKG_CREATE;
+        expect(TK_LPAREN);
+        n_left[n] = parse_expression_ast();
+        expect(TK_COMMA);
+        while (tok != TK_COMMA && tok != TK_RPAREN && tok != TK_EOF) {
+            next_token();
+            if (tok == TK_DOT) { next_token(); next_token(); }
+        }
+        if (tok == TK_COMMA) next_token();
+        n_right[n] = parse_expression_ast();
+        expect(TK_RPAREN);
+    } else if (name_eq_ci(sub, sub_len, "Close")) {
+        n_op[n] = PKG_CLOSE;
+        expect(TK_LPAREN);
+        n_left[n] = parse_expression_ast();
+        expect(TK_RPAREN);
+    } else if (name_eq_ci(sub, sub_len, "Get_Line")) {
+        n_op[n] = PKG_GET_LINE;
+        expect(TK_LPAREN);
+        n_left[n] = parse_expression_ast();
+        expect(TK_RPAREN);
+    } else if (name_eq_ci(sub, sub_len, "Get")) {
+        n_op[n] = PKG_GET;
+        expect(TK_LPAREN);
+        n_left[n] = parse_expression_ast();   /* file */
+        expect(TK_COMMA);
+        n_right[n] = parse_expression_ast();   /* char var */
+        expect(TK_RPAREN);
+    } else {
+        n_op[n] = PKG_GENERIC;
+        n_str_off[n] = pool_str(saved, saved_len);
+        n_str_len[n] = saved_len;
+        n_arg2[n] = pool_str(sub, sub_len);
+        n_int[n] = sub_len;
+        if (tok == TK_LPAREN) {
+            n_aux1[n] = 1;
+            next_token();
+            if (tok != TK_RPAREN) {
+                int first = parse_expression_ast();
+                n_first[n] = first;
+                int prev = first;
+                while (tok == TK_COMMA) {
+                    next_token();
+                    int arg = parse_expression_ast();
+                    n_next[prev] = arg;
+                    prev = arg;
+                }
+            }
+            expect(TK_RPAREN);
+        }
+    }
+    return n;
+}
+
+/* The statement-level Text_IO builtins that `use Ada.Text_IO;` makes
+   visible without a prefix. */
+static int is_textio_sub(const char *s, int len) {
+    return name_eq_ci(s, len, "Put_Line") || name_eq_ci(s, len, "Put")
+        || name_eq_ci(s, len, "New_Line") || name_eq_ci(s, len, "Get_Line")
+        || name_eq_ci(s, len, "Get") || name_eq_ci(s, len, "Open")
+        || name_eq_ci(s, len, "Close") || name_eq_ci(s, len, "Create");
+}
+
 /* Build one statement node (leaf or compound). */
 static int parse_statement_ast(void) {
     int n;
@@ -1977,6 +2098,17 @@ static int parse_statement_ast(void) {
             return n;
         }
 
+        /* Bare Text_IO builtin made visible by `use Ada.Text_IO;`:
+           Put_Line ("x"); / New_Line; / ... without the package prefix.
+           Only for names that don't resolve to a user symbol, so a
+           user-defined Put_Line still wins. */
+        if (use_text_io && sidx < 0 && (tok == TK_LPAREN || tok == TK_SEMI)
+            && is_textio_sub(saved, saved_len)) {
+            n = build_pkg_stmt(saved, saved_len, saved, saved_len);
+            expect(TK_SEMI);
+            return n;
+        }
+
         if (tok == TK_LPAREN) {
             next_token();
             if (sidx >= 0 && sym_kind[sidx]==SK_PROC && sym_arr_hi[sidx]==1) {
@@ -2098,104 +2230,7 @@ static int parse_statement_ast(void) {
                 memcpy(sub, tok_val, tok_len);
                 next_token();
             }
-
-            n = new_node(S_PKG);
-            if (name_eq_ci(sub, sub_len, "Put_Line")) {
-                n_op[n] = PKG_PUT_LINE;
-                expect(TK_LPAREN);
-                if (has_arg_separator_ahead()) {
-                    n_left[n] = parse_expression_ast();
-                    expect(TK_COMMA);
-                    n_right[n] = parse_expression_ast();
-                } else {
-                    n_left[n] = parse_expression_ast();
-                }
-                expect(TK_RPAREN);
-            } else if (name_eq_ci(sub, sub_len, "Put")) {
-                n_op[n] = PKG_PUT;
-                expect(TK_LPAREN);
-                if (has_arg_separator_ahead()) {
-                    n_aux1[n] = second_arg_is_char() ? 1 : 0;
-                    n_left[n] = parse_expression_ast();
-                    expect(TK_COMMA);
-                    n_right[n] = parse_expression_ast();
-                } else {
-                    n_aux1[n] = first_arg_is_char() ? 1 : 0;
-                    n_left[n] = parse_expression_ast();
-                }
-                expect(TK_RPAREN);
-            } else if (name_eq_ci(sub, sub_len, "New_Line")) {
-                n_op[n] = PKG_NEW_LINE;
-                if (tok == TK_LPAREN) {
-                    expect(TK_LPAREN);
-                    if (tok != TK_RPAREN) n_left[n] = parse_expression_ast();
-                    expect(TK_RPAREN);
-                }
-            } else if (name_eq_ci(sub, sub_len, "Open")) {
-                n_op[n] = PKG_OPEN;
-                expect(TK_LPAREN);
-                n_left[n] = parse_expression_ast();   /* file var */
-                expect(TK_COMMA);
-                while (tok != TK_COMMA && tok != TK_RPAREN && tok != TK_EOF) {
-                    if (tok_eq_ci("Out_File")) n_int[n] = 1;
-                    next_token();
-                    if (tok == TK_DOT) { next_token(); next_token(); }
-                }
-                if (tok == TK_COMMA) next_token();
-                n_right[n] = parse_expression_ast();   /* name */
-                expect(TK_RPAREN);
-            } else if (name_eq_ci(sub, sub_len, "Create")) {
-                n_op[n] = PKG_CREATE;
-                expect(TK_LPAREN);
-                n_left[n] = parse_expression_ast();
-                expect(TK_COMMA);
-                while (tok != TK_COMMA && tok != TK_RPAREN && tok != TK_EOF) {
-                    next_token();
-                    if (tok == TK_DOT) { next_token(); next_token(); }
-                }
-                if (tok == TK_COMMA) next_token();
-                n_right[n] = parse_expression_ast();
-                expect(TK_RPAREN);
-            } else if (name_eq_ci(sub, sub_len, "Close")) {
-                n_op[n] = PKG_CLOSE;
-                expect(TK_LPAREN);
-                n_left[n] = parse_expression_ast();
-                expect(TK_RPAREN);
-            } else if (name_eq_ci(sub, sub_len, "Get_Line")) {
-                n_op[n] = PKG_GET_LINE;
-                expect(TK_LPAREN);
-                n_left[n] = parse_expression_ast();
-                expect(TK_RPAREN);
-            } else if (name_eq_ci(sub, sub_len, "Get")) {
-                n_op[n] = PKG_GET;
-                expect(TK_LPAREN);
-                n_left[n] = parse_expression_ast();   /* file */
-                expect(TK_COMMA);
-                n_right[n] = parse_expression_ast();   /* char var */
-                expect(TK_RPAREN);
-            } else {
-                n_op[n] = PKG_GENERIC;
-                n_str_off[n] = pool_str(saved, saved_len);
-                n_str_len[n] = saved_len;
-                n_arg2[n] = pool_str(sub, sub_len);
-                n_int[n] = sub_len;
-                if (tok == TK_LPAREN) {
-                    n_aux1[n] = 1;
-                    next_token();
-                    if (tok != TK_RPAREN) {
-                        int first = parse_expression_ast();
-                        n_first[n] = first;
-                        int prev = first;
-                        while (tok == TK_COMMA) {
-                            next_token();
-                            int arg = parse_expression_ast();
-                            n_next[prev] = arg;
-                            prev = arg;
-                        }
-                    }
-                    expect(TK_RPAREN);
-                }
-            }
+            n = build_pkg_stmt(saved, saved_len, sub, sub_len);
             expect(TK_SEMI);
             return n;
         }
@@ -3326,6 +3361,14 @@ static void parse_context(void) {
                 memcpy(with_buf[with_count], nm, nl);
                 with_nlen[with_count] = nl;
                 with_count++;
+            }
+        }
+        if (!is_with && tok == TK_IDENT && tok_eq_ci("Ada")) {
+            /* `use Ada.Text_IO;` makes the Text_IO builtins visible bare. */
+            next_token();
+            if (tok == TK_DOT) {
+                next_token();
+                if (tok == TK_IDENT && tok_eq_ci("Text_IO")) use_text_io = 1;
             }
         }
         while (tok != TK_SEMI && tok != TK_EOF) next_token();
