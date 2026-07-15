@@ -212,6 +212,7 @@ procedure Adacomp is
    A_ATTR_VAR  : constant Integer := 13;
    A_NEW       : constant Integer := 14;
    A_FIELD     : constant Integer := 15;
+   A_ALL       : constant Integer := 16;
 
    -- Operator codes (for UNARY / BINARY)
    OP_ADD : constant Integer := 1;
@@ -263,6 +264,8 @@ procedure Adacomp is
    S_CASE    : constant Integer := 48;
    S_WHEN    : constant Integer := 49;
    S_EXC_ID  : constant Integer := 50;
+   S_ALL_ASSIGN : constant Integer := 51;
+   S_FREE    : constant Integer := 52;
 
    -- Sub-ops for S_PKG (dotted Ada.Text_IO.* statement calls).
    PKG_PUT_LINE : constant Integer := 1;
@@ -713,6 +716,74 @@ procedure Adacomp is
       end loop;
       return Found;
    end Has_Arg_Separator_Ahead;
+
+   -- With the current token being '.', check whether the next token is
+   -- the reserved word `all` (P.all dereference). Saves/restores state.
+   function All_Follows_Dot return Boolean is
+      Save_Src_Pos : Integer;
+      Save_Line    : Integer;
+      Save_Tok     : Integer;
+      Save_Tok_Len : Integer;
+      Save_Tok_Int : Integer;
+      Save_Tok_Val : Tok_Buffer;
+      Found        : Boolean;
+   begin
+      Save_Src_Pos := Src_Pos;
+      Save_Line    := Line_Num;
+      Save_Tok     := Tok;
+      Save_Tok_Len := Tok_Len;
+      Save_Tok_Int := Tok_Int;
+      for I in 1 .. Tok_Len loop
+         Save_Tok_Val (I) := Tok_Val (I);
+      end loop;
+
+      Next_Token;
+      Found := Tok = TK_IDENT and then Tok_Eq_CI ("all");
+
+      Src_Pos  := Save_Src_Pos;
+      Line_Num := Save_Line;
+      Tok      := Save_Tok;
+      Tok_Len  := Save_Tok_Len;
+      Tok_Int  := Save_Tok_Int;
+      for I in 1 .. Save_Tok_Len loop
+         Tok_Val (I) := Save_Tok_Val (I);
+      end loop;
+      return Found;
+   end All_Follows_Dot;
+
+   -- With the current token being `is`, check whether the next token is
+   -- `new` (a generic instantiation). Saves/restores lexer state.
+   function New_Follows_Is return Boolean is
+      Save_Src_Pos : Integer;
+      Save_Line    : Integer;
+      Save_Tok     : Integer;
+      Save_Tok_Len : Integer;
+      Save_Tok_Int : Integer;
+      Save_Tok_Val : Tok_Buffer;
+      Found        : Boolean;
+   begin
+      Save_Src_Pos := Src_Pos;
+      Save_Line    := Line_Num;
+      Save_Tok     := Tok;
+      Save_Tok_Len := Tok_Len;
+      Save_Tok_Int := Tok_Int;
+      for I in 1 .. Tok_Len loop
+         Save_Tok_Val (I) := Tok_Val (I);
+      end loop;
+
+      Next_Token;
+      Found := Tok = TK_NEW;
+
+      Src_Pos  := Save_Src_Pos;
+      Line_Num := Save_Line;
+      Tok      := Save_Tok;
+      Tok_Len  := Save_Tok_Len;
+      Tok_Int  := Save_Tok_Int;
+      for I in 1 .. Save_Tok_Len loop
+         Tok_Val (I) := Save_Tok_Val (I);
+      end loop;
+      return Found;
+   end New_Follows_Is;
 
    -- Given we're positioned just past `(` of a 2-arg call (and we already
    -- confirmed a top-level comma is present), look ahead to determine
@@ -1260,6 +1331,20 @@ procedure Adacomp is
       return Off;
    end Pool_Str;
 
+   -- Pool a symbol's name (which lives in Name_Pool) into the node
+   -- string pool, so nodes can carry type names past symbol-table pops.
+   function Pool_Name_Pool (Off : Integer; Len : Integer) return Integer is
+      O : Integer;
+   begin
+      Ensure_NPool_Cap (NPool_Len + Len);
+      O := NPool_Len + 1;
+      for I in 1 .. Len loop
+         NPool_Len := NPool_Len + 1;
+         NPool (NPool_Len) := Name_Pool (Off + I - 1);
+      end loop;
+      return O;
+   end Pool_Name_Pool;
+
    -- Set node N's call name: <pkg>_<name> when the callee is a package
    -- subprogram (tagged in Sym_Arr_Lo as index+1), else <name>. Resolved
    -- at build time so the walker stays symbol-table-independent.
@@ -1448,6 +1533,13 @@ procedure Adacomp is
          Next_Token;
          return N;
       end if;
+      if Tok = TK_NULL then
+         -- null access value -> 0 (C pointers compare/assign against 0).
+         N := New_Node (A_INT_LIT);
+         N_Int (N) := 0;
+         Next_Token;
+         return N;
+      end if;
       if Tok = TK_NOT then
          Next_Token;
          N := New_Node (A_UNARY);
@@ -1463,29 +1555,46 @@ procedure Adacomp is
          return N;
       end if;
       if Tok = TK_NEW then
-         -- Allocator: `new <ArrayType> (lo .. hi)`. Element type (for
-         -- sizeof) in N_Op; bound expressions in N_Left / N_Right.
+         -- Allocator. `new <ArrayType> (lo .. hi)` -> malloc of that many
+         -- elements (element type in N_Op, bounds in N_Left / N_Right).
+         -- `new <RecordType>` / `new <ScalarType>` (no bounds, N_Left = 0)
+         -- -> calloc of one zeroed object; a record target pools its type
+         -- name into N_Str for `sizeof(struct <name>)`.
          declare
-            El : Integer := TY_INTEGER;
-            Ti : Integer;
+            El      : Integer := TY_INTEGER;
+            Rec_Idx : Integer := -1;
+            Ti      : Integer;
          begin
             Next_Token;
             if Tok = TK_IDENT then
                Ti := Find_Sym (Tok_Val, Tok_Len);
                if Ti > 0 and then Sym_Kind (Ti) = SK_TYPE then
-                  El := Sym_Arr_El (Ti);
+                  if Sym_Type (Ti) = TY_RECORD then
+                     Rec_Idx := Ti;
+                  else
+                     El := Sym_Arr_El (Ti);
+                  end if;
                end if;
                Next_Token;
             else
                El := Parse_Type_Ref;
             end if;
             N := New_Node (A_NEW);
-            N_Op (N) := El;
-            Expect (TK_LPAREN);
-            N_Left (N) := Parse_Expression_AST;
-            Expect (TK_DOTDOT);
-            N_Right (N) := Parse_Expression_AST;
-            Expect (TK_RPAREN);
+            if Rec_Idx > 0 then
+               N_Op (N) := TY_RECORD;
+               N_Str_Off (N) := Pool_Name_Pool (Sym_Name_Off (Rec_Idx),
+                                                Sym_Name_Len (Rec_Idx));
+               N_Str_Len (N) := Sym_Name_Len (Rec_Idx);
+            else
+               N_Op (N) := El;
+            end if;
+            if Tok = TK_LPAREN then
+               Next_Token;
+               N_Left (N) := Parse_Expression_AST;
+               Expect (TK_DOTDOT);
+               N_Right (N) := Parse_Expression_AST;
+               Expect (TK_RPAREN);
+            end if;
             return N;
          end;
       end if;
@@ -1660,15 +1769,31 @@ procedure Adacomp is
          if Tok = TK_DOT and then Sym_Idx > 0
             and then (Sym_Kind (Sym_Idx) = SK_VAR or Sym_Kind (Sym_Idx) = SK_PARAM
                       or Sym_Kind (Sym_Idx) = SK_CONST)
-            and then Sym_Type (Sym_Idx) = TY_RECORD
+            and then (Sym_Type (Sym_Idx) = TY_RECORD
+                      or Sym_Type (Sym_Idx) = TY_ACCESS
+                      or (Sym_Type (Sym_Idx) = TY_ARRAY
+                          and then Sym_Arr_Hi (Sym_Idx) = 0
+                          and then All_Follows_Dot))
          then
-            -- Record field access: var.field -> var.field
+            -- Record field access (var.field -> var.field), implicit
+            -- dereference through an access value (p.field -> p->field),
+            -- or explicit dereference (p.all -> (*p)).
             Next_Token;   -- consume '.'
+            if Tok = TK_IDENT and then Tok_Eq_CI ("all") then
+               N := New_Node (A_ALL);
+               N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+               N_Str_Len (N) := Saved_Len;
+               Next_Token;   -- consume 'all'
+               return N;
+            end if;
             N := New_Node (A_FIELD);
             N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
             N_Str_Len (N) := Saved_Len;
             N_Arg2 (N) := Pool_Str (Tok_Val, Tok_Len);
             N_Int (N) := Tok_Len;
+            if Sym_Type (Sym_Idx) = TY_ACCESS then
+               N_Op (N) := 1;                        -- -> instead of .
+            end if;
             Next_Token;   -- consume field name
             return N;
          end if;
@@ -1999,19 +2124,41 @@ procedure Adacomp is
             Emit ("1");
          end if;
       elsif Kind = A_NEW then
-         -- new T (lo..hi) -> malloc(((hi) - (lo) + 1) * sizeof(T))
-         Emit ("malloc((");
-         Emit_Expression_AST (N_Right (N));
-         Emit (" - ");
-         Emit_Expression_AST (N_Left (N));
-         Emit (" + 1) * sizeof(");
-         Emit_C_Type (N_Op (N));
-         Emit ("))");
+         if N_Left (N) /= 0 then
+            -- new T (lo..hi) -> malloc(((hi) - (lo) + 1) * sizeof(T))
+            Emit ("malloc((");
+            Emit_Expression_AST (N_Right (N));
+            Emit (" - ");
+            Emit_Expression_AST (N_Left (N));
+            Emit (" + 1) * sizeof(");
+            Emit_C_Type (N_Op (N));
+            Emit ("))");
+         else
+            -- new T -> calloc(1, sizeof(T)): one zeroed object, matching
+            -- the compiler's zero-default init convention.
+            Emit ("calloc(1, sizeof(");
+            if N_Op (N) = TY_RECORD then
+               Emit ("struct ");
+               Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            else
+               Emit_C_Type (N_Op (N));
+            end if;
+            Emit ("))");
+         end if;
       elsif Kind = A_FIELD then
-         -- record field access: base.field
+         -- record field access: base.field, or base->field via access
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
-         Emit (".");
+         if N_Op (N) = 1 then
+            Emit ("->");
+         else
+            Emit (".");
+         end if;
          Emit_Pool_Lower (N_Arg2 (N), N_Int (N));
+      elsif Kind = A_ALL then
+         -- pointer dereference: P.all -> (*p)
+         Emit ("(*");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit (")");
       elsif Kind = A_DOTTED then
          Sub_Off := N_Arg2 (N);
          Sub_Len := N_Int (N);
@@ -2146,14 +2293,35 @@ procedure Adacomp is
          Emit_Expression_AST (N_First (N));
          Emit_Ln (";");
       elsif Kind = S_FIELD_ASSIGN then
-         -- record field assignment: base.field = rhs;
+         -- field assignment: base.field = rhs; or base->field = rhs;
          Emit_Indent;
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
-         Emit (".");
+         if N_Op (N) = 1 then
+            Emit ("->");
+         else
+            Emit (".");
+         end if;
          Emit_Pool_Lower (N_Arg2 (N), N_Int (N));
          Emit (" = ");
          Emit_Expression_AST (N_Right (N));
          Emit_Ln (";");
+      elsif Kind = S_ALL_ASSIGN then
+         -- dereference assignment: *base = rhs;
+         Emit_Indent;
+         Emit ("*");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit (" = ");
+         Emit_Expression_AST (N_Right (N));
+         Emit_Ln (";");
+      elsif Kind = S_FREE then
+         -- instantiated Unchecked_Deallocation: free + null out, matching
+         -- Ada's post-condition that the access value becomes null.
+         Emit_Indent;
+         Emit ("free(");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit ("); ");
+         Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+         Emit_Ln (" = NULL;");
       elsif Kind = S_IF then
          Emit_Indent; Emit ("if (");
          Emit_Expression_AST (N_Left (N));
@@ -2629,6 +2797,17 @@ procedure Adacomp is
 
          if Tok = TK_LPAREN then
             Next_Token;
+            if Sym_Idx > 0 and then Sym_Kind (Sym_Idx) = SK_PROC
+               and then Sym_Arr_Hi (Sym_Idx) = 1
+            then
+               -- Instantiated Unchecked_Deallocation: Free (P);
+               N := New_Node (S_FREE);
+               N_Str_Off (N) := Pool_Str (Tok_Val, Tok_Len);
+               N_Str_Len (N) := Tok_Len;
+               Next_Token;
+               Expect (TK_RPAREN); Expect (TK_SEMI);
+               return N;
+            end if;
             if Sym_Idx > 0 and then (Sym_Kind (Sym_Idx) = SK_PROC or Sym_Kind (Sym_Idx) = SK_FUNC) then
                N := New_Node (S_CALL);
                Set_Call_Name (N, Saved, Saved_Len, Sym_Idx);
@@ -2711,15 +2890,33 @@ procedure Adacomp is
 
          if Tok = TK_DOT and then Sym_Idx > 0
             and then (Sym_Kind (Sym_Idx) = SK_VAR or Sym_Kind (Sym_Idx) = SK_PARAM)
-            and then Sym_Type (Sym_Idx) = TY_RECORD
+            and then (Sym_Type (Sym_Idx) = TY_RECORD
+                      or Sym_Type (Sym_Idx) = TY_ACCESS
+                      or (Sym_Type (Sym_Idx) = TY_ARRAY
+                          and then Sym_Arr_Hi (Sym_Idx) = 0
+                          and then All_Follows_Dot))
          then
-            -- Record field assignment: var.field := expr;
+            -- Field assignment (var.field := / p.field := via access) or
+            -- dereference assignment (p.all := expr; -> *p = expr;).
             Next_Token;   -- consume '.'
+            if Tok = TK_IDENT and then Tok_Eq_CI ("all") then
+               N := New_Node (S_ALL_ASSIGN);
+               N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
+               N_Str_Len (N) := Saved_Len;
+               Next_Token;   -- consume 'all'
+               Expect (TK_ASSIGN);
+               N_Right (N) := Parse_Expression_AST;
+               Expect (TK_SEMI);
+               return N;
+            end if;
             N := New_Node (S_FIELD_ASSIGN);
             N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
             N_Str_Len (N) := Saved_Len;
             N_Arg2 (N) := Pool_Str (Tok_Val, Tok_Len);
             N_Int (N) := Tok_Len;
+            if Sym_Type (Sym_Idx) = TY_ACCESS then
+               N_Op (N) := 1;                        -- -> instead of .
+            end if;
             Next_Token;   -- consume field name
             Expect (TK_ASSIGN);
             N_Right (N) := Parse_Expression_AST;
@@ -3134,10 +3331,15 @@ procedure Adacomp is
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          Emit_Ln (" = NULL;");
       elsif Kind = D_VAR_ACCESS then
-         -- Elem *name [= <new ...>]; (default NULL)
+         -- Elem *name / struct <rec> *name [= <new ...>]; (default NULL)
          Emit_Indent;
          if Is_Const = 1 then Emit ("const "); end if;
-         Emit_C_Type (N_Aux1 (N));
+         if N_Aux1 (N) = TY_RECORD then
+            Emit ("struct ");
+            Emit_Pool_Lower (N_Arg2 (N), N_Int (N));   -- record type name
+         else
+            Emit_C_Type (N_Aux1 (N));
+         end if;
          Emit (" *");
          Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
          if N_Left (N) /= 0 then
@@ -3211,6 +3413,15 @@ procedure Adacomp is
          Next_Token;
          Add_Sym (SK_TYPE, TY_ARRAY);
          Next_Token;
+         -- Incomplete type declaration: `type Node;` — assume a record
+         -- (its only use in the subset is a self-referencing record via
+         -- an access type). No C is emitted: `struct node` is usable
+         -- self-referentially in C without a forward declaration.
+         if Tok = TK_SEMI then
+            Sym_Type (Sym_Count) := TY_RECORD;
+            Next_Token;
+            return 0;
+         end if;
          Expect (TK_IS);
          if Tok = TK_ARRAY then
             Next_Token;
@@ -3257,17 +3468,26 @@ procedure Adacomp is
                end;
             end if;
          elsif Tok = TK_ACCESS then
-            -- `access <ArrayTypeName>` or `access <ScalarType>`: a pointer
-            -- to its element type.
+            -- `access <ArrayTypeName>`, `access <RecordTypeName>`, or
+            -- `access <ScalarType>`. Array/scalar targets are modelled as
+            -- a pointer to the element type; a record target keeps the
+            -- record type's symbol index (+1, 0 = none) in
+            -- Sym_Arr_Inner_Lo so declarations can emit `struct <name> *`.
             declare
-               El : Integer := TY_INTEGER;
-               Ti : Integer;
+               El  : Integer := TY_INTEGER;
+               Rec : Integer := 0;
+               Ti  : Integer;
             begin
                Next_Token;
                if Tok = TK_IDENT then
                   Ti := Find_Sym (Tok_Val, Tok_Len);
                   if Ti > 0 and then Sym_Kind (Ti) = SK_TYPE then
-                     El := Sym_Arr_El (Ti);
+                     if Sym_Type (Ti) = TY_RECORD then
+                        El := TY_RECORD;
+                        Rec := Ti + 1;
+                     else
+                        El := Sym_Arr_El (Ti);
+                     end if;
                   end if;
                   Next_Token;
                else
@@ -3277,11 +3497,13 @@ procedure Adacomp is
                Sym_Arr_Lo (Sym_Count) := 1;
                Sym_Arr_Hi (Sym_Count) := 0;
                Sym_Arr_El (Sym_Count) := El;
+               Sym_Arr_Inner_Lo (Sym_Count) := Rec;
             end;
          elsif Tok = TK_RECORD then
             -- `record F1 : T1; ... end record;` -> a C struct, emitted here.
             declare
                FTy : Integer;
+               Fti : Integer;
             begin
                Sym_Type (Sym_Count) := TY_RECORD;
                Emit ("struct ");
@@ -3299,12 +3521,38 @@ procedure Adacomp is
                      end loop;
                      Next_Token;
                      Expect (TK_COLON);
-                     FTy := Parse_Type_Ref;
-                     Emit (" ");
-                     Emit_C_Type (FTy);
-                     Emit (" ");
-                     Emit_Lower (FName, FNLen);
-                     Emit (";");
+                     -- Access-typed field -> a pointer member (this is what
+                     -- makes self-referencing records like list nodes work).
+                     Fti := -1;
+                     if Tok = TK_IDENT then
+                        Fti := Find_Sym (Tok_Val, Tok_Len);
+                     end if;
+                     if Fti > 0 and then Sym_Kind (Fti) = SK_TYPE
+                        and then Sym_Type (Fti) = TY_ACCESS
+                     then
+                        Emit (" ");
+                        if Sym_Arr_El (Fti) = TY_RECORD
+                           and then Sym_Arr_Inner_Lo (Fti) /= 0
+                        then
+                           Emit ("struct ");
+                           Emit_Name_Pool_Lower
+                              (Sym_Name_Off (Sym_Arr_Inner_Lo (Fti) - 1),
+                               Sym_Name_Len (Sym_Arr_Inner_Lo (Fti) - 1));
+                        else
+                           Emit_C_Type (Sym_Arr_El (Fti));
+                        end if;
+                        Emit (" *");
+                        Emit_Lower (FName, FNLen);
+                        Emit (";");
+                        Next_Token;
+                     else
+                        FTy := Parse_Type_Ref;
+                        Emit (" ");
+                        Emit_C_Type (FTy);
+                        Emit (" ");
+                        Emit_Lower (FName, FNLen);
+                        Emit (";");
+                     end if;
                      Expect (TK_SEMI);
                   end;
                end loop;
@@ -3461,6 +3709,18 @@ procedure Adacomp is
                Add_Sym (SK_PROC, 0);
                if Cur_Pkg /= 0 then Sym_Arr_Lo (Sym_Count) := Cur_Pkg; end if;
                Next_Token;
+               -- Generic instantiation: the only supported generic is
+               --   procedure Free is new Ada.Unchecked_Deallocation (T, PT);
+               -- Tagged via Sym_Arr_Hi = 1; a call `Free (P);` then emits
+               -- `free(p); p = NULL;`. No C is emitted here.
+               if Tok = TK_IS and then New_Follows_Is then
+                  while Tok /= TK_SEMI and Tok /= TK_EOF loop
+                     Next_Token;
+                  end loop;
+                  Expect (TK_SEMI);
+                  Sym_Arr_Hi (Sym_Count) := 1;   -- free-proc tag
+                  return 0;
+               end if;
                Emit ("void ");
                Emit_Sub_Name (P_Name, P_Len);
                Emit ("(");
@@ -3817,6 +4077,39 @@ procedure Adacomp is
                   Tidx := Find_Sym (Tok_Val, Tok_Len);
                   if Tidx > 0 and then Sym_Kind (Tidx) = SK_TYPE and then Sym_Type (Tidx) = TY_ACCESS then
                      El := Sym_Arr_El (Tidx);
+                     if El = TY_RECORD and then Sym_Arr_Inner_Lo (Tidx) /= 0 then
+                        -- Access-to-record: `struct <rec> *name`. Registered
+                        -- TY_ACCESS (not TY_ARRAY) so `.field` resolves to
+                        -- `->` instead of the indexing machinery.
+                        declare
+                           Rec : Integer := Sym_Arr_Inner_Lo (Tidx);
+                        begin
+                           if Is_Const then
+                              Add_Sym_Named (Var_Name, Var_Len, SK_CONST, TY_ACCESS);
+                           else
+                              Add_Sym_Named (Var_Name, Var_Len, SK_VAR, TY_ACCESS);
+                           end if;
+                           Sym_Arr_Lo (Sym_Count) := 1;
+                           Sym_Arr_Hi (Sym_Count) := 0;
+                           Sym_Arr_El (Sym_Count) := TY_RECORD;
+                           Sym_Arr_Inner_Lo (Sym_Count) := Rec;
+                           N := New_Node (D_VAR_ACCESS);
+                           N_Str_Off (N) := Pool_Str (Var_Name, Var_Len);
+                           N_Str_Len (N) := Var_Len;
+                           if Is_Const then N_Op (N) := 1; else N_Op (N) := 0; end if;
+                           N_Aux1 (N) := TY_RECORD;
+                           N_Arg2 (N) := Pool_Name_Pool (Sym_Name_Off (Rec - 1),
+                                                         Sym_Name_Len (Rec - 1));
+                           N_Int (N) := Sym_Name_Len (Rec - 1);
+                           Next_Token;
+                           if Tok = TK_ASSIGN then
+                              Next_Token;
+                              N_Left (N) := Parse_Expression_AST;  -- e.g. new Node
+                           end if;
+                           Expect (TK_SEMI);
+                           return N;
+                        end;
+                     end if;
                      if Is_Const then
                         Add_Sym_Named (Var_Name, Var_Len, SK_CONST, TY_ARRAY);
                      else

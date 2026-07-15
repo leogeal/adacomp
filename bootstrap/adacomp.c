@@ -470,6 +470,17 @@ static int has_arg_separator_ahead(void) {
     return found;
 }
 
+/* With the current token being '.', check whether the next token is the
+   reserved word `all` (P.all dereference). Saves/restores lexer state. */
+static int all_follows_dot(void) {
+    LexState s;
+    save_lex(&s);
+    next_token();
+    int r = (tok == TK_IDENT && tok_eq_ci("all"));
+    restore_lex(&s);
+    return r;
+}
+
 /* Given we're positioned just past `(` of a 2-arg call (and we already
    confirmed a top-level comma is present), look ahead to determine
    whether the second argument is character-typed. Saves/restores state. */
@@ -638,7 +649,7 @@ enum {
     A_UNARY=6, A_BINARY=7,
     A_INDEX=8, A_INDEX2=9,
     A_CALL=10, A_DOTTED=11,
-    A_ATTR_TYPE=12, A_ATTR_VAR=13, A_NEW=14, A_FIELD=15,
+    A_ATTR_TYPE=12, A_ATTR_VAR=13, A_NEW=14, A_FIELD=15, A_ALL=16,
     /* Statement leaf nodes. Compound (if/while/for/loop/declare/begin) and
        dotted-package statements still emit directly; they'll become full
        AST nodes once declarations are AST-driven (step 4). */
@@ -650,7 +661,7 @@ enum {
        the unit is fully parsed. */
     S_IF=40, S_ELSIF=41, S_WHILE=42, S_LOOP=43, S_FOR=44,
     S_DECLARE=45, S_BLOCK=46, S_PKG=47, S_CASE=48, S_WHEN=49,
-    S_EXC_ID=50,
+    S_EXC_ID=50, S_ALL_ASSIGN=51, S_FREE=52,
     /* Variable-declaration leaf nodes. Type definitions and procedure /
        function declarations still emit directly during parse and return
        0 from parse_declaration_ast. */
@@ -915,6 +926,13 @@ static int parse_primary_ast(void) {
         next_token();
         return n;
     }
+    if (tok == TK_NULL) {
+        /* null access value -> 0 (C pointers compare/assign against 0). */
+        n = new_node(A_INT_LIT);
+        n_int[n] = 0;
+        next_token();
+        return n;
+    }
     if (tok == TK_NOT) {
         next_token();
         n = new_node(A_UNARY);
@@ -930,25 +948,39 @@ static int parse_primary_ast(void) {
         return n;
     }
     if (tok == TK_NEW) {
-        /* Allocator: `new <ArrayType> (lo .. hi)` -> malloc of that many
-           elements. Element type (for sizeof) in n_op; bound expressions
-           in n_left (lo) and n_right (hi). */
+        /* Allocator. `new <ArrayType> (lo .. hi)` -> malloc of that many
+           elements (element type in n_op, bounds in n_left/n_right).
+           `new <RecordType>` / `new <ScalarType>` (no bounds, n_left = 0)
+           -> calloc of one zeroed object; a record target pools its type
+           name into n_str for `sizeof(struct <name>)`. */
         next_token();
         int el = TY_INTEGER;
+        int rec_idx = -1;
         if (tok == TK_IDENT) {
             int ti = find_sym(tok_val, tok_len);
-            if (ti >= 0 && sym_kind[ti] == SK_TYPE) el = sym_arr_el[ti];
+            if (ti >= 0 && sym_kind[ti] == SK_TYPE) {
+                if (sym_type[ti] == TY_RECORD) rec_idx = ti;
+                else el = sym_arr_el[ti];
+            }
             next_token();
         } else {
             el = parse_type_ref();
         }
         n = new_node(A_NEW);
-        n_op[n] = el;
-        expect(TK_LPAREN);
-        n_left[n] = parse_expression_ast();
-        expect(TK_DOTDOT);
-        n_right[n] = parse_expression_ast();
-        expect(TK_RPAREN);
+        if (rec_idx >= 0) {
+            n_op[n] = TY_RECORD;
+            n_str_off[n] = pool_str(sym_name[rec_idx], sym_nlen[rec_idx]);
+            n_str_len[n] = sym_nlen[rec_idx];
+        } else {
+            n_op[n] = el;
+        }
+        if (tok == TK_LPAREN) {
+            next_token();
+            n_left[n] = parse_expression_ast();
+            expect(TK_DOTDOT);
+            n_right[n] = parse_expression_ast();
+            expect(TK_RPAREN);
+        }
         return n;
     }
     if (tok == TK_LPAREN) {
@@ -1085,14 +1117,26 @@ static int parse_primary_ast(void) {
 
         if (tok == TK_DOT && sidx >= 0
             && (sym_kind[sidx]==SK_VAR || sym_kind[sidx]==SK_PARAM || sym_kind[sidx]==SK_CONST)
-            && sym_type[sidx]==TY_RECORD) {
-            /* Record field access: var.field -> var.field */
+            && (sym_type[sidx]==TY_RECORD || sym_type[sidx]==TY_ACCESS
+                || (sym_type[sidx]==TY_ARRAY && sym_arr_hi[sidx]==0
+                    && all_follows_dot()))) {
+            /* Record field access (var.field -> var.field), implicit
+               dereference through an access value (p.field -> p->field),
+               or explicit dereference (p.all -> (*p)). */
             next_token();   /* consume '.' */
+            if (tok == TK_IDENT && tok_eq_ci("all")) {
+                n = new_node(A_ALL);
+                n_str_off[n] = pool_str(saved, saved_len);
+                n_str_len[n] = saved_len;
+                next_token();   /* consume 'all' */
+                return n;
+            }
             n = new_node(A_FIELD);
             n_str_off[n] = pool_str(saved, saved_len);
             n_str_len[n] = saved_len;
             n_arg2[n] = pool_str(tok_val, tok_len);
             n_int[n] = tok_len;
+            n_op[n] = (sym_type[sidx]==TY_ACCESS) ? 1 : 0;   /* -> vs . */
             next_token();   /* consume field name */
             return n;
         }
@@ -1362,19 +1406,37 @@ static void emit_expression_ast(int n) {
             emit("1");
         }
     } else if (kind == A_NEW) {
-        /* new T (lo..hi) -> malloc(((hi) - (lo) + 1) * sizeof(T)) */
-        emit("malloc((");
-        emit_expression_ast(n_right[n]);
-        emit(" - ");
-        emit_expression_ast(n_left[n]);
-        emit(" + 1) * sizeof(");
-        emit_c_type(n_op[n]);
-        emit("))");
+        if (n_left[n] != 0) {
+            /* new T (lo..hi) -> malloc(((hi) - (lo) + 1) * sizeof(T)) */
+            emit("malloc((");
+            emit_expression_ast(n_right[n]);
+            emit(" - ");
+            emit_expression_ast(n_left[n]);
+            emit(" + 1) * sizeof(");
+            emit_c_type(n_op[n]);
+            emit("))");
+        } else {
+            /* new T -> calloc(1, sizeof(T)): one zeroed object, matching
+               the compiler's zero-default init convention. */
+            emit("calloc(1, sizeof(");
+            if (n_op[n] == TY_RECORD) {
+                emit("struct ");
+                emit_pool_lower(n_str_off[n], n_str_len[n]);
+            } else {
+                emit_c_type(n_op[n]);
+            }
+            emit("))");
+        }
     } else if (kind == A_FIELD) {
-        /* record field access: base.field */
+        /* record field access: base.field, or base->field via access */
         emit_pool_lower(n_str_off[n], n_str_len[n]);
-        emit(".");
+        emit(n_op[n] ? "->" : ".");
         emit_pool_lower(n_arg2[n], n_int[n]);
+    } else if (kind == A_ALL) {
+        /* pointer dereference: P.all -> (*p) */
+        emit("(*");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit(")");
     } else if (kind == A_DOTTED) {
         int sub_off = n_arg2[n];
         int sub_len = n_int[n];
@@ -1516,14 +1578,31 @@ static void emit_statement_ast(int n) {
         emit_expression_ast(n_first[n]);
         emit_line(";");
     } else if (kind == S_FIELD_ASSIGN) {
-        /* record field assignment: base.field = rhs; */
+        /* field assignment: base.field = rhs; or base->field = rhs; */
         emit_indent();
         emit_pool_lower(n_str_off[n], n_str_len[n]);
-        emit(".");
+        emit(n_op[n] ? "->" : ".");
         emit_pool_lower(n_arg2[n], n_int[n]);
         emit(" = ");
         emit_expression_ast(n_right[n]);
         emit_line(";");
+    } else if (kind == S_ALL_ASSIGN) {
+        /* dereference assignment: *base = rhs; */
+        emit_indent();
+        emit("*");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit(" = ");
+        emit_expression_ast(n_right[n]);
+        emit_line(";");
+    } else if (kind == S_FREE) {
+        /* instantiated Unchecked_Deallocation: free + null out, matching
+           Ada's post-condition that the access value becomes null. */
+        emit_indent();
+        emit("free(");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit("); ");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit_line(" = NULL;");
     } else if (kind == S_IF) {
         emit_indent(); emit("if (");
         emit_expression_ast(n_left[n]);
@@ -1900,6 +1979,15 @@ static int parse_statement_ast(void) {
 
         if (tok == TK_LPAREN) {
             next_token();
+            if (sidx >= 0 && sym_kind[sidx]==SK_PROC && sym_arr_hi[sidx]==1) {
+                /* Instantiated Unchecked_Deallocation: Free (P); */
+                n = new_node(S_FREE);
+                n_str_off[n] = pool_str(tok_val, tok_len);
+                n_str_len[n] = tok_len;
+                next_token();
+                expect(TK_RPAREN); expect(TK_SEMI);
+                return n;
+            }
             if (sidx >= 0 && (sym_kind[sidx]==SK_PROC || sym_kind[sidx]==SK_FUNC)) {
                 n = new_node(S_CALL);
                 set_call_name(n, saved, saved_len, sidx);
@@ -1968,14 +2056,28 @@ static int parse_statement_ast(void) {
 
         if (tok == TK_DOT && sidx >= 0
             && (sym_kind[sidx]==SK_VAR || sym_kind[sidx]==SK_PARAM)
-            && sym_type[sidx]==TY_RECORD) {
-            /* Record field assignment: var.field := expr; */
+            && (sym_type[sidx]==TY_RECORD || sym_type[sidx]==TY_ACCESS
+                || (sym_type[sidx]==TY_ARRAY && sym_arr_hi[sidx]==0
+                    && all_follows_dot()))) {
+            /* Field assignment (var.field := / p.field := via access) or
+               dereference assignment (p.all := expr; -> *p = expr;). */
             next_token();   /* consume '.' */
+            if (tok == TK_IDENT && tok_eq_ci("all")) {
+                n = new_node(S_ALL_ASSIGN);
+                n_str_off[n] = pool_str(saved, saved_len);
+                n_str_len[n] = saved_len;
+                next_token();   /* consume 'all' */
+                expect(TK_ASSIGN);
+                n_right[n] = parse_expression_ast();
+                expect(TK_SEMI);
+                return n;
+            }
             n = new_node(S_FIELD_ASSIGN);
             n_str_off[n] = pool_str(saved, saved_len);
             n_str_len[n] = saved_len;
             n_arg2[n] = pool_str(tok_val, tok_len);
             n_int[n] = tok_len;
+            n_op[n] = (sym_type[sidx]==TY_ACCESS) ? 1 : 0;   /* -> vs . */
             next_token();   /* consume field name */
             expect(TK_ASSIGN);
             n_right[n] = parse_expression_ast();
@@ -2314,10 +2416,15 @@ static void emit_declaration_ast(int n) {
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         emit_line(" = NULL;");
     } else if (kind == D_VAR_ACCESS) {
-        /* Elem *name [= <new ...>]; (default NULL) */
+        /* Elem *name / struct <rec> *name [= <new ...>]; (default NULL) */
         emit_indent();
         if (is_const) emit("const ");
-        emit_c_type(n_aux1[n]);
+        if (n_aux1[n] == TY_RECORD) {
+            emit("struct ");
+            emit_pool_lower(n_arg2[n], n_int[n]);   /* record type name */
+        } else {
+            emit_c_type(n_aux1[n]);
+        }
         emit(" *");
         emit_pool_lower(n_str_off[n], n_str_len[n]);
         if (n_left[n] != 0) {
@@ -2379,6 +2486,15 @@ static int parse_declaration_ast(void) {
         next_token();
         add_sym(SK_TYPE, TY_ARRAY);
         next_token();
+        /* Incomplete type declaration: `type Node;` — assume a record
+           (its only use in the subset is a self-referencing record via
+           an access type). No C is emitted: `struct node` is usable
+           self-referentially in C without a forward declaration. */
+        if (tok == TK_SEMI) {
+            sym_type[sym_count-1] = TY_RECORD;
+            next_token();
+            return 0;
+        }
         expect(TK_IS);
         if (tok == TK_ARRAY) {
             next_token();
@@ -2423,13 +2539,20 @@ static int parse_declaration_ast(void) {
                 }
             }
         } else if (tok == TK_ACCESS) {
-            /* `access <ArrayTypeName>` or `access <ScalarType>`. Modelled
-               as a pointer to its element type. */
+            /* `access <ArrayTypeName>`, `access <RecordTypeName>`, or
+               `access <ScalarType>`. Array/scalar targets are modelled as
+               a pointer to the element type; a record target keeps the
+               record type's symbol index (+1, 0 = none) in
+               sym_arr_inner_lo so declarations can emit `struct <name> *`. */
             next_token();
             int el = TY_INTEGER;
+            int rec = 0;
             if (tok == TK_IDENT) {
                 int ti = find_sym(tok_val, tok_len);
-                if (ti >= 0 && sym_kind[ti] == SK_TYPE) el = sym_arr_el[ti];
+                if (ti >= 0 && sym_kind[ti] == SK_TYPE) {
+                    if (sym_type[ti] == TY_RECORD) { el = TY_RECORD; rec = ti + 1; }
+                    else el = sym_arr_el[ti];
+                }
                 next_token();
             } else {
                 el = parse_type_ref();
@@ -2438,6 +2561,7 @@ static int parse_declaration_ast(void) {
             sym_arr_lo[sym_count-1] = 1;
             sym_arr_hi[sym_count-1] = 0;
             sym_arr_el[sym_count-1] = el;
+            sym_arr_inner_lo[sym_count-1] = rec;
         } else if (tok == TK_RECORD) {
             /* `record F1 : T1; ... end record;` -> a C struct, emitted
                here (records, unlike array/access types, produce C). */
@@ -2452,12 +2576,31 @@ static int parse_declaration_ast(void) {
                 memcpy(fname, tok_val, tok_len);
                 next_token();
                 expect(TK_COLON);
-                int fty = parse_type_ref();
-                emit(" ");
-                emit_c_type(fty);
-                emit(" ");
-                emit_str_lower(fname, fnl);
-                emit(";");
+                /* Access-typed field -> a pointer member (this is what
+                   makes self-referencing records like linked nodes work). */
+                int fti = (tok == TK_IDENT) ? find_sym(tok_val, tok_len) : -1;
+                if (fti >= 0 && sym_kind[fti] == SK_TYPE
+                    && sym_type[fti] == TY_ACCESS) {
+                    emit(" ");
+                    if (sym_arr_el[fti] == TY_RECORD && sym_arr_inner_lo[fti] != 0) {
+                        int ri = sym_arr_inner_lo[fti] - 1;
+                        emit("struct ");
+                        emit_str_lower(sym_name[ri], sym_nlen[ri]);
+                    } else {
+                        emit_c_type(sym_arr_el[fti]);
+                    }
+                    emit(" *");
+                    emit_str_lower(fname, fnl);
+                    emit(";");
+                    next_token();
+                } else {
+                    int fty = parse_type_ref();
+                    emit(" ");
+                    emit_c_type(fty);
+                    emit(" ");
+                    emit_str_lower(fname, fnl);
+                    emit(";");
+                }
                 expect(TK_SEMI);
             }
             emit_line(" };");
@@ -2579,6 +2722,23 @@ static int parse_declaration_ast(void) {
             add_sym(SK_PROC, 0);
             if (cur_pkg) sym_arr_lo[sym_count-1] = cur_pkg;
             next_token();
+
+            /* Generic instantiation: the only supported generic is
+                   procedure Free is new Ada.Unchecked_Deallocation (T, PT);
+               Tagged via sym_arr_hi = 1; a call `Free (P);` then emits
+               `free(p); p = NULL;`. No C is emitted here. */
+            if (tok == TK_IS) {
+                LexState s;
+                save_lex(&s);
+                next_token();
+                if (tok == TK_NEW) {
+                    while (tok != TK_SEMI && tok != TK_EOF) next_token();
+                    expect(TK_SEMI);
+                    sym_arr_hi[sym_count-1] = 1;   /* free-proc tag */
+                    return 0;
+                }
+                restore_lex(&s);
+            }
 
             emit("void ");
             emit_sub_name(pname, plen);
@@ -2892,6 +3052,35 @@ static int parse_declaration_ast(void) {
                 int tidx = find_sym(tok_val, tok_len);
                 if (tidx >= 0 && sym_kind[tidx] == SK_TYPE && sym_type[tidx] == TY_ACCESS) {
                     int el = sym_arr_el[tidx];
+                    int rec = sym_arr_inner_lo[tidx];   /* rec sym idx + 1, 0 = none */
+                    if (el == TY_RECORD && rec != 0) {
+                        /* Access-to-record: `struct <rec> *name`. Registered
+                           TY_ACCESS (not TY_ARRAY) so `.field` resolves to
+                           `->` instead of the indexing machinery. */
+                        if (is_const) add_sym(SK_CONST, TY_ACCESS);
+                        else add_sym(SK_VAR, TY_ACCESS);
+                        sym_arr_lo[sym_count-1] = 1;
+                        sym_arr_hi[sym_count-1] = 0;
+                        sym_arr_el[sym_count-1] = TY_RECORD;
+                        sym_arr_inner_lo[sym_count-1] = rec;
+                        memcpy(sym_name[sym_count-1], vname, vlen);
+                        sym_nlen[sym_count-1] = vlen;
+
+                        n = new_node(D_VAR_ACCESS);
+                        n_str_off[n] = pool_str(vname, vlen);
+                        n_str_len[n] = vlen;
+                        n_op[n] = is_const;
+                        n_aux1[n] = TY_RECORD;
+                        n_arg2[n] = pool_str(sym_name[rec-1], sym_nlen[rec-1]);
+                        n_int[n] = sym_nlen[rec-1];      /* record type name */
+                        next_token();
+                        if (tok == TK_ASSIGN) {
+                            next_token();
+                            n_left[n] = parse_expression_ast();   /* e.g. new Node */
+                        }
+                        expect(TK_SEMI);
+                        return n;
+                    }
                     if (is_const) add_sym(SK_CONST, TY_ARRAY);
                     else add_sym(SK_VAR, TY_ARRAY);
                     sym_arr_lo[sym_count-1] = 1;

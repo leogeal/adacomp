@@ -442,8 +442,35 @@ Started.
   alternatives + integer case with others) -> weekday/weekend/two or
   three; stage1 byte-identical to bootstrap; verify passes. Deferred:
   range choices (`when 1 .. 5 =>`).
-- [ ] Access types beyond the buffer-growth subset (`.all`, general
-  allocators), deallocation.
+- [x] **Access types v2 (records, .all, deallocation).** Access-to-record
+  types with implicit dereference — the shape linked lists and trees
+  need. `type Node;` (incomplete declaration, assumed record),
+  `type Node_Ptr is access Node;`, access-typed record fields
+  (`Next : Node_Ptr;` -> `struct node *next;` — self-reference works
+  because C structs don't need a forward declaration for pointer
+  members), `P : Node_Ptr := new Node;` -> `struct node *p =
+  calloc(1, sizeof(struct node))` (zeroed, matching the compiler's
+  zero-default convention), `P.Field` -> `p->field` (read and write),
+  `P.all` -> `(*p)` including `P.all := e;` -> `*p = e;` for scalar
+  access types, `null` as an expression (-> 0) so `P := null` and
+  `P /= null` work, and `procedure Free is new
+  Ada.Unchecked_Deallocation (T, PT);` whose call `Free (P);` emits
+  `free(p); p = NULL;` (the only supported generic instantiation,
+  tagged in the symbol table; matches Ada's null-out post-condition).
+  Access-to-record variables register as TY_ACCESS so `.` resolves to
+  `->` instead of the array-indexing machinery; access-to-array keeps
+  its v1 TY_ARRAY modelling. New node kinds A_ALL / S_ALL_ASSIGN /
+  S_FREE; `.all` after an access-to-array value is disambiguated by a
+  one-token lookahead (all_follows_dot). Both compilers; fixture
+  `access_records.adb` (build a 3-node list by head insertion, traverse
+  and sum, free it node by node, then a scalar Int_Ptr with .all
+  arithmetic and Free) -> 3 / 2 / 1 / 6 / freed / 42 / int freed.
+  Stage1 byte-identical to the bootstrap; verify passes; 27/27 fixtures
+  under both compilers. Deferred: initialized allocators
+  (`new T'(...)`), access-to-subprogram, `.all` on record access values
+  (`P.all.Field` — use `P.Field`), general access (`'Access` /
+  `'Unchecked_Access`), and dereference null-checks (a null `P.Field`
+  is a C segfault, not Constraint_Error).
 - [x] **Exceptions (v1).** `Name : exception;` declarations, `raise E`,
   bare `raise;` (re-raise), and `begin ... exception when E1 | E2 => ...
   when others => ... end` handlers on block statements, subprogram
