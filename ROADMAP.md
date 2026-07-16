@@ -542,10 +542,22 @@ Started.
   bootstrap; verify passes; 24/24 fixtures under both compilers.
   Deferred: dynamic / named-constant bounds (bounds must be static
   integer literals); range checks on parameter passing and subtype
-  conversions; ranged subtypes of enum / character types; `Natural` /
-  `Positive` implicit constraints; `'First` / `'Last` / `'Range` on
-  subtypes; initializer checks on main-level locals (emitted as C
-  globals, so the check is skipped there).
+  conversions; ranged subtypes of enum / character types; `'First` /
+  `'Last` / `'Range` on subtypes; initializer checks on main-level
+  locals (emitted as C globals, so the check is skipped there).
+- [x] **Natural / Positive implicit constraints.** `Natural` and
+  `Positive` are now real tokens carrying their implicit ranges
+  (0 .. Integer'Last and 1 .. Integer'Last) through the existing
+  sym_has_range machinery: variables of either type get
+  Constraint_Error checks on assignment, `subtype S is Natural;`
+  inherits the range (an explicit `range L .. H` on either base wins),
+  and they are accepted everywhere Integer is (parameters, record
+  fields, `array (Positive range <>)`, `Natural'Image`). Both
+  compilers; fixture `natural_positive.adb` (in-range arithmetic, a
+  Natural underflow to -1 and a Positive underflow to 0 both caught) ->
+  10 / 3 / 5 / natural underflow / positive underflow / 10 / 3.
+  Stage1 byte-identical to the bootstrap; verify passes; 30/30
+  fixtures under both compilers.
 - [x] **Array index bounds checks (v1).** Indexing a fixed-size array —
   on read (`A (I)`), 2D read (`M (I)(J)`), and write (`A (I) := ...`) —
   now emits `ada_range_check(idx, lo, hi)` against the array's

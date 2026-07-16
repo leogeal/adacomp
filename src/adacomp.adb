@@ -97,6 +97,8 @@ procedure Adacomp is
    TK_BAR       : constant Integer := 81;
    TK_EXCEPTION : constant Integer := 82;
    TK_SUBTYPE   : constant Integer := 83;
+   TK_NATURAL   : constant Integer := 84;
+   TK_POSITIVE  : constant Integer := 85;
 
    -- Current token
    type Tok_Buffer is array (1 .. 4096) of Character;
@@ -522,8 +524,8 @@ procedure Adacomp is
       if Tok_Eq_CI ("raise") then return TK_RAISE; end if;
       if Tok_Eq_CI ("exception") then return TK_EXCEPTION; end if;
       if Tok_Eq_CI ("Integer") then return TK_INTEGER; end if;
-      if Tok_Eq_CI ("Natural") then return TK_INTEGER; end if;
-      if Tok_Eq_CI ("Positive") then return TK_INTEGER; end if;
+      if Tok_Eq_CI ("Natural") then return TK_NATURAL; end if;
+      if Tok_Eq_CI ("Positive") then return TK_POSITIVE; end if;
       if Tok_Eq_CI ("Character") then return TK_CHARACTER; end if;
       if Tok_Eq_CI ("Boolean") then return TK_BOOLEAN; end if;
       if Tok_Eq_CI ("String") then return TK_STRING; end if;
@@ -1470,6 +1472,9 @@ procedure Adacomp is
       if Tok = TK_INTEGER then
          Next_Token;
          return TY_INTEGER;
+      elsif Tok = TK_NATURAL or Tok = TK_POSITIVE then
+         Next_Token;
+         return TY_INTEGER;
       elsif Tok = TK_CHARACTER then
          Next_Token;
          return TY_CHARACTER;
@@ -1643,7 +1648,9 @@ procedure Adacomp is
          Expect (TK_RPAREN);
          return N;
       end if;
-      if Tok = TK_INTEGER or Tok = TK_CHARACTER or Tok = TK_BOOLEAN then
+      if Tok = TK_INTEGER or Tok = TK_NATURAL or Tok = TK_POSITIVE
+         or Tok = TK_CHARACTER or Tok = TK_BOOLEAN
+      then
          -- Type-name attribute: Integer'Image (X), Character'Pos/Val (X)
          Next_Token;
          if Tok /= TK_TICK then Error ("expected ' after type name"); end if;
@@ -3532,7 +3539,9 @@ procedure Adacomp is
          if Tok = TK_ARRAY then
             Next_Token;
             Expect (TK_LPAREN);
-            if Tok = TK_INTEGER or Tok = TK_CHARACTER or Tok = TK_BOOLEAN then
+            if Tok = TK_INTEGER or Tok = TK_NATURAL or Tok = TK_POSITIVE
+               or Tok = TK_CHARACTER or Tok = TK_BOOLEAN
+            then
                -- Unconstrained: `array (Index range <>) of Elem`. hi=0
                -- marks "no fixed size"; only used as an access target.
                declare
@@ -3753,6 +3762,18 @@ procedure Adacomp is
             Next_Token;                  -- subtype name
             Expect (TK_IS);
             if Tok = TK_INTEGER then
+               Next_Token;
+            elsif Tok = TK_NATURAL then
+               -- base Natural: inherit 0 .. Integer'Last (an explicit
+               -- `range L .. H` below overrides it).
+               Sym_Has_Range (Sym_Count) := 1;
+               Sym_Range_Lo (Sym_Count) := 0;
+               Sym_Range_Hi (Sym_Count) := 2147483647;
+               Next_Token;
+            elsif Tok = TK_POSITIVE then
+               Sym_Has_Range (Sym_Count) := 1;
+               Sym_Range_Lo (Sym_Count) := 1;
+               Sym_Range_Hi (Sym_Count) := 2147483647;
                Next_Token;
             elsif Tok = TK_IDENT then
                Next_Token;               -- a base subtype name
@@ -4386,18 +4407,25 @@ procedure Adacomp is
 
             -- Generic typed variable (Integer/Character/Boolean keyword),
             -- with an optional `range L .. H` constraint on Integer.
-            Typ := Parse_Type_Ref;
+            -- Natural / Positive carry their implicit range (an explicit
+            -- range wins).
             declare
+               Base_Tok : Integer := Tok;
                Rlo   : Integer := 0;
                Rhi   : Integer := 0;
                Has_R : Boolean := False;
             begin
+               Typ := Parse_Type_Ref;
                if Typ = TY_INTEGER and then Tok = TK_RANGE then
                   Next_Token;
                   Rlo := Parse_Range_Bound;
                   Expect (TK_DOTDOT);
                   Rhi := Parse_Range_Bound;
                   Has_R := True;
+               elsif Base_Tok = TK_NATURAL then
+                  Has_R := True; Rlo := 0; Rhi := 2147483647;
+               elsif Base_Tok = TK_POSITIVE then
+                  Has_R := True; Rlo := 1; Rhi := 2147483647;
                end if;
                if Is_Const then
                   Add_Sym_Named (Var_Name, Var_Len, SK_CONST, Typ);

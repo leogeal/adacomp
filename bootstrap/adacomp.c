@@ -44,7 +44,7 @@ enum {
     TK_STRING=70, TK_REVERSE=71, TK_TICK=72,
     TK_ACCESS=73, TK_NEW=74, TK_RANGE=75, TK_BOX=76, TK_RECORD=77,
     TK_PACKAGE=78, TK_CASE=79, TK_ARROW=80, TK_BAR=81, TK_EXCEPTION=82,
-    TK_SUBTYPE=83
+    TK_SUBTYPE=83, TK_NATURAL=84, TK_POSITIVE=85
 };
 
 /* Current token */
@@ -273,8 +273,8 @@ static int check_keyword(void) {
     if (tok_eq_ci("declare")) return TK_DECLARE;
     if (tok_eq_ci("raise")) return TK_RAISE;
     if (tok_eq_ci("exception")) return TK_EXCEPTION;
-    if (tok_eq_ci("Natural")) return TK_INTEGER;
-    if (tok_eq_ci("Positive")) return TK_INTEGER;
+    if (tok_eq_ci("Natural")) return TK_NATURAL;
+    if (tok_eq_ci("Positive")) return TK_POSITIVE;
     if (tok_eq_ci("String")) return TK_STRING;
     if (tok_eq_ci("Program_Error")) return TK_IDENT;
     return TK_IDENT;
@@ -828,6 +828,7 @@ static void emit_declaration_chain(int head);
 /* ---- Type reference ---- */
 static int parse_type_ref(void) {
     if (tok == TK_INTEGER) { next_token(); return TY_INTEGER; }
+    if (tok == TK_NATURAL || tok == TK_POSITIVE) { next_token(); return TY_INTEGER; }
     if (tok == TK_CHARACTER) { next_token(); return TY_CHARACTER; }
     if (tok == TK_BOOLEAN) { next_token(); return TY_BOOLEAN; }
     if (tok == TK_STRING) { next_token(); return TY_STRING; }
@@ -994,7 +995,8 @@ static int parse_primary_ast(void) {
         expect(TK_RPAREN);
         return n;
     }
-    if (tok == TK_INTEGER || tok == TK_CHARACTER || tok == TK_BOOLEAN) {
+    if (tok == TK_INTEGER || tok == TK_NATURAL || tok == TK_POSITIVE
+        || tok == TK_CHARACTER || tok == TK_BOOLEAN) {
         /* Type-name attribute: Integer'Image (X), Character'Pos (X), Character'Val (X). */
         next_token();
         if (tok != TK_TICK) error("expected ' after type name");
@@ -2562,7 +2564,8 @@ static int parse_declaration_ast(void) {
         if (tok == TK_ARRAY) {
             next_token();
             expect(TK_LPAREN);
-            if (tok == TK_INTEGER || tok == TK_CHARACTER || tok == TK_BOOLEAN) {
+            if (tok == TK_INTEGER || tok == TK_NATURAL || tok == TK_POSITIVE
+                || tok == TK_CHARACTER || tok == TK_BOOLEAN) {
                 /* Unconstrained: `array (Index range <>) of Elem`. The
                    hi=0 marker says "no fixed size"; such a type is only
                    used as the target of an access type. */
@@ -2742,6 +2745,19 @@ static int parse_declaration_ast(void) {
         next_token();                   /* subtype name */
         expect(TK_IS);
         if (tok == TK_INTEGER) next_token();
+        else if (tok == TK_NATURAL) {
+            /* base Natural: inherit 0 .. Integer'Last (an explicit
+               `range L .. H` below overrides it). */
+            sym_has_range[sym_count-1] = 1;
+            sym_range_lo[sym_count-1] = 0;
+            sym_range_hi[sym_count-1] = 2147483647;
+            next_token();
+        } else if (tok == TK_POSITIVE) {
+            sym_has_range[sym_count-1] = 1;
+            sym_range_lo[sym_count-1] = 1;
+            sym_range_hi[sym_count-1] = 2147483647;
+            next_token();
+        }
         else if (tok == TK_IDENT) next_token();   /* a base subtype name */
         if (tok == TK_RANGE) {
             next_token();
@@ -3298,8 +3314,11 @@ static int parse_declaration_ast(void) {
             }
 
             /* Generic typed variable (Integer / Character / Boolean keyword),
-               with an optional `range L .. H` constraint on Integer. */
+               with an optional `range L .. H` constraint on Integer.
+               Natural / Positive carry their implicit range (an explicit
+               range wins). */
             {
+                int base_tok = tok;
                 int typ = parse_type_ref();
                 int hr = 0, rlo = 0, rhi = 0;
                 if (typ == TY_INTEGER && tok == TK_RANGE) {
@@ -3308,6 +3327,10 @@ static int parse_declaration_ast(void) {
                     expect(TK_DOTDOT);
                     rhi = parse_range_bound();
                     hr = 1;
+                } else if (base_tok == TK_NATURAL) {
+                    hr = 1; rlo = 0; rhi = 2147483647;
+                } else if (base_tok == TK_POSITIVE) {
+                    hr = 1; rlo = 1; rhi = 2147483647;
                 }
                 if (is_const) add_sym(SK_CONST, typ);
                 else add_sym(SK_VAR, typ);
