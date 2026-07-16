@@ -689,7 +689,8 @@ enum {
 
 enum {
     ATTR_IMAGE=1, ATTR_POS=2, ATTR_VAL=3,
-    ATTR_LENGTH=4, ATTR_FIRST=5, ATTR_LAST=6
+    ATTR_LENGTH=4, ATTR_FIRST=5, ATTR_LAST=6,
+    ATTR_SUCC=7, ATTR_PRED=8
 };
 
 /* Sub-ops for S_PKG (dotted Ada.Text_IO.* statement calls). */
@@ -1010,6 +1011,8 @@ static int parse_primary_ast(void) {
         if (attr_len == 5 && strncasecmp(attr, "Image", 5) == 0)      n_op[n] = ATTR_IMAGE;
         else if (attr_len == 3 && strncasecmp(attr, "Pos", 3) == 0)   n_op[n] = ATTR_POS;
         else if (attr_len == 3 && strncasecmp(attr, "Val", 3) == 0)   n_op[n] = ATTR_VAL;
+        else if (attr_len == 4 && strncasecmp(attr, "Succ", 4) == 0)  n_op[n] = ATTR_SUCC;
+        else if (attr_len == 4 && strncasecmp(attr, "Pred", 4) == 0)  n_op[n] = ATTR_PRED;
         else error("unsupported type-name attribute");
         expect(TK_LPAREN);
         n_left[n] = parse_expression_ast();
@@ -1058,6 +1061,21 @@ static int parse_primary_ast(void) {
                     n_op[n] = ATTR_IMAGE;
                     n_str_off[n] = pool_str(saved, saved_len);  /* enum type name */
                     n_str_len[n] = saved_len;
+                    expect(TK_LPAREN);
+                    n_left[n] = parse_expression_ast();
+                    expect(TK_RPAREN);
+                    return n;
+                }
+                if ((attr_len == 4 && strncasecmp(attr, "Succ", 4) == 0)
+                    || (attr_len == 4 && strncasecmp(attr, "Pred", 4) == 0)) {
+                    /* Range-checked against the type's position range, so
+                       T'Succ (T'Last) raises Constraint_Error. */
+                    n = new_node(A_ATTR_TYPE);
+                    n_op[n] = (tolower((unsigned char)attr[0]) == 's')
+                              ? ATTR_SUCC : ATTR_PRED;
+                    n_aux1[n] = 1;                     /* checked */
+                    n_aux2[n] = sym_range_lo[sidx];
+                    n_int[n] = sym_range_hi[sidx];
                     expect(TK_LPAREN);
                     n_left[n] = parse_expression_ast();
                     expect(TK_RPAREN);
@@ -1403,6 +1421,21 @@ static void emit_expression_ast(int n) {
             emit("((char)(");
             emit_expression_ast(n_left[n]);
             emit("))");
+        } else if (n_op[n] == ATTR_SUCC || n_op[n] == ATTR_PRED) {
+            /* n_aux1 = 1: enum, checked against [n_aux2, n_int] */
+            if (n_aux1[n]) {
+                emit("ada_range_check((");
+                emit_expression_ast(n_left[n]);
+                emit(n_op[n] == ATTR_SUCC ? ") + 1, " : ") - 1, ");
+                emit_int(n_aux2[n]);
+                emit(", ");
+                emit_int(n_int[n]);
+                emit(")");
+            } else {
+                emit("((");
+                emit_expression_ast(n_left[n]);
+                emit(n_op[n] == ATTR_SUCC ? ") + 1)" : ") - 1)");
+            }
         }
     } else if (kind == A_ATTR_VAR) {
         if (n_op[n] == ATTR_LENGTH || n_op[n] == ATTR_LAST) {

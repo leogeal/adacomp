@@ -602,8 +602,17 @@ Started.
   GREEN / RED. Stage1 byte-identical to the bootstrap; verify passes;
   26/26 fixtures under both compilers. Deferred: `'Image` on a
   proc-local enum type (would need a hoisted or nested function),
-  `'Succ` / `'Pred`, `'Value` (string -> enum), and range-checking
-  `'Val` itself (only the assignment target is checked).
+  `'Value` (string -> enum), and range-checking `'Val` itself (only
+  the assignment target is checked).
+- [x] **'Succ / 'Pred.** `T'Succ (X)` / `T'Pred (X)` as +1 / -1. On an
+  enum type the result is range-checked against the type's position
+  range, so stepping past `T'Last` / before `T'First` raises
+  Constraint_Error (matching Ada); on Integer (and Natural/Positive /
+  Character / Boolean type names) they are plain unchecked +-1. Both
+  compilers; fixture `succ_pred.adb` (enum walk up and down,
+  Integer'Succ/'Pred, both out-of-range edges caught) -> BLUE / RED /
+  11 / 10 / pred out of range / succ out of range / BLUE. Stage1
+  byte-identical to the bootstrap; verify passes; 32/32 fixtures.
 
 ### Phases 3–7
 

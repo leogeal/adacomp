@@ -246,6 +246,8 @@ procedure Adacomp is
    ATTR_LENGTH : constant Integer := 4;
    ATTR_FIRST  : constant Integer := 5;
    ATTR_LAST   : constant Integer := 6;
+   ATTR_SUCC   : constant Integer := 7;
+   ATTR_PRED   : constant Integer := 8;
 
    -- Statement-leaf AST node kinds.
    S_NULL         : constant Integer := 20;
@@ -1673,6 +1675,10 @@ procedure Adacomp is
                N_Op (N) := ATTR_POS;
             elsif Name_Eq (Attr, Attr_Len, "Val") then
                N_Op (N) := ATTR_VAL;
+            elsif Name_Eq (Attr, Attr_Len, "Succ") then
+               N_Op (N) := ATTR_SUCC;
+            elsif Name_Eq (Attr, Attr_Len, "Pred") then
+               N_Op (N) := ATTR_PRED;
             else
                Error ("unsupported type-name attribute");
             end if;
@@ -1732,6 +1738,24 @@ procedure Adacomp is
                      N_Op (N) := ATTR_IMAGE;
                      N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
                      N_Str_Len (N) := Saved_Len;
+                     Expect (TK_LPAREN);
+                     N_Left (N) := Parse_Expression_AST;
+                     Expect (TK_RPAREN);
+                     return N;
+                  elsif Name_Eq (Attr, Attr_Len, "Succ")
+                     or else Name_Eq (Attr, Attr_Len, "Pred")
+                  then
+                     -- Range-checked against the type's position range,
+                     -- so T'Succ (T'Last) raises Constraint_Error.
+                     N := New_Node (A_ATTR_TYPE);
+                     if Name_Eq (Attr, Attr_Len, "Succ") then
+                        N_Op (N) := ATTR_SUCC;
+                     else
+                        N_Op (N) := ATTR_PRED;
+                     end if;
+                     N_Aux1 (N) := 1;                  -- checked
+                     N_Aux2 (N) := Sym_Range_Lo (Sym_Idx);
+                     N_Int (N) := Sym_Range_Hi (Sym_Idx);
                      Expect (TK_LPAREN);
                      N_Left (N) := Parse_Expression_AST;
                      Expect (TK_RPAREN);
@@ -2161,6 +2185,29 @@ procedure Adacomp is
             Emit ("((char)(");
             Emit_Expression_AST (N_Left (N));
             Emit ("))");
+         elsif N_Op (N) = ATTR_SUCC or N_Op (N) = ATTR_PRED then
+            -- N_Aux1 = 1: enum, checked against [N_Aux2, N_Int]
+            if N_Aux1 (N) = 1 then
+               Emit ("ada_range_check((");
+               Emit_Expression_AST (N_Left (N));
+               if N_Op (N) = ATTR_SUCC then
+                  Emit (") + 1, ");
+               else
+                  Emit (") - 1, ");
+               end if;
+               Emit_Int (N_Aux2 (N));
+               Emit (", ");
+               Emit_Int (N_Int (N));
+               Emit (")");
+            else
+               Emit ("((");
+               Emit_Expression_AST (N_Left (N));
+               if N_Op (N) = ATTR_SUCC then
+                  Emit (") + 1)");
+               else
+                  Emit (") - 1)");
+               end if;
+            end if;
          end if;
       elsif Kind = A_ATTR_VAR then
          if N_Op (N) = ATTR_LENGTH or N_Op (N) = ATTR_LAST then
