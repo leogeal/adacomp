@@ -219,6 +219,8 @@ procedure Adacomp is
    A_NEW       : constant Integer := 14;
    A_FIELD     : constant Integer := 15;
    A_ALL       : constant Integer := 16;
+   --  Case range choice `when lo .. hi =>`; only appears in case arms.
+   A_RANGE     : constant Integer := 17;
 
    -- Operator codes (for UNARY / BINARY)
    OP_ADD : constant Integer := 1;
@@ -2421,7 +2423,14 @@ procedure Adacomp is
                   C := N_First (Arm);
                   while C /= 0 loop
                      Emit_Indent; Emit ("case ");
-                     Emit_Expression_AST (C);
+                     if N_Kind (C) = A_RANGE then
+                        -- GNU C case range (gcc and clang both accept it)
+                        Emit_Expression_AST (N_Left (C));
+                        Emit (" ... ");
+                        Emit_Expression_AST (N_Right (C));
+                     else
+                        Emit_Expression_AST (C);
+                     end if;
                      if N_Next (C) = 0 then
                         Emit_Ln (": {");
                      else
@@ -2746,6 +2755,23 @@ procedure Adacomp is
          or else Name_Eq (S, Len, "Create");
    end Is_Textio_Sub;
 
+   -- One case-arm choice: an expression, or a range choice `lo .. hi`
+   -- (an A_RANGE node, emitted as a GNU C case range `case lo ... hi:`).
+   function Parse_Case_Choice return Integer is
+      C : Integer;
+      R : Integer;
+   begin
+      C := Parse_Expression_AST;
+      if Tok = TK_DOTDOT then
+         Next_Token;
+         R := New_Node (A_RANGE);
+         N_Left (R) := C;
+         N_Right (R) := Parse_Expression_AST;
+         return R;
+      end if;
+      return C;
+   end Parse_Case_Choice;
+
    function Parse_Statement_AST return Integer is
       N : Integer;
       Saved : Tok_Buffer;
@@ -2868,12 +2894,12 @@ procedure Adacomp is
                      Prev_C  : Integer;
                      C       : Integer;
                   begin
-                     First_C := Parse_Expression_AST;
+                     First_C := Parse_Case_Choice;
                      N_First (Arm) := First_C;
                      Prev_C := First_C;
                      while Tok = TK_BAR loop
                         Next_Token;
-                        C := Parse_Expression_AST;
+                        C := Parse_Case_Choice;
                         N_Next (Prev_C) := C;
                         Prev_C := C;
                      end loop;

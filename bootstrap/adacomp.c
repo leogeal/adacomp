@@ -654,6 +654,7 @@ enum {
     A_INDEX=8, A_INDEX2=9,
     A_CALL=10, A_DOTTED=11,
     A_ATTR_TYPE=12, A_ATTR_VAR=13, A_NEW=14, A_FIELD=15, A_ALL=16,
+    A_RANGE=17,   /* case range choice `when lo .. hi =>`; only in case arms */
     /* Statement leaf nodes. Compound (if/while/for/loop/declare/begin) and
        dotted-package statements still emit directly; they'll become full
        AST nodes once declarations are AST-driven (step 4). */
@@ -1649,7 +1650,14 @@ static void emit_statement_ast(int n) {
             } else {
                 for (int c = n_first[arm]; c != 0; c = n_next[c]) {
                     emit_indent(); emit("case ");
-                    emit_expression_ast(c);
+                    if (n_kind[c] == A_RANGE) {
+                        /* GNU C case range (gcc and clang both accept it) */
+                        emit_expression_ast(n_left[c]);
+                        emit(" ... ");
+                        emit_expression_ast(n_right[c]);
+                    } else {
+                        emit_expression_ast(c);
+                    }
                     if (n_next[c] == 0) emit_line(": {");
                     else emit_line(":");
                 }
@@ -1908,6 +1916,20 @@ static int build_pkg_stmt(const char *saved, int saved_len,
     return n;
 }
 
+/* One case-arm choice: an expression, or a range choice `lo .. hi`
+   (an A_RANGE node, emitted as a GNU C case range `case lo ... hi:`). */
+static int parse_case_choice(void) {
+    int c = parse_expression_ast();
+    if (tok == TK_DOTDOT) {
+        next_token();
+        int r = new_node(A_RANGE);
+        n_left[r] = c;
+        n_right[r] = parse_expression_ast();
+        return r;
+    }
+    return c;
+}
+
 /* The statement-level Text_IO builtins that `use Ada.Text_IO;` makes
    visible without a prefix. */
 static int is_textio_sub(const char *s, int len) {
@@ -2011,12 +2033,12 @@ static int parse_statement_ast(void) {
                 n_op[arm] = 1;                 /* default: */
                 next_token();
             } else {
-                int first_c = parse_expression_ast();
+                int first_c = parse_case_choice();
                 n_first[arm] = first_c;
                 int prev_c = first_c;
                 while (tok == TK_BAR) {
                     next_token();
-                    int c = parse_expression_ast();
+                    int c = parse_case_choice();
                     n_next[prev_c] = c;
                     prev_c = c;
                 }

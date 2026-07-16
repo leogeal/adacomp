@@ -440,8 +440,14 @@ Started.
   arm bodies reuse the statement-chain parser (it already stops at
   `when`/`end`). Both compilers; fixture `case_stmt.adb` (enum case with
   alternatives + integer case with others) -> weekday/weekend/two or
-  three; stage1 byte-identical to bootstrap; verify passes. Deferred:
-  range choices (`when 1 .. 5 =>`).
+  three; stage1 byte-identical to bootstrap; verify passes.
+- [x] **Case range choices.** `when 1 .. 5 =>` (also mixed with
+  alternatives: `when 11 .. 20 | 30 .. 40 =>`) via a new A_RANGE choice
+  node emitted as a GNU C case range (`case 1 ... 5:` — gcc and clang
+  both accept it, warning-free without -pedantic). Both compilers;
+  fixture `case_ranges.adb` -> low / even-ish / odd-ish / teens or
+  thirties (x2) / other. Stage1 byte-identical to the bootstrap;
+  verify passes; 31/31 fixtures under both compilers.
 - [x] **Access types v2 (records, .all, deallocation).** Access-to-record
   types with implicit dereference — the shape linked lists and trees
   need. `type Node;` (incomplete declaration, assumed record),
