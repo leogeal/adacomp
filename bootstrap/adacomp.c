@@ -2585,14 +2585,45 @@ static void emit_declaration_ast(int n) {
 }
 
 /* Parse one bound of a range constraint: an optionally-signed integer
-   literal. (v1 restricts bounds to static literals; named-constant and
-   dynamic bounds are deferred.) */
+   literal, or an integer constant whose value is statically known
+   (recorded at its declaration by record_const_value). */
 static int parse_range_bound(void) {
     int neg = 0;
     if (tok == TK_MINUS) { neg = 1; next_token(); }
-    int v = tok_int;
+    int v;
+    if (tok == TK_IDENT) {
+        int idx = find_sym(tok_val, tok_len);
+        if (idx >= 0 && sym_kind[idx] == SK_CONST && sym_arr_inner_hi[idx] == 1)
+            v = sym_arr_el[idx];
+        else {
+            error("range bound must be an integer literal or constant");
+            v = 0;
+        }
+    } else {
+        v = tok_int;
+    }
     next_token();
     return neg ? -v : v;
+}
+
+/* If the just-declared constant (sym_count-1) is initialized with an
+   integer literal (or a negated one), record its compile-time value —
+   sym_arr_el = value, sym_arr_inner_hi = 1 as the value-known flag
+   (both otherwise unused on scalar constants) — so it can serve as a
+   range or array bound. */
+static void record_const_value(int init) {
+    if (init == 0) return;
+    int v, known = 0;
+    if (n_kind[init] == A_INT_LIT) {
+        v = n_int[init]; known = 1;
+    } else if (n_kind[init] == A_UNARY && n_op[init] == OP_NEG
+               && n_left[init] != 0 && n_kind[n_left[init]] == A_INT_LIT) {
+        v = -n_int[n_left[init]]; known = 1;
+    }
+    if (known) {
+        sym_arr_el[sym_count-1] = v;
+        sym_arr_inner_hi[sym_count-1] = 1;
+    }
 }
 
 /* Parse one declaration. Variable declarations become AST nodes; type
@@ -2634,16 +2665,16 @@ static int parse_declaration_ast(void) {
                 sym_arr_hi[sym_count-1] = 0;
                 sym_arr_el[sym_count-1] = el;
             } else {
-                int lo = tok_int; next_token();
+                int lo = parse_range_bound();
                 expect(TK_DOTDOT);
-                int hi = tok_int; next_token();
+                int hi = parse_range_bound();
                 if (tok == TK_COMMA) {
                     /* 2D form (1..N, 1..M) — second dim parsed but not
                        tracked separately. */
                     next_token();
-                    next_token();
+                    parse_range_bound();
                     expect(TK_DOTDOT);
-                    next_token();
+                    parse_range_bound();
                     expect(TK_RPAREN);
                     expect(TK_OF);
                     int el = parse_type_ref();
@@ -3101,9 +3132,9 @@ static int parse_declaration_ast(void) {
             if (tok == TK_ARRAY) {
                 next_token();
                 expect(TK_LPAREN);
-                int lo = tok_int; next_token();
+                int lo = parse_range_bound();
                 expect(TK_DOTDOT);
-                int hi = tok_int; next_token();
+                int hi = parse_range_bound();
                 expect(TK_RPAREN);
                 expect(TK_OF);
                 int el_type = TY_INTEGER;
@@ -3363,6 +3394,7 @@ static int parse_declaration_ast(void) {
                 if (tok == TK_ASSIGN) {
                     next_token();
                     n_left[n] = parse_expression_ast();
+                    if (is_const) record_const_value(n_left[n]);
                 }
                 expect(TK_SEMI);
                 return n;
@@ -3407,6 +3439,7 @@ static int parse_declaration_ast(void) {
                 if (tok == TK_ASSIGN) {
                     next_token();
                     n_left[n] = parse_expression_ast();
+                    if (is_const) record_const_value(n_left[n]);
                 }
                 expect(TK_SEMI);
                 return n;

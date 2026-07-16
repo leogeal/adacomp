@@ -3573,13 +3573,27 @@ procedure Adacomp is
    -- literal. (v1 restricts bounds to static literals.)
    function Parse_Range_Bound return Integer is
       Neg : Boolean := False;
-      V   : Integer;
+      V   : Integer := 0;
+      Idx : Integer;
    begin
       if Tok = TK_MINUS then
          Neg := True;
          Next_Token;
       end if;
-      V := Tok_Int;
+      if Tok = TK_IDENT then
+         --  An integer constant whose value is statically known
+         --  (recorded at its declaration by Record_Const_Value).
+         Idx := Find_Sym (Tok_Val, Tok_Len);
+         if Idx > 0 and then Sym_Kind (Idx) = SK_CONST
+            and then Sym_Arr_Inner_Hi (Idx) = 1
+         then
+            V := Sym_Arr_El (Idx);
+         else
+            Error ("range bound must be an integer literal or constant");
+         end if;
+      else
+         V := Tok_Int;
+      end if;
       Next_Token;
       if Neg then
          return -V;
@@ -3587,6 +3601,32 @@ procedure Adacomp is
          return V;
       end if;
    end Parse_Range_Bound;
+
+   -- If the just-declared constant (Sym_Count) is initialized with an
+   -- integer literal (or a negated one), record its compile-time value —
+   -- Sym_Arr_El = value, Sym_Arr_Inner_Hi = 1 as the value-known flag
+   -- (both otherwise unused on scalar constants) — so it can serve as a
+   -- range or array bound.
+   procedure Record_Const_Value (Init : Integer) is
+      V     : Integer := 0;
+      Known : Boolean := False;
+   begin
+      if Init = 0 then return; end if;
+      if N_Kind (Init) = A_INT_LIT then
+         V := N_Int (Init);
+         Known := True;
+      elsif N_Kind (Init) = A_UNARY and then N_Op (Init) = OP_NEG
+         and then N_Left (Init) /= 0
+         and then N_Kind (N_Left (Init)) = A_INT_LIT
+      then
+         V := -N_Int (N_Left (Init));
+         Known := True;
+      end if;
+      if Known then
+         Sym_Arr_El (Sym_Count) := V;
+         Sym_Arr_Inner_Hi (Sym_Count) := 1;
+      end if;
+   end Record_Const_Value;
 
    function Parse_Declaration_AST return Integer is
       Var_Name : Tok_Buffer;
@@ -3636,16 +3676,17 @@ procedure Adacomp is
                   Hi : Integer := 0;
                   El : Integer;
                begin
-                  if Tok = TK_INT_LIT then Lo := Tok_Int; end if;
-                  Next_Token;
+                  Lo := Parse_Range_Bound;
                   Expect (TK_DOTDOT);
-                  if Tok = TK_INT_LIT then Hi := Tok_Int; end if;
-                  Next_Token;
+                  Hi := Parse_Range_Bound;
                   if Tok = TK_COMMA then
+                     -- 2D form (1..N, 1..M) — second dim parsed but not
+                     -- tracked separately. (El is reassigned by the
+                     -- Parse_Type_Ref below, so it doubles as scratch.)
                      Next_Token;
-                     if Tok = TK_INT_LIT then Next_Token; end if;
+                     El := Parse_Range_Bound;
                      Expect (TK_DOTDOT);
-                     if Tok = TK_INT_LIT then Next_Token; end if;
+                     El := Parse_Range_Bound;
                   end if;
                   Expect (TK_RPAREN);
                   Expect (TK_OF);
@@ -4177,11 +4218,9 @@ procedure Adacomp is
                   Is_Nested : Boolean := False;
                   Tidx : Integer;
                begin
-                  if Tok = TK_INT_LIT then Lo := Tok_Int; end if;
-                  Next_Token;
+                  Lo := Parse_Range_Bound;
                   Expect (TK_DOTDOT);
-                  if Tok = TK_INT_LIT then Hi := Tok_Int; end if;
-                  Next_Token;
+                  Hi := Parse_Range_Bound;
                   Expect (TK_RPAREN);
                   Expect (TK_OF);
                   if Tok = TK_IDENT then
@@ -4472,6 +4511,7 @@ procedure Adacomp is
                   if Tok = TK_ASSIGN then
                      Next_Token;
                      N_Left (N) := Parse_Expression_AST;
+                     if Is_Const then Record_Const_Value (N_Left (N)); end if;
                   end if;
                   Expect (TK_SEMI);
                   return N;
@@ -4521,6 +4561,7 @@ procedure Adacomp is
                if Tok = TK_ASSIGN then
                   Next_Token;
                   N_Left (N) := Parse_Expression_AST;
+                  if Is_Const then Record_Const_Value (N_Left (N)); end if;
                end if;
                Expect (TK_SEMI);
                return N;

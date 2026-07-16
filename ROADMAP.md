@@ -546,11 +546,30 @@ Started.
   out-of-range assigns caught by handlers) -> 5 / 10 / 75 / 100 / x out
   of range / z out of range / 10. Stage1 byte-identical to the
   bootstrap; verify passes; 24/24 fixtures under both compilers.
-  Deferred: dynamic / named-constant bounds (bounds must be static
-  integer literals); range checks on parameter passing and subtype
-  conversions; ranged subtypes of enum / character types; `'First` /
-  `'Last` / `'Range` on subtypes; initializer checks on main-level
-  locals (emitted as C globals, so the check is skipped there).
+  Deferred: dynamic bounds; range checks on parameter passing and
+  subtype conversions; ranged subtypes of enum / character types;
+  `'First` / `'Last` / `'Range` on subtypes; initializer checks on
+  main-level locals (emitted as C globals, so the check is skipped
+  there).
+- [x] **Named-constant range and array bounds.** An integer constant
+  initialized with a literal (`Max : constant Integer := 10;`, negated
+  literals too) records its compile-time value in the symbol table
+  (sym_arr_el + a value-known flag in sym_arr_inner_hi), and
+  parse_range_bound accepts such constants wherever it accepts
+  literals: subtype ranges (`range 1 .. Max`, `range Low .. Max`),
+  inline variable ranges, and — array bounds now also go through
+  parse_range_bound — array type and anonymous-array bounds
+  (`array (1 .. Max) of ...`). Unknown identifiers in bounds now get a
+  proper diagnostic instead of a silent misparse. Both compilers;
+  fixture `const_bounds.adb` (constant-bounded subtypes incl. a
+  negative bound, a constant-sized array filled and indexed at Max,
+  out-of-range on both edges caught) -> 10 / -3 / -5 / 10 / above max
+  / below low / 10. Stage1 byte-identical to the bootstrap; verify
+  passes; 33/33 fixtures under both compilers. Deferred: constants
+  initialized with expressions (`Max2 : constant Integer := Max + 1;`
+  — only plain literals record a value), and named constants in case
+  choices (they emit as C `const int` variables, which C rejects as
+  case labels; would need the recorded value substituted at emit).
 - [x] **Natural / Positive implicit constraints.** `Natural` and
   `Positive` are now real tokens carrying their implicit ranges
   (0 .. Integer'Last and 1 .. Integer'Last) through the existing
