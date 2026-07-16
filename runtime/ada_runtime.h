@@ -86,4 +86,17 @@ static int ada_range_check(int v, int lo, int hi) {
     return v;
 }
 
+/* String concatenation (`&`). Rotating static buffers so nested
+   concatenations like a & b & c each get their own storage; the result
+   is consumed (printed / re-concatenated) before eight more concats
+   can occur. */
+static char *ada_cat(const char *a, const char *b) {
+    static char bufs[8][4096];
+    static int cur = 0;
+    char *buf = bufs[cur];
+    cur = (cur + 1) % 8;
+    snprintf(buf, sizeof(bufs[0]), "%s%s", a, b);
+    return buf;
+}
+
 #endif

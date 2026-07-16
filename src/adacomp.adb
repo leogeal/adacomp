@@ -186,6 +186,20 @@ procedure Adacomp is
    -- Put / New_Line / ... statements then resolve to the Text_IO builtins.
    Use_Text_IO : Boolean := False;
 
+   -- Default parameter values. Each procedure's parameters get one slot
+   -- (positional): kind 0 = no default, 1 = integer literal (value in
+   -- Def_Val), 2 = a named constant such as an enum literal (name in
+   -- Name_Pool at Def_NOff/Def_NLen). The proc symbol stores its
+   -- parameter count in Sym_Arr_El and its base slot + 1 in
+   -- Sym_Arr_Inner_Lo (both otherwise unused on SK_PROC); call sites
+   -- append omitted trailing arguments from here.
+   Def_Kind  : Int_Vec_Ptr;
+   Def_Val   : Int_Vec_Ptr;
+   Def_NOff  : Int_Vec_Ptr;
+   Def_NLen  : Int_Vec_Ptr;
+   Def_Cap   : Integer := 0;
+   Def_Count : Integer := 0;
+
    -- Output
    Out_File : Ada.Text_IO.File_Type;
 
@@ -221,6 +235,8 @@ procedure Adacomp is
    A_ALL       : constant Integer := 16;
    --  Case range choice `when lo .. hi =>`; only appears in case arms.
    A_RANGE     : constant Integer := 17;
+   --  Array-aggregate entry; only appears under D_VAR_ANON_ARRAY.
+   A_AGG       : constant Integer := 18;
 
    -- Operator codes (for UNARY / BINARY)
    OP_ADD : constant Integer := 1;
@@ -238,6 +254,7 @@ procedure Adacomp is
    OP_OR  : constant Integer := 13;
    OP_NEG : constant Integer := 14;
    OP_NOT : constant Integer := 15;
+   OP_CAT : constant Integer := 16;
 
    -- Attribute kinds (for ATTR_TYPE / ATTR_VAR)
    ATTR_IMAGE  : constant Integer := 1;
@@ -357,6 +374,18 @@ procedure Adacomp is
       return Is_Alpha (C) or Is_Digit (C);
    end Is_Alnum;
 
+   -- Print a non-negative number without Integer'Image's leading space,
+   -- keeping diagnostic format identical to the C bootstrap's.
+   procedure Put_Nat (V : Integer) is
+      C : Character;
+   begin
+      if V >= 10 then
+         Put_Nat (V / 10);
+      end if;
+      C := Character'Val (48 + (V mod 10));
+      Ada.Text_IO.Put (C);
+   end Put_Nat;
+
    -- Report an error located at the current token, in the gcc-style
    -- `file:line:col: error: msg` form, followed by the offending source
    -- line and a caret under the column.
@@ -380,9 +409,9 @@ procedure Adacomp is
       Col := Pos - LS + 1;
       Ada.Text_IO.Put (Src_Name);
       Ada.Text_IO.Put (":");
-      Ada.Text_IO.Put (Integer'Image (Tok_Line));
+      Put_Nat (Tok_Line);
       Ada.Text_IO.Put (":");
-      Ada.Text_IO.Put (Integer'Image (Col));
+      Put_Nat (Col);
       Ada.Text_IO.Put (": error: ");
       Ada.Text_IO.Put_Line (Msg);
       if Src_Len > 0 then
@@ -760,6 +789,44 @@ procedure Adacomp is
       end loop;
       return Found;
    end All_Follows_Dot;
+
+   -- With the current token being an identifier, check whether `'Range`
+   -- follows (a `for I in A'Range loop` iteration). Note `range` lexes
+   -- as its keyword token. Saves/restores lexer state.
+   function Tick_Range_Follows return Boolean is
+      Save_Src_Pos : Integer;
+      Save_Line    : Integer;
+      Save_Tok     : Integer;
+      Save_Tok_Len : Integer;
+      Save_Tok_Int : Integer;
+      Save_Tok_Val : Tok_Buffer;
+      Found        : Boolean := False;
+   begin
+      Save_Src_Pos := Src_Pos;
+      Save_Line    := Line_Num;
+      Save_Tok     := Tok;
+      Save_Tok_Len := Tok_Len;
+      Save_Tok_Int := Tok_Int;
+      for I in 1 .. Tok_Len loop
+         Save_Tok_Val (I) := Tok_Val (I);
+      end loop;
+
+      Next_Token;
+      if Tok = TK_TICK then
+         Next_Token;
+         Found := Tok = TK_RANGE;
+      end if;
+
+      Src_Pos  := Save_Src_Pos;
+      Line_Num := Save_Line;
+      Tok      := Save_Tok;
+      Tok_Len  := Save_Tok_Len;
+      Tok_Int  := Save_Tok_Int;
+      for I in 1 .. Save_Tok_Len loop
+         Tok_Val (I) := Save_Tok_Val (I);
+      end loop;
+      return Found;
+   end Tick_Range_Follows;
 
    -- With the current token being `is`, check whether the next token is
    -- `new` (a generic instantiation). Saves/restores lexer state.
@@ -1160,6 +1227,35 @@ procedure Adacomp is
       Sym_Range_Hi := A12;
       Sym_Cap := New_Cap;
    end Ensure_Sym_Cap;
+
+   -- Grow the default-parameter arrays to hold at least Need entries.
+   procedure Ensure_Def_Cap (Need : Integer) is
+      New_Cap : Integer;
+      B1 : Int_Vec_Ptr;
+      B2 : Int_Vec_Ptr;
+      B3 : Int_Vec_Ptr;
+      B4 : Int_Vec_Ptr;
+   begin
+      if Need <= Def_Cap then return; end if;
+      New_Cap := Def_Cap * 2;
+      if New_Cap < 256 then New_Cap := 256; end if;
+      if New_Cap < Need then New_Cap := Need; end if;
+      B1 := new Int_Vec (1 .. New_Cap);
+      B2 := new Int_Vec (1 .. New_Cap);
+      B3 := new Int_Vec (1 .. New_Cap);
+      B4 := new Int_Vec (1 .. New_Cap);
+      for I in 1 .. Def_Count loop
+         B1 (I) := Def_Kind (I);
+         B2 (I) := Def_Val (I);
+         B3 (I) := Def_NOff (I);
+         B4 (I) := Def_NLen (I);
+      end loop;
+      Def_Kind := B1;
+      Def_Val := B2;
+      Def_NOff := B3;
+      Def_NLen := B4;
+      Def_Cap := New_Cap;
+   end Ensure_Def_Cap;
 
    procedure Add_Sym (Kind : Integer; Typ : Integer) is
    begin
@@ -1764,6 +1860,30 @@ procedure Adacomp is
                      Error ("unsupported enum attribute");
                   end if;
                end if;
+               -- Statically-bounded array (or array type): 'First / 'Last
+               -- / 'Length resolve to integer literals at parse time.
+               -- Strings and dynamic buffers (hi = 0) keep strlen.
+               if Sym_Idx > 0 and then Sym_Arr_Hi (Sym_Idx) /= 0
+                  and then Sym_Type (Sym_Idx) = TY_ARRAY
+                  and then (Sym_Kind (Sym_Idx) = SK_VAR
+                            or Sym_Kind (Sym_Idx) = SK_PARAM
+                            or Sym_Kind (Sym_Idx) = SK_CONST
+                            or Sym_Kind (Sym_Idx) = SK_TYPE)
+               then
+                  if Name_Eq (Attr, Attr_Len, "First") then
+                     N := New_Node (A_INT_LIT);
+                     N_Int (N) := Sym_Arr_Lo (Sym_Idx);
+                     return N;
+                  elsif Name_Eq (Attr, Attr_Len, "Last") then
+                     N := New_Node (A_INT_LIT);
+                     N_Int (N) := Sym_Arr_Hi (Sym_Idx);
+                     return N;
+                  elsif Name_Eq (Attr, Attr_Len, "Length") then
+                     N := New_Node (A_INT_LIT);
+                     N_Int (N) := Sym_Arr_Hi (Sym_Idx) - Sym_Arr_Lo (Sym_Idx) + 1;
+                     return N;
+                  end if;
+               end if;
                N := New_Node (A_ATTR_VAR);
                N_Str_Off (N) := Pool_Str (Saved, Saved_Len);
                N_Str_Len (N) := Saved_Len;
@@ -1973,7 +2093,7 @@ procedure Adacomp is
          elsif Tok = TK_MINUS then
             Op := OP_SUB;
          else
-            Op := OP_ADD;  -- `&` simplified to concatenation-as-add
+            Op := OP_CAT;  -- `&` -> ada_cat(l, r)
          end if;
          Next_Token;
          RHS := Parse_Factor_AST;
@@ -2123,6 +2243,15 @@ procedure Adacomp is
          end if;
          Emit_Expression_AST (N_Left (N));
       elsif Kind = A_BINARY then
+         if N_Op (N) = OP_CAT then
+            -- String concatenation is a call, not an infix operator.
+            Emit ("ada_cat(");
+            Emit_Expression_AST (N_Left (N));
+            Emit (", ");
+            Emit_Expression_AST (N_Right (N));
+            Emit (")");
+            return;
+         end if;
          Emit ("(");
          Emit_Expression_AST (N_Left (N));
          if N_Op (N) = OP_ADD then Emit (" + ");
@@ -3015,6 +3144,23 @@ procedure Adacomp is
                N_Int (Hi_N) := Sym_Range_Hi (Eidx);
                N_Left (N) := Lo_N;
                N_Right (N) := Hi_N;
+            elsif Eidx > 0 and then Sym_Arr_Hi (Eidx) /= 0
+               and then Sym_Type (Eidx) = TY_ARRAY
+               and then (Sym_Kind (Eidx) = SK_VAR or Sym_Kind (Eidx) = SK_PARAM
+                         or Sym_Kind (Eidx) = SK_CONST or Sym_Kind (Eidx) = SK_TYPE)
+               and then Tick_Range_Follows
+            then
+               -- `for I in A'Range loop` over a statically-bounded array
+               -- (or array type) becomes a loop over its index range.
+               Next_Token;                       -- array name
+               Next_Token;                       -- '
+               Next_Token;                       -- Range
+               Lo_N := New_Node (A_INT_LIT);
+               N_Int (Lo_N) := Sym_Arr_Lo (Eidx);
+               Hi_N := New_Node (A_INT_LIT);
+               N_Int (Hi_N) := Sym_Arr_Hi (Eidx);
+               N_Left (N) := Lo_N;
+               N_Right (N) := Hi_N;
             else
                N_Left (N) := Parse_Expression_AST;
                Expect (TK_DOTDOT);
@@ -3103,23 +3249,53 @@ procedure Adacomp is
                N := New_Node (S_CALL);
                Set_Call_Name (N, Saved, Saved_Len, Sym_Idx);
                N_Int (N) := Sym_Idx;
-               if Tok /= TK_RPAREN then
-                  declare
-                     First : Integer;
-                     Prev : Integer;
-                     Arg : Integer;
-                  begin
+               declare
+                  First : Integer;
+                  Prev : Integer := 0;
+                  Arg : Integer;
+                  Got : Integer := 0;
+                  Base : Integer;
+               begin
+                  if Tok /= TK_RPAREN then
                      First := Parse_Expression_AST;
                      N_First (N) := First;
                      Prev := First;
+                     Got := 1;
                      while Tok = TK_COMMA loop
                         Next_Token;
                         Arg := Parse_Expression_AST;
                         N_Next (Prev) := Arg;
                         Prev := Arg;
+                        Got := Got + 1;
                      end loop;
-                  end;
-               end if;
+                  end if;
+                  -- Omitted trailing arguments: append recorded defaults.
+                  if Sym_Kind (Sym_Idx) = SK_PROC
+                     and then Sym_Arr_Inner_Lo (Sym_Idx) /= 0
+                     and then Got < Sym_Arr_El (Sym_Idx)
+                  then
+                     Base := Sym_Arr_Inner_Lo (Sym_Idx);
+                     for I in Got .. Sym_Arr_El (Sym_Idx) - 1 loop
+                        if Def_Kind (Base + I) = 1 then
+                           Arg := New_Node (A_INT_LIT);
+                           N_Int (Arg) := Def_Val (Base + I);
+                        elsif Def_Kind (Base + I) = 2 then
+                           Arg := New_Node (A_IDENT);
+                           N_Str_Off (Arg) := Pool_Name_Pool (Def_NOff (Base + I),
+                                                              Def_NLen (Base + I));
+                           N_Str_Len (Arg) := Def_NLen (Base + I);
+                        else
+                           Error ("missing argument for parameter without default");
+                        end if;
+                        if Prev = 0 then
+                           N_First (N) := Arg;
+                        else
+                           N_Next (Prev) := Arg;
+                        end if;
+                        Prev := Arg;
+                     end loop;
+                  end if;
+               end;
                Expect (TK_RPAREN); Expect (TK_SEMI);
                return N;
             end if;
@@ -3499,6 +3675,40 @@ procedure Adacomp is
             Emit_Int (N_Int (N));
             Emit ("]");
          end if;
+         if N_Left (N) /= 0 then
+            -- Named/others aggregate as GNU designated initializers; the
+            -- `others` range goes first so specific entries override it.
+            declare
+               E     : Integer;
+               First : Boolean := True;
+            begin
+               Emit (" = {");
+               E := N_Left (N);
+               while E /= 0 loop
+                  if N_Op (E) = 1 then
+                     Emit ("[0 ... ");
+                     Emit_Int (N_Aux2 (N) - 1);
+                     Emit ("] = ");
+                     Emit_Int (N_Aux1 (E));
+                     First := False;
+                  end if;
+                  E := N_Next (E);
+               end loop;
+               E := N_Left (N);
+               while E /= 0 loop
+                  if N_Op (E) /= 1 then
+                     if not First then Emit (", "); end if;
+                     Emit ("[");
+                     Emit_Int (N_Int (E) - N_Right (N));
+                     Emit ("] = ");
+                     Emit_Int (N_Aux1 (E));
+                     First := False;
+                  end if;
+                  E := N_Next (E);
+               end loop;
+               Emit ("}");
+            end;
+         end if;
          Emit_Ln (";");
       elsif Kind = D_VAR_STRING then
          Emit_Indent;
@@ -3601,6 +3811,61 @@ procedure Adacomp is
          return V;
       end if;
    end Parse_Range_Bound;
+
+   -- Parse an array aggregate initializer with named associations:
+   --   (1 => False, 5 => True, others => True)
+   -- Returns a chain of A_AGG nodes: N_Op = 1 marks `others`, else
+   -- N_Int is the (literal or named-constant) index; the value goes to
+   -- N_Aux1. Values are limited to True / False and optionally-signed
+   -- integer literals.
+   function Parse_Aggregate return Integer is
+      Head : Integer := 0;
+      Prev : Integer := 0;
+      E    : Integer;
+      Neg  : Boolean;
+   begin
+      Expect (TK_LPAREN);
+      while Tok /= TK_RPAREN and Tok /= TK_EOF loop
+         E := New_Node (A_AGG);
+         if Tok = TK_IDENT and then Tok_Eq_CI ("others") then
+            N_Op (E) := 1;
+            Next_Token;
+         else
+            N_Int (E) := Parse_Range_Bound;
+         end if;
+         Expect (TK_ARROW);
+         Neg := False;
+         if Tok = TK_MINUS then
+            Neg := True;
+            Next_Token;
+         end if;
+         if Tok = TK_TRUE then
+            N_Aux1 (E) := 1;
+            Next_Token;
+         elsif Tok = TK_FALSE then
+            N_Aux1 (E) := 0;
+            Next_Token;
+         elsif Tok = TK_INT_LIT then
+            if Neg then
+               N_Aux1 (E) := -Tok_Int;
+            else
+               N_Aux1 (E) := Tok_Int;
+            end if;
+            Next_Token;
+         else
+            Error ("unsupported aggregate value (use a literal)");
+         end if;
+         if Head = 0 then
+            Head := E;
+         else
+            N_Next (Prev) := E;
+         end if;
+         Prev := E;
+         if Tok = TK_COMMA then Next_Token; end if;
+      end loop;
+      Expect (TK_RPAREN);
+      return Head;
+   end Parse_Aggregate;
 
    -- If the just-declared constant (Sym_Count) is initialized with an
    -- integer literal (or a negated one), record its compile-time value —
@@ -3974,7 +4239,18 @@ procedure Adacomp is
                      Parm_Len : Integer;
                      Arr_Idx : Integer;
                      Rec_Idx : Integer;
+                     Psym : Integer := 0;
+                     Def_Base : Integer := Def_Count;
+                     NParams : Integer := 0;
+                     Neg : Boolean;
                   begin
+                     -- proc symbol index: params get added after it
+                     for Si in reverse 1 .. Sym_Count loop
+                        if Sym_Kind (Si) = SK_PROC then
+                           Psym := Si;
+                           exit;
+                        end if;
+                     end loop;
                      while Tok /= TK_RPAREN and Tok /= TK_EOF loop
                         if not First then Emit (", "); end if;
                         First := False;
@@ -4026,9 +4302,57 @@ procedure Adacomp is
                            Emit (" ");
                            Emit_Lower (Parm, Parm_Len);
                         end if;
+                        -- Optional default: `:= <literal or named
+                        -- constant>`. Doesn't affect the C signature;
+                        -- call sites append omitted trailing arguments.
+                        Ensure_Def_Cap (Def_Count + 1);
+                        Def_Count := Def_Count + 1;
+                        Def_Kind (Def_Count) := 0;
+                        if Tok = TK_ASSIGN then
+                           Next_Token;
+                           Neg := False;
+                           if Tok = TK_MINUS then
+                              Neg := True;
+                              Next_Token;
+                           end if;
+                           if Tok = TK_INT_LIT then
+                              Def_Kind (Def_Count) := 1;
+                              if Neg then
+                                 Def_Val (Def_Count) := -Tok_Int;
+                              else
+                                 Def_Val (Def_Count) := Tok_Int;
+                              end if;
+                              Next_Token;
+                           elsif Tok = TK_TRUE or Tok = TK_FALSE then
+                              Def_Kind (Def_Count) := 1;
+                              if Tok = TK_TRUE then
+                                 Def_Val (Def_Count) := 1;
+                              else
+                                 Def_Val (Def_Count) := 0;
+                              end if;
+                              Next_Token;
+                           elsif Tok = TK_IDENT then
+                              Def_Kind (Def_Count) := 2;
+                              Ensure_Name_Pool_Cap (Name_Pool_Len + Tok_Len);
+                              Def_NOff (Def_Count) := Name_Pool_Len + 1;
+                              Def_NLen (Def_Count) := Tok_Len;
+                              for I in 1 .. Tok_Len loop
+                                 Name_Pool_Len := Name_Pool_Len + 1;
+                                 Name_Pool (Name_Pool_Len) := Tok_Val (I);
+                              end loop;
+                              Next_Token;
+                           else
+                              Error ("unsupported parameter default (use a literal or name)");
+                           end if;
+                        end if;
+                        NParams := NParams + 1;
                         if Tok = TK_SEMI then Next_Token; end if;
                      end loop;
                      Expect (TK_RPAREN);
+                     if Psym > 0 then
+                        Sym_Arr_El (Psym) := NParams;
+                        Sym_Arr_Inner_Lo (Psym) := Def_Base + 1;
+                     end if;
                   end;
                end if;
                if Tok = TK_SEMI then
@@ -4260,11 +4584,18 @@ procedure Adacomp is
                   else
                      N_Int (N) := 0;
                   end if;
+                  N_Right (N) := Lo;              -- for aggregate indices
                   if Tok = TK_ASSIGN then
                      Next_Token;
-                     while Tok /= TK_SEMI and Tok /= TK_EOF loop
-                        Next_Token;
-                     end loop;
+                     if not Is_Nested and then Tok = TK_LPAREN then
+                        -- named/others aggregate -> chain in N_Left
+                        N_Left (N) := Parse_Aggregate;
+                     else
+                        -- other initializers unsupported — zero default
+                        while Tok /= TK_SEMI and Tok /= TK_EOF loop
+                           Next_Token;
+                        end loop;
+                     end if;
                   end if;
                   Expect (TK_SEMI);
                   return N;
@@ -4668,9 +4999,15 @@ procedure Adacomp is
 
    procedure Emit_Int_To_Str is
    begin
+      -- Integer'Image: Ada prepends a space to non-negative values.
+      -- Rotating buffers so several images can appear in one
+      -- concatenation chain.
       Emit_Ln ("static char *int_to_str(int n) {");
-      Emit_Ln ("    static char buf[20];");
-      Emit_Ln ("    sprintf(buf, ""%d"", n);");
+      Emit_Ln ("    static char bufs[8][16];");
+      Emit_Ln ("    static int cur = 0;");
+      Emit_Ln ("    char *buf = bufs[cur];");
+      Emit_Ln ("    cur = (cur + 1) % 8;");
+      Emit_Ln ("    sprintf(buf, n < 0 ? ""%d"" : "" %d"", n);");
       Emit_Ln ("    return buf;");
       Emit_Ln ("}");
       Emit_Ln ("");

@@ -570,6 +570,46 @@ Started.
   — only plain literals record a value), and named constants in case
   choices (they emit as C `const int` variables, which C rejects as
   case labels; would need the recorded value substituted at emit).
+- [x] **Phase 2 exit test: real programs.** Two idiomatic Ada programs
+  from Rosetta Code (written by other people, not fitted to the
+  subset) now compile and produce GNAT-identical output. *Towers of
+  Hanoi* compiles **completely unmodified**; *Sieve of Eratosthenes*
+  needed exactly one adapted line (its array bound comes from the
+  command line — dynamic array sizes are out of subset — replaced by
+  `Last : constant Positive := 50;`). Fixtures `real_hanoi.adb` /
+  `real_sieve.adb`. Compiling them surfaced and drove five fixes, all
+  in both compilers:
+  1. **`&` was silently broken** — it lowered to C `+` (pointer
+     arithmetic). Now a real concatenation: OP_CAT emits
+     `ada_cat(l, r)`, a runtime helper with eight rotating buffers so
+     chained concatenations work.
+  2. **`Integer'Image` fidelity** — Ada prepends a space to
+     non-negative values; `int_to_str` now does too (and rotates
+     buffers so several images survive one concatenation). All 24
+     affected `.expected` files regenerated (verified space-only
+     diffs). The self-host's diagnostics keep the bootstrap's exact
+     `file:line:col` format via a new digit printer (Put_Nat) instead
+     of 'Image.
+  3. **Array aggregates** `(1 => False, others => True)` on
+     anonymous arrays -> GNU designated initializers
+     (`{[0 ... N-1] = 1, [0] = 0}`), literal values only.
+  4. **`A'Range` / `'First` / `'Last` / `'Length` on
+     statically-bounded arrays** (variables and types) — resolve to
+     integer literals at parse time; `for I in A'Range loop` works.
+     Strings/dynamic buffers keep the strlen-based path.
+  5. **Default parameter values** — `procedure P (X : T := <literal
+     or enum literal>)` records per-parameter defaults (a defaults
+     pool; the proc symbol carries param count + base slot); a
+     statement call with omitted trailing arguments appends them
+     (`Hanoi (4);` fills Left, Right, Center).
+  Still-open gaps the real programs exposed (the Phase 2 punch list):
+  dynamic array bounds (`array (1 .. Last)` with runtime Last — needs
+  VLAs or heap arrays, plus main-level locals being C globals),
+  `'Value` (string -> integer), positional aggregates and aggregate
+  expressions, defaults on function calls / expression-position calls,
+  and named parameter associations (`Put (Item => X)`). 35/35 fixtures
+  under both compilers; stage1 byte-identical on both real programs;
+  verify passes.
 - [x] **Natural / Positive implicit constraints.** `Natural` and
   `Positive` are now real tokens carrying their implicit ranges
   (0 .. Integer'Last and 1 .. Integer'Last) through the existing

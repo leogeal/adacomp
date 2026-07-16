@@ -136,6 +136,30 @@ static int with_count = 0;
    New_Line / ... statements then resolve to the Text_IO builtins. */
 static int use_text_io = 0;
 
+/* Default parameter values. Each procedure's parameters get one slot
+   (positional): kind 0 = no default, 1 = integer literal (value in
+   def_val), 2 = a named constant such as an enum literal (name in
+   def_name). The proc symbol stores its parameter count in sym_arr_el
+   and its base slot + 1 in sym_arr_inner_lo (both otherwise unused on
+   SK_PROC); call sites append omitted trailing arguments from here. */
+static int *def_kind = NULL;
+static int *def_val = NULL;
+static char (*def_name)[MAX_NAME] = NULL;
+static int *def_nlen = NULL;
+static int def_cap = 0;
+static int def_count = 0;
+
+static void grow_defs(int need) {
+    if (need < def_cap) return;
+    int new_cap = def_cap ? def_cap * 2 : 256;
+    if (new_cap <= need) new_cap = need + 1;
+    def_kind = realloc(def_kind, (size_t)new_cap * sizeof(int));
+    def_val  = realloc(def_val, (size_t)new_cap * sizeof(int));
+    def_name = realloc(def_name, (size_t)new_cap * MAX_NAME);
+    def_nlen = realloc(def_nlen, (size_t)new_cap * sizeof(int));
+    def_cap = new_cap;
+}
+
 /* True while emitting statements for the outermost program procedure,
    so a bare Ada `return;` translates to `return 0;` in C's int main. */
 static int in_main_proc = 0;
@@ -485,6 +509,21 @@ static int all_follows_dot(void) {
     return r;
 }
 
+/* With the current token being an identifier, check whether `'Range`
+   follows (a `for I in A'Range loop` iteration). Saves/restores state. */
+static int tick_range_follows(void) {
+    LexState s;
+    save_lex(&s);
+    next_token();
+    int r = 0;
+    if (tok == TK_TICK) {
+        next_token();
+        r = (tok == TK_RANGE);   /* `range` lexes as its keyword token */
+    }
+    restore_lex(&s);
+    return r;
+}
+
 /* Given we're positioned just past `(` of a 2-arg call (and we already
    confirmed a top-level comma is present), look ahead to determine
    whether the second argument is character-typed. Saves/restores state. */
@@ -655,6 +694,7 @@ enum {
     A_CALL=10, A_DOTTED=11,
     A_ATTR_TYPE=12, A_ATTR_VAR=13, A_NEW=14, A_FIELD=15, A_ALL=16,
     A_RANGE=17,   /* case range choice `when lo .. hi =>`; only in case arms */
+    A_AGG=18,     /* array-aggregate entry; only under D_VAR_ANON_ARRAY */
     /* Statement leaf nodes. Compound (if/while/for/loop/declare/begin) and
        dotted-package statements still emit directly; they'll become full
        AST nodes once declarations are AST-driven (step 4). */
@@ -684,7 +724,7 @@ enum {
     OP_ADD=1, OP_SUB=2, OP_MUL=3, OP_DIV=4, OP_MOD=5,
     OP_EQ=6, OP_NEQ=7, OP_LT=8, OP_GT=9, OP_LE=10, OP_GE=11,
     OP_AND=12, OP_OR=13,
-    OP_NEG=14, OP_NOT=15
+    OP_NEG=14, OP_NOT=15, OP_CAT=16
 };
 
 enum {
@@ -1083,6 +1123,26 @@ static int parse_primary_ast(void) {
                 }
                 error("unsupported enum attribute");
             }
+            /* Statically-bounded array (or array type): 'First / 'Last /
+               'Length resolve to integer literals at parse time. Strings
+               and dynamic buffers (hi = 0) keep the strlen-based path. */
+            if (sidx >= 0 && sym_arr_hi[sidx] != 0 && sym_type[sidx] == TY_ARRAY
+                && (sym_kind[sidx] == SK_VAR || sym_kind[sidx] == SK_PARAM
+                    || sym_kind[sidx] == SK_CONST || sym_kind[sidx] == SK_TYPE)) {
+                if (attr_len == 5 && strncasecmp(attr, "First", 5) == 0) {
+                    n = new_node(A_INT_LIT); n_int[n] = sym_arr_lo[sidx];
+                    return n;
+                }
+                if (attr_len == 4 && strncasecmp(attr, "Last", 4) == 0) {
+                    n = new_node(A_INT_LIT); n_int[n] = sym_arr_hi[sidx];
+                    return n;
+                }
+                if (attr_len == 6 && strncasecmp(attr, "Length", 6) == 0) {
+                    n = new_node(A_INT_LIT);
+                    n_int[n] = sym_arr_hi[sidx] - sym_arr_lo[sidx] + 1;
+                    return n;
+                }
+            }
             n = new_node(A_ATTR_VAR);
             n_str_off[n] = pool_str(saved, saved_len);
             n_str_len[n] = saved_len;
@@ -1239,7 +1299,7 @@ static int parse_term_ast(void) {
         int op;
         if (tok == TK_PLUS)       op = OP_ADD;
         else if (tok == TK_MINUS) op = OP_SUB;
-        else                      op = OP_ADD; /* `&` → simplified concat */
+        else                      op = OP_CAT; /* `&` -> ada_cat(l, r) */
         next_token();
         int rhs = parse_factor_ast();
         int n = new_node(A_BINARY);
@@ -1355,6 +1415,15 @@ static void emit_expression_ast(int n) {
         emit(n_op[n] == OP_NEG ? "-" : "!");
         emit_expression_ast(n_left[n]);
     } else if (kind == A_BINARY) {
+        if (n_op[n] == OP_CAT) {
+            /* String concatenation is a call, not an infix operator. */
+            emit("ada_cat(");
+            emit_expression_ast(n_left[n]);
+            emit(", ");
+            emit_expression_ast(n_right[n]);
+            emit(")");
+            return;
+        }
         /* Wrap binary subtrees in parens so source-explicit groupings
            survive the AST round-trip and C-precedence ambiguities are
            impossible. The output is verbose but unambiguously correct. */
@@ -2117,6 +2186,18 @@ static int parse_statement_ast(void) {
             if (tok == TK_TICK) { next_token(); next_token(); }  /* 'Range */
             n_left[n] = new_node(A_INT_LIT);  n_int[n_left[n]]  = sym_range_lo[eidx];
             n_right[n] = new_node(A_INT_LIT); n_int[n_right[n]] = sym_range_hi[eidx];
+        } else if (eidx >= 0 && sym_arr_hi[eidx] != 0
+                   && (sym_type[eidx] == TY_ARRAY)
+                   && (sym_kind[eidx] == SK_VAR || sym_kind[eidx] == SK_PARAM
+                       || sym_kind[eidx] == SK_CONST || sym_kind[eidx] == SK_TYPE)
+                   && tick_range_follows()) {
+            /* `for I in A'Range loop` over a statically-bounded array
+               (or array type) becomes a loop over its index range. */
+            next_token();                       /* array name */
+            next_token();                       /* ' */
+            next_token();                       /* Range */
+            n_left[n] = new_node(A_INT_LIT);  n_int[n_left[n]]  = sym_arr_lo[eidx];
+            n_right[n] = new_node(A_INT_LIT); n_int[n_right[n]] = sym_arr_hi[eidx];
         } else {
             n_left[n] = parse_expression_ast();
             expect(TK_DOTDOT);
@@ -2199,15 +2280,42 @@ static int parse_statement_ast(void) {
                 n = new_node(S_CALL);
                 set_call_name(n, saved, saved_len, sidx);
                 n_int[n] = sidx;
+                int got = 0;
+                int prev = 0;
                 if (tok != TK_RPAREN) {
                     int first = parse_expression_ast();
                     n_first[n] = first;
-                    int prev = first;
+                    prev = first;
+                    got = 1;
                     while (tok == TK_COMMA) {
                         next_token();
                         int arg = parse_expression_ast();
                         n_next[prev] = arg;
                         prev = arg;
+                        got++;
+                    }
+                }
+                /* Omitted trailing arguments: append recorded defaults. */
+                if (sym_kind[sidx] == SK_PROC && sym_arr_inner_lo[sidx] != 0
+                    && got < sym_arr_el[sidx]) {
+                    int base = sym_arr_inner_lo[sidx] - 1;
+                    for (int i = got; i < sym_arr_el[sidx]; i++) {
+                        int a;
+                        if (def_kind[base + i] == 1) {
+                            a = new_node(A_INT_LIT);
+                            n_int[a] = def_val[base + i];
+                        } else if (def_kind[base + i] == 2) {
+                            a = new_node(A_IDENT);
+                            n_str_off[a] = pool_str(def_name[base + i],
+                                                    def_nlen[base + i]);
+                            n_str_len[a] = def_nlen[base + i];
+                        } else {
+                            error("missing argument for parameter without default");
+                            break;
+                        }
+                        if (prev == 0) n_first[n] = a;
+                        else n_next[prev] = a;
+                        prev = a;
                     }
                 }
                 expect(TK_RPAREN); expect(TK_SEMI);
@@ -2518,6 +2626,32 @@ static void emit_declaration_ast(int n) {
             emit_int(n_int[n]);
             emit("]");
         }
+        if (n_left[n] != 0) {
+            /* Named/others aggregate as GNU designated initializers; the
+               `others` range goes first so specific entries override it. */
+            emit(" = {");
+            int first = 1;
+            for (int e = n_left[n]; e != 0; e = n_next[e]) {
+                if (n_op[e] == 1) {
+                    emit("[0 ... ");
+                    emit_int(n_aux2[n] - 1);
+                    emit("] = ");
+                    emit_int(n_aux1[e]);
+                    first = 0;
+                }
+            }
+            for (int e = n_left[n]; e != 0; e = n_next[e]) {
+                if (n_op[e] != 1) {
+                    if (!first) emit(", ");
+                    emit("[");
+                    emit_int(n_int[e] - n_right[n]);
+                    emit("] = ");
+                    emit_int(n_aux1[e]);
+                    first = 0;
+                }
+            }
+            emit("}");
+        }
         emit_line(";");
     } else if (kind == D_VAR_STRING) {
         emit_indent();
@@ -2604,6 +2738,43 @@ static int parse_range_bound(void) {
     }
     next_token();
     return neg ? -v : v;
+}
+
+/* Parse an array aggregate initializer with named associations:
+     (1 => False, 5 => True, others => True)
+   Returns a chain of A_AGG nodes: n_op = 1 marks `others`, else n_int
+   is the (literal or named-constant) index; the value goes to n_aux1.
+   Values are limited to True / False and optionally-signed integer
+   literals — enough for static flag/table initialization. */
+static int parse_aggregate(void) {
+    expect(TK_LPAREN);
+    int head = 0, prev = 0;
+    while (tok != TK_RPAREN && tok != TK_EOF) {
+        int e = new_node(A_AGG);
+        if (tok == TK_IDENT && tok_eq_ci("others")) {
+            n_op[e] = 1;
+            next_token();
+        } else {
+            n_int[e] = parse_range_bound();
+        }
+        expect(TK_ARROW);
+        int neg = 0;
+        if (tok == TK_MINUS) { neg = 1; next_token(); }
+        if (tok == TK_TRUE) { n_aux1[e] = 1; next_token(); }
+        else if (tok == TK_FALSE) { n_aux1[e] = 0; next_token(); }
+        else if (tok == TK_INT_LIT) {
+            n_aux1[e] = neg ? -tok_int : tok_int;
+            next_token();
+        } else {
+            error("unsupported aggregate value (use a literal)");
+        }
+        if (head == 0) head = e;
+        else n_next[prev] = e;
+        prev = e;
+        if (tok == TK_COMMA) next_token();
+    }
+    expect(TK_RPAREN);
+    return head;
 }
 
 /* If the just-declared constant (sym_count-1) is initialized with an
@@ -2911,6 +3082,13 @@ static int parse_declaration_ast(void) {
 
             push_scope();
 
+            int psym = -1;
+            /* proc symbol index: params get added after it */
+            for (int si = sym_count - 1; si >= 0; si--)
+                if (sym_kind[si] == SK_PROC) { psym = si; break; }
+            int def_base = def_count;
+            int nparams = 0;
+
             if (tok == TK_LPAREN) {
                 next_token();
                 int first = 1;
@@ -2959,9 +3137,41 @@ static int parse_declaration_ast(void) {
                         emit(" ");
                         emit_str_lower(pn, pnl);
                     }
+                    /* Optional default: `:= <literal or named constant>`.
+                       Doesn't affect the C signature; call sites append
+                       omitted trailing arguments from the recorded slot. */
+                    grow_defs(def_count);
+                    def_kind[def_count] = 0;
+                    if (tok == TK_ASSIGN) {
+                        next_token();
+                        int neg = 0;
+                        if (tok == TK_MINUS) { neg = 1; next_token(); }
+                        if (tok == TK_INT_LIT) {
+                            def_kind[def_count] = 1;
+                            def_val[def_count] = neg ? -tok_int : tok_int;
+                            next_token();
+                        } else if (tok == TK_TRUE || tok == TK_FALSE) {
+                            def_kind[def_count] = 1;
+                            def_val[def_count] = (tok == TK_TRUE) ? 1 : 0;
+                            next_token();
+                        } else if (tok == TK_IDENT) {
+                            def_kind[def_count] = 2;
+                            memcpy(def_name[def_count], tok_val, tok_len);
+                            def_nlen[def_count] = tok_len;
+                            next_token();
+                        } else {
+                            error("unsupported parameter default (use a literal or name)");
+                        }
+                    }
+                    def_count++;
+                    nparams++;
                     if (tok == TK_SEMI) next_token();
                 }
                 expect(TK_RPAREN);
+                if (psym >= 0) {
+                    sym_arr_el[psym] = nparams;
+                    sym_arr_inner_lo[psym] = def_base + 1;
+                }
             }
 
             /* Forward declaration: `procedure Name (...);` with no body */
@@ -3172,10 +3382,16 @@ static int parse_declaration_ast(void) {
                 n_aux1[n] = el_type;                          /* resolved element type */
                 n_aux2[n] = hi - lo + 1;                      /* resolved outer count */
                 n_int[n] = is_nested ? (inner_hi - inner_lo + 1) : 0;  /* inner count, 0 if flat */
+                n_right[n] = lo;                              /* for aggregate indices */
                 if (tok == TK_ASSIGN) {
                     next_token();
-                    /* skip the initializer expression — we always emit {0} */
-                    while (tok != TK_SEMI && tok != TK_EOF) next_token();
+                    if (!is_nested && tok == TK_LPAREN) {
+                        /* named/others aggregate -> chain in n_left */
+                        n_left[n] = parse_aggregate();
+                    } else {
+                        /* other initializers unsupported — zero default */
+                        while (tok != TK_SEMI && tok != TK_EOF) next_token();
+                    }
                 }
                 expect(TK_SEMI);
                 return n;
@@ -3515,10 +3731,15 @@ static void parse_context(void) {
     }
 }
 
+/* Integer'Image: Ada prepends a space to non-negative values. Rotating
+   buffers so several images can appear in one concatenation chain. */
 static void emit_int_to_str(void) {
     emit_line("static char *int_to_str(int n) {");
-    emit_line("    static char buf[20];");
-    emit_line("    sprintf(buf, \"%d\", n);");
+    emit_line("    static char bufs[8][16];");
+    emit_line("    static int cur = 0;");
+    emit_line("    char *buf = bufs[cur];");
+    emit_line("    cur = (cur + 1) % 8;");
+    emit_line("    sprintf(buf, n < 0 ? \"%d\" : \" %d\", n);");
     emit_line("    return buf;");
     emit_line("}");
     emit_line("");
