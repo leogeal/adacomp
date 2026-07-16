@@ -789,6 +789,40 @@ procedure Adacomp is
       return Found;
    end New_Follows_Is;
 
+   -- With the current token being an identifier, check whether the next
+   -- token is ':' (a handler occurrence parameter `when E : ...`).
+   function Colon_Follows_Ident return Boolean is
+      Save_Src_Pos : Integer;
+      Save_Line    : Integer;
+      Save_Tok     : Integer;
+      Save_Tok_Len : Integer;
+      Save_Tok_Int : Integer;
+      Save_Tok_Val : Tok_Buffer;
+      Found        : Boolean;
+   begin
+      Save_Src_Pos := Src_Pos;
+      Save_Line    := Line_Num;
+      Save_Tok     := Tok;
+      Save_Tok_Len := Tok_Len;
+      Save_Tok_Int := Tok_Int;
+      for I in 1 .. Tok_Len loop
+         Save_Tok_Val (I) := Tok_Val (I);
+      end loop;
+
+      Next_Token;
+      Found := Tok = TK_COLON;
+
+      Src_Pos  := Save_Src_Pos;
+      Line_Num := Save_Line;
+      Tok      := Save_Tok;
+      Tok_Len  := Save_Tok_Len;
+      Tok_Int  := Save_Tok_Int;
+      for I in 1 .. Save_Tok_Len loop
+         Tok_Val (I) := Save_Tok_Val (I);
+      end loop;
+      return Found;
+   end Colon_Follows_Ident;
+
    -- Given we're positioned just past `(` of a 2-arg call (and we already
    -- confirmed a top-level comma is present), look ahead to determine
    -- whether the second argument is character-typed. Saves/restores state.
@@ -2166,7 +2200,11 @@ procedure Adacomp is
       elsif Kind = A_DOTTED then
          Sub_Off := N_Arg2 (N);
          Sub_Len := N_Int (N);
-         if NPool_Eq_CI (Sub_Off, Sub_Len, "Argument_Count") then
+         if NPool_Eq_CI (Sub_Off, Sub_Len, "Exception_Message") then
+            Emit ("ada_cur_exc_msg");     -- occurrence arg is cosmetic
+         elsif NPool_Eq_CI (Sub_Off, Sub_Len, "Exception_Name") then
+            Emit ("ada_cur_exc_name");
+         elsif NPool_Eq_CI (Sub_Off, Sub_Len, "Argument_Count") then
             Emit ("(argc - 1)");
          elsif NPool_Eq_CI (Sub_Off, Sub_Len, "Argument") then
             Emit ("argv[");
@@ -2236,7 +2274,16 @@ procedure Adacomp is
       elsif Kind = S_RAISE then
          Emit_Indent;
          if N_Op (N) = 1 then
-            Emit_Ln ("ada_raise(ada_cur_exc, ada_cur_exc_name);");
+            -- bare re-raise preserves the occurrence, message included
+            Emit_Ln ("ada_raise_msg(ada_cur_exc, ada_cur_exc_name, ada_cur_exc_msg);");
+         elsif N_Arg2 (N) /= 0 then
+            Emit ("ada_raise_msg(");
+            Emit_Int (N_Aux1 (N));
+            Emit (", """);
+            Emit_Pool_Raw (N_Str_Off (N), N_Str_Len (N));
+            Emit (""", ");
+            Emit_Expression_AST (N_Arg2 (N));
+            Emit_Ln (");");
          else
             Emit ("ada_raise(");
             Emit_Int (N_Aux1 (N));
@@ -2737,6 +2784,11 @@ procedure Adacomp is
             N_Str_Off (N) := Pool_Str (Tok_Val, Tok_Len);
             N_Str_Len (N) := Tok_Len;
             Next_Token;
+            if Tok = TK_WITH then
+               -- optional message expression -> N_Arg2 (0 = none)
+               Next_Token;
+               N_Arg2 (N) := Parse_Expression_AST;
+            end if;
             while Tok /= TK_SEMI and Tok /= TK_EOF loop
                Next_Token;
             end loop;
@@ -3154,6 +3206,13 @@ procedure Adacomp is
    begin
       while Tok = TK_WHEN loop
          Next_Token;
+         -- Optional occurrence parameter: `when E : others =>`. Only one
+         -- exception is ever in flight, so the name is cosmetic — accept
+         -- and discard it; Exception_Message/_Name read the globals.
+         if Tok = TK_IDENT and then Colon_Follows_Ident then
+            Next_Token;   -- the occurrence name
+            Next_Token;   -- the ':'
+         end if;
          Arm := New_Node (S_WHEN);
          if Tok = TK_IDENT and then Tok_Eq_CI ("others") then
             N_Op (Arm) := 1;

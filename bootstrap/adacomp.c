@@ -1446,6 +1446,10 @@ static void emit_expression_ast(int n) {
         int sub_len = n_int[n];
         if (sub_len == 14 && strncasecmp(npool + sub_off, "Argument_Count", 14) == 0) {
             emit("(argc - 1)");
+        } else if (sub_len == 17 && strncasecmp(npool + sub_off, "Exception_Message", 17) == 0) {
+            emit("ada_cur_exc_msg");     /* occurrence arg is cosmetic */
+        } else if (sub_len == 14 && strncasecmp(npool + sub_off, "Exception_Name", 14) == 0) {
+            emit("ada_cur_exc_name");
         } else if (sub_len == 8 && strncasecmp(npool + sub_off, "Argument", 8) == 0) {
             emit("argv[");
             emit_expression_ast(n_first[n]);
@@ -1521,7 +1525,16 @@ static void emit_statement_ast(int n) {
     } else if (kind == S_RAISE) {
         emit_indent();
         if (n_op[n] == 1) {
-            emit_line("ada_raise(ada_cur_exc, ada_cur_exc_name);");
+            /* bare re-raise preserves the occurrence, message included */
+            emit_line("ada_raise_msg(ada_cur_exc, ada_cur_exc_name, ada_cur_exc_msg);");
+        } else if (n_arg2[n] != 0) {
+            emit("ada_raise_msg(");
+            emit_int(n_aux1[n]);
+            emit(", \"");
+            emit_pool_raw(n_str_off[n], n_str_len[n]);
+            emit("\", ");
+            emit_expression_ast(n_arg2[n]);
+            emit_line(");");
         } else {
             emit("ada_raise(");
             emit_int(n_aux1[n]);
@@ -1929,13 +1942,18 @@ static int parse_statement_ast(void) {
             n_op[n] = 1;                 /* bare `raise;` -> re-raise */
         } else {
             /* raise Name [with "msg"];  resolve Name to its exception id;
-               unknown names default to Program_Error (id 2). */
+               unknown names default to Program_Error (id 2). The optional
+               message expression goes to n_arg2 (0 = none). */
             int idx = find_sym(tok_val, tok_len);
             n_aux1[n] = (idx >= 0 && sym_kind[idx] == SK_EXCEPTION)
                         ? sym_arr_lo[idx] : 2;
             n_str_off[n] = pool_str(tok_val, tok_len);
             n_str_len[n] = tok_len;
             next_token();
+            if (tok == TK_WITH) {
+                next_token();
+                n_arg2[n] = parse_expression_ast();
+            }
             while (tok != TK_SEMI && tok != TK_EOF) next_token();
         }
         expect(TK_SEMI);
@@ -2274,6 +2292,16 @@ static int parse_handler_arms(void) {
     int head = 0, prev = 0;
     while (tok == TK_WHEN) {
         next_token();
+        /* Optional occurrence parameter: `when E : others =>`. Only one
+           exception is ever in flight, so the name is cosmetic — accept
+           and discard it; Exception_Message/_Name read the globals. */
+        if (tok == TK_IDENT) {
+            LexState s;
+            save_lex(&s);
+            next_token();
+            if (tok == TK_COLON) next_token();
+            else restore_lex(&s);
+        }
         int arm = new_node(S_WHEN);
         if (tok == TK_IDENT && tok_eq_ci("others")) {
             n_op[arm] = 1;

@@ -505,10 +505,25 @@ Started.
   caught constraint_error / caught alt / logged, re-raising / outer
   caught reraised / caught others. Stage1 byte-identical to the
   bootstrap; verify passes; 23/23 fixtures under both compilers.
-  Deferred: exception messages (`raise E with "msg"` is parsed but the
-  message is discarded), `Exception_Message`/`Exception_Name`, and a
-  `return`/`exit`/`goto` that leaves a handled region while a handler is
-  still installed (it would skip the stack pop — fixtures avoid this).
+  Deferred: a `return`/`exit`/`goto` that leaves a handled region while
+  a handler is still installed (it would skip the stack pop — fixtures
+  avoid this).
+- [x] **Exception messages.** `raise E with "msg"` carries the message
+  into the runtime (`ada_raise_msg` sets `ada_cur_exc_msg`); a bare
+  re-raise `raise;` preserves the whole occurrence, message included;
+  an unhandled exception prints `raised E : msg` to stderr. Handlers
+  accept the occurrence parameter (`when E : others =>` — the name is
+  cosmetic since one exception is in flight), and
+  `Ada.Exceptions.Exception_Message (E)` / `Exception_Name (E)` read
+  the in-flight globals as expression builtins. Both compilers;
+  fixture `exc_messages.adb` (message read in handler, re-raise
+  preserving it, plain raise yielding an empty message) -> bad line 5
+  / Config_Error / inner / plain / (empty). Stage1 byte-identical to
+  the bootstrap; verify passes; 29/29 fixtures. Deferred:
+  `Exception_Name` is the simple declared-case name (real Ada gives a
+  fully-qualified upper-case name), message expressions are evaluated
+  but only string-valued ones are meaningful, and occurrence objects
+  are not first-class values (no saving/copying occurrences).
 - [x] **Subtypes / ranges with checks (v1).** `subtype S is Integer
   range L .. H;`, `type T is range L .. H;`, and inline `X : Integer
   range L .. H;` constraints, plus variables of a named ranged subtype

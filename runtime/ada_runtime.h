@@ -63,13 +63,20 @@ typedef struct ada_handler {
 static ada_handler *ada_handler_top = 0;
 static int ada_cur_exc = 0;                 /* id of exception in flight */
 static const char *ada_cur_exc_name = "";
+static const char *ada_cur_exc_msg = "";    /* from `raise E with "msg"` */
 
-static void ada_raise(int id, const char *name) {
+static void ada_raise_msg(int id, const char *name, const char *msg) {
     ada_cur_exc = id;
     ada_cur_exc_name = name;
+    ada_cur_exc_msg = msg;
     if (ada_handler_top) longjmp(ada_handler_top->buf, 1);
-    fprintf(stderr, "\nraised %s : unhandled exception\n", name);
+    if (msg[0]) fprintf(stderr, "\nraised %s : %s\n", name, msg);
+    else fprintf(stderr, "\nraised %s : unhandled exception\n", name);
     exit(1);
+}
+
+static void ada_raise(int id, const char *name) {
+    ada_raise_msg(id, name, "");
 }
 
 /* Scalar range check for constrained subtypes. Returns the value if it
