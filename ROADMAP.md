@@ -673,7 +673,37 @@ Started.
   11 / 10 / pred out of range / succ out of range / BLUE. Stage1
   byte-identical to the bootstrap; verify passes; 32/32 fixtures.
 
-### Phases 3–7
+### Phase 3 — Backend pivot (Option B-light)
+
+In progress. Strategy: the resolved AST *is* the IR — flat parallel
+int arrays, symbol-free at walk time (everything a backend needs is
+resolved onto nodes at build). The seam work is eliminating every
+place the parser still prints C text mid-parse, so that a backend is
+purely a set of walkers that can be swapped. Each conversion is
+validated **byte-identically**: the refactored compiler must produce
+the exact same C as the pre-seam reference for all fixtures and for
+adacomp.adb itself.
+
+- [x] **IR schema documented** — `docs/IR.md`: the node store, every
+  kind's field contract, lifetimes, and the backend contract (also
+  closes the Phase 1 "documented internal IR" gap).
+- [x] **Type definitions build-then-walk.** Records and enums no
+  longer emit during parsing: new D_TYPE_RECORD / D_FIELD /
+  D_TYPE_ENUM / D_ENUM_LIT nodes carry pooled names, field variants
+  (scalar / struct-ptr / scalar-ptr), and the image-function flag; the
+  declaration walker renders them. Also fixes a latent ordering bug
+  (a record/enum declared in a `declare` block used to emit its C
+  mid-statement-build, before the enclosing block was walked).
+  Verified byte-identical over all 35 fixtures + adacomp.adb +
+  multifile units, under both compilers.
+- [ ] Subprogram declarations build-then-walk (signatures, param
+  lists, forward decls; bodies already build/walk their statements).
+- [ ] Unit scaffolding behind the backend (program preamble,
+  `int main`, package spec/body emission).
+- [ ] Single backend entry point (one dispatch table / module per
+  backend; the C emitter becomes the first pluggable backend).
+
+### Phases 4–7
 
 Not started.
 

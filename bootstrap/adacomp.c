@@ -717,7 +717,13 @@ enum {
     D_VAR_FILE=34,         /* X : Ada.Text_IO.File_Type; */
     D_VAR_DOTTED=35,       /* X : Some.Other.Dotted_Type [:= expr]; (treated as int) */
     D_VAR_ACCESS=36,       /* X : Some_Access_Type [:= expr]; -> Elem *x = NULL; */
-    D_VAR_RECORD=37        /* X : Some_Record_Type; -> struct t x = {0}; */
+    D_VAR_RECORD=37,       /* X : Some_Record_Type; -> struct t x = {0}; */
+    /* Type-definition nodes (Phase 3 seam: type defs are built and
+       walked like everything else instead of emitting during parse). */
+    D_TYPE_RECORD=38,      /* type R is record ... end record; -> struct */
+    D_FIELD=39,            /* one record field; chained via n_next */
+    D_TYPE_ENUM=40,        /* type T is (A, B, C); -> enum + image fn */
+    D_ENUM_LIT=41          /* one enum literal; chained via n_next */
 };
 
 enum {
@@ -1366,6 +1372,11 @@ static void emit_pool_lower(int off, int len) {
 static void emit_pool_raw(int off, int len) {
     for (int i = 0; i < len; i++)
         fputc(npool[off + i], out_file);
+}
+
+static void emit_pool_upper(int off, int len) {
+    for (int i = 0; i < len; i++)
+        fputc(toupper((unsigned char)npool[off + i]), out_file);
 }
 
 /* Emit one array subscript as C: the Ada index expression, bounds-checked
@@ -2688,6 +2699,56 @@ static void emit_declaration_ast(int n) {
             emit(" = NULL");
         }
         emit_line(";");
+    } else if (kind == D_TYPE_RECORD) {
+        /* struct <name> { <fields> }; — field variants: 0 scalar,
+           1 pointer-to-struct, 2 pointer-to-scalar. */
+        emit("struct ");
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit(" {");
+        for (int f = n_first[n]; f != 0; f = n_next[f]) {
+            emit(" ");
+            if (n_op[f] == 1) {
+                emit("struct ");
+                emit_pool_lower(n_arg2[f], n_aux2[f]);
+                emit(" *");
+            } else if (n_op[f] == 2) {
+                emit_c_type(n_int[f]);
+                emit(" *");
+            } else {
+                emit_c_type(n_int[f]);
+                emit(" ");
+            }
+            emit_pool_lower(n_str_off[f], n_str_len[f]);
+            emit(";");
+        }
+        emit_line(" };");
+    } else if (kind == D_TYPE_ENUM) {
+        /* enum { a, b, c }; plus, at file scope (n_op), the
+           <type>_image(v) function returning upper-cased names. */
+        emit("enum { ");
+        int first = 1;
+        for (int l = n_first[n]; l != 0; l = n_next[l]) {
+            if (!first) emit(", ");
+            first = 0;
+            emit_pool_lower(n_str_off[l], n_str_len[l]);
+        }
+        emit_line(" };");
+        if (n_op[n]) {
+            emit("static const char *");
+            emit_pool_lower(n_str_off[n], n_str_len[n]);
+            emit_line("_image(int v) {");
+            emit_line("    switch (v) {");
+            int i = 0;
+            for (int l = n_first[n]; l != 0; l = n_next[l]) {
+                emit("    case "); emit_int(i); emit(": return \"");
+                emit_pool_upper(n_str_off[l], n_str_len[l]);
+                emit_line("\";");
+                i++;
+            }
+            emit_line("    default: return \"?\";");
+            emit_line("    }");
+            emit_line("}");
+        }
     } else if (kind == D_VAR_RECORD) {
         /* struct <typename> name [= <other record>] (default {0}). */
         emit_indent();
@@ -2818,6 +2879,7 @@ static int parse_declaration_ast(void) {
             return 0;
         }
         expect(TK_IS);
+        int tnode = 0;   /* record/enum defs return a walkable node */
         if (tok == TK_ARRAY) {
             next_token();
             expect(TK_LPAREN);
@@ -2886,69 +2948,79 @@ static int parse_declaration_ast(void) {
             sym_arr_el[sym_count-1] = el;
             sym_arr_inner_lo[sym_count-1] = rec;
         } else if (tok == TK_RECORD) {
-            /* `record F1 : T1; ... end record;` -> a C struct, emitted
-               here (records, unlike array/access types, produce C). */
+            /* `record F1 : T1; ... end record;` -> a C struct. Built as
+               a D_TYPE_RECORD node with a D_FIELD chain; the declaration
+               walker renders it (Phase 3 seam: no emission here). */
             sym_type[sym_count-1] = TY_RECORD;
-            emit("struct ");
-            emit_str_lower(sym_name[sym_count-1], sym_nlen[sym_count-1]);
-            emit(" {");
+            tnode = new_node(D_TYPE_RECORD);
+            n_str_off[tnode] = pool_str(sym_name[sym_count-1], sym_nlen[sym_count-1]);
+            n_str_len[tnode] = sym_nlen[sym_count-1];
             next_token();   /* consume 'record' */
+            int prev_f = 0;
             while (tok != TK_END && tok != TK_EOF) {
                 char fname[MAX_NAME];
                 int fnl = tok_len;
                 memcpy(fname, tok_val, tok_len);
                 next_token();
                 expect(TK_COLON);
+                int f = new_node(D_FIELD);
+                n_str_off[f] = pool_str(fname, fnl);
+                n_str_len[f] = fnl;
                 /* Access-typed field -> a pointer member (this is what
                    makes self-referencing records like linked nodes work). */
                 int fti = (tok == TK_IDENT) ? find_sym(tok_val, tok_len) : -1;
                 if (fti >= 0 && sym_kind[fti] == SK_TYPE
                     && sym_type[fti] == TY_ACCESS) {
-                    emit(" ");
                     if (sym_arr_el[fti] == TY_RECORD && sym_arr_inner_lo[fti] != 0) {
                         int ri = sym_arr_inner_lo[fti] - 1;
-                        emit("struct ");
-                        emit_str_lower(sym_name[ri], sym_nlen[ri]);
+                        n_op[f] = 1;         /* struct pointer */
+                        n_arg2[f] = pool_str(sym_name[ri], sym_nlen[ri]);
+                        n_aux2[f] = sym_nlen[ri];
                     } else {
-                        emit_c_type(sym_arr_el[fti]);
+                        n_op[f] = 2;         /* scalar pointer */
+                        n_int[f] = sym_arr_el[fti];
                     }
-                    emit(" *");
-                    emit_str_lower(fname, fnl);
-                    emit(";");
                     next_token();
                 } else {
-                    int fty = parse_type_ref();
-                    emit(" ");
-                    emit_c_type(fty);
-                    emit(" ");
-                    emit_str_lower(fname, fnl);
-                    emit(";");
+                    n_op[f] = 0;             /* scalar */
+                    n_int[f] = parse_type_ref();
                 }
+                if (prev_f == 0) n_first[tnode] = f;
+                else n_next[prev_f] = f;
+                prev_f = f;
                 expect(TK_SEMI);
             }
-            emit_line(" };");
             expect(TK_END);
             expect(TK_RECORD);
         } else if (tok == TK_LPAREN) {
             /* enumeration: `type T is (A, B, C);` -> a C enum whose
                constants are the lowercased literals (a=0, b=1, ...).
                Each literal is registered as a constant so its use emits
-               the matching C name; the type itself is an int. */
+               the matching C name; the type itself is an int. Built as a
+               D_TYPE_ENUM node with a D_ENUM_LIT chain; the declaration
+               walker renders the enum and the <type>_image function. */
             int type_idx = sym_count - 1;
             sym_type[type_idx] = TY_ENUM;
-            emit("enum { ");
+            tnode = new_node(D_TYPE_ENUM);
+            n_str_off[tnode] = pool_str(sym_name[type_idx], sym_nlen[type_idx]);
+            n_str_len[tnode] = sym_nlen[type_idx];
+            /* T'Image support only at file scope — a nested C function
+               would be illegal (proc-local enum 'Image is deferred). */
+            n_op[tnode] = (indent_level == 0) ? 1 : 0;
             next_token();   /* consume '(' */
-            int first = 1;
             int first_lit = sym_count;
+            int prev_l = 0;
             while (tok != TK_RPAREN && tok != TK_EOF) {
-                if (!first) emit(", ");
-                first = 0;
-                emit_str_lower(tok_val, tok_len);   /* literal -> C constant */
+                int l = new_node(D_ENUM_LIT);
+                n_str_off[l] = pool_str(tok_val, tok_len);
+                n_str_len[l] = tok_len;
+                if (prev_l == 0) n_first[tnode] = l;
+                else n_next[prev_l] = l;
+                prev_l = l;
                 add_sym(SK_CONST, TY_ENUM);          /* register the literal */
                 next_token();
                 if (tok == TK_COMMA) next_token();
             }
-            emit_line(" };");
             expect(TK_RPAREN);
             int nlits = sym_count - first_lit;
             /* The type carries its position range [0, nlits-1] so 'First /
@@ -2956,25 +3028,6 @@ static int parse_declaration_ast(void) {
             sym_has_range[type_idx] = 1;
             sym_range_lo[type_idx] = 0;
             sym_range_hi[type_idx] = nlits - 1;
-            /* T'Image support: a <type>_image(v) that returns the
-               uppercased literal name. Only emit at file scope — a nested
-               C function would be illegal (proc-local enum 'Image is
-               deferred). The function is static, so if unused it is fine
-               under -Wno-unused-function. */
-            if (indent_level == 0) {
-                emit("static const char *");
-                emit_str_lower(sym_name[type_idx], sym_nlen[type_idx]);
-                emit_line("_image(int v) {");
-                emit_line("    switch (v) {");
-                for (int i = 0; i < nlits; i++) {
-                    emit("    case "); emit_int(i); emit(": return \"");
-                    emit_str_upper(sym_name[first_lit + i], sym_nlen[first_lit + i]);
-                    emit_line("\";");
-                }
-                emit_line("    default: return \"?\";");
-                emit_line("    }");
-                emit_line("}");
-            }
         } else if (tok == TK_RANGE) {
             /* `type T is range L .. H;` -> an integer type carrying a
                range constraint (no C emission; the type is a plain int). */
@@ -2990,7 +3043,7 @@ static int parse_declaration_ast(void) {
             while (tok != TK_SEMI && tok != TK_EOF) next_token();
         }
         expect(TK_SEMI);
-        return 0;
+        return tnode;
     }
 
     if (tok == TK_SUBTYPE) {

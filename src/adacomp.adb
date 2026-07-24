@@ -314,6 +314,12 @@ procedure Adacomp is
    D_VAR_FILE        : constant Integer := 34;
    D_VAR_DOTTED      : constant Integer := 35;
    D_VAR_ACCESS      : constant Integer := 36;
+   --  Type-definition nodes (Phase 3 seam: type defs are built and
+   --  walked like everything else instead of emitting during parse).
+   D_TYPE_RECORD     : constant Integer := 38;
+   D_FIELD           : constant Integer := 39;
+   D_TYPE_ENUM       : constant Integer := 40;
+   D_ENUM_LIT        : constant Integer := 41;
    D_VAR_RECORD      : constant Integer := 37;
 
    -- Node storage: 13 parallel growable arrays (access-to-Int_Vec, the
@@ -1543,6 +1549,13 @@ procedure Adacomp is
          Emit_Ch (NPool (Off + I - 1));
       end loop;
    end Emit_Pool_Raw;
+
+   procedure Emit_Pool_Upper (Off : Integer; Len : Integer) is
+   begin
+      for I in 1 .. Len loop
+         Emit_Ch (To_Upper (NPool (Off + I - 1)));
+      end loop;
+   end Emit_Pool_Upper;
 
    -- Forward declarations
    procedure Parse_Expression;
@@ -3745,6 +3758,70 @@ procedure Adacomp is
             Emit (" = NULL");
          end if;
          Emit_Ln (";");
+      elsif Kind = D_TYPE_RECORD then
+         -- struct <name> { <fields> }; — field variants: 0 scalar,
+         -- 1 pointer-to-struct, 2 pointer-to-scalar.
+         declare
+            F : Integer;
+         begin
+            Emit ("struct ");
+            Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            Emit (" {");
+            F := N_First (N);
+            while F /= 0 loop
+               Emit (" ");
+               if N_Op (F) = 1 then
+                  Emit ("struct ");
+                  Emit_Pool_Lower (N_Arg2 (F), N_Aux2 (F));
+                  Emit (" *");
+               elsif N_Op (F) = 2 then
+                  Emit_C_Type (N_Int (F));
+                  Emit (" *");
+               else
+                  Emit_C_Type (N_Int (F));
+                  Emit (" ");
+               end if;
+               Emit_Pool_Lower (N_Str_Off (F), N_Str_Len (F));
+               Emit (";");
+               F := N_Next (F);
+            end loop;
+            Emit_Ln (" };");
+         end;
+      elsif Kind = D_TYPE_ENUM then
+         -- enum { a, b, c }; plus, at file scope (N_Op), the
+         -- <type>_image(v) function returning upper-cased names.
+         declare
+            L     : Integer;
+            First : Boolean := True;
+            I     : Integer := 0;
+         begin
+            Emit ("enum { ");
+            L := N_First (N);
+            while L /= 0 loop
+               if not First then Emit (", "); end if;
+               First := False;
+               Emit_Pool_Lower (N_Str_Off (L), N_Str_Len (L));
+               L := N_Next (L);
+            end loop;
+            Emit_Ln (" };");
+            if N_Op (N) = 1 then
+               Emit ("static const char *");
+               Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+               Emit_Ln ("_image(int v) {");
+               Emit_Ln ("    switch (v) {");
+               L := N_First (N);
+               while L /= 0 loop
+                  Emit ("    case "); Emit_Int (I); Emit (": return """);
+                  Emit_Pool_Upper (N_Str_Off (L), N_Str_Len (L));
+                  Emit_Ln (""";");
+                  I := I + 1;
+                  L := N_Next (L);
+               end loop;
+               Emit_Ln ("    default: return ""?"";");
+               Emit_Ln ("    }");
+               Emit_Ln ("}");
+            end if;
+         end;
       elsif Kind = D_VAR_RECORD then
          -- struct <typename> name [= <other record>] (default {0}).
          Emit_Indent;
@@ -3899,6 +3976,7 @@ procedure Adacomp is
       Typ      : Integer;
       Is_Const : Boolean;
       N        : Integer;
+      Tnode    : Integer := 0;   -- record/enum defs return a walkable node
    begin
       if Tok = TK_TYPE then
          Next_Token;
@@ -3994,15 +4072,19 @@ procedure Adacomp is
                Sym_Arr_Inner_Lo (Sym_Count) := Rec;
             end;
          elsif Tok = TK_RECORD then
-            -- `record F1 : T1; ... end record;` -> a C struct, emitted here.
+            -- `record F1 : T1; ... end record;` -> a C struct. Built as
+            -- a D_TYPE_RECORD node with a D_FIELD chain; the declaration
+            -- walker renders it (Phase 3 seam: no emission here).
             declare
-               FTy : Integer;
-               Fti : Integer;
+               Fti    : Integer;
+               F      : Integer;
+               Prev_F : Integer := 0;
             begin
                Sym_Type (Sym_Count) := TY_RECORD;
-               Emit ("struct ");
-               Emit_Name_Pool_Lower (Sym_Name_Off (Sym_Count), Sym_Name_Len (Sym_Count));
-               Emit (" {");
+               Tnode := New_Node (D_TYPE_RECORD);
+               N_Str_Off (Tnode) := Pool_Name_Pool (Sym_Name_Off (Sym_Count),
+                                                    Sym_Name_Len (Sym_Count));
+               N_Str_Len (Tnode) := Sym_Name_Len (Sym_Count);
                Next_Token;   -- consume 'record'
                while Tok /= TK_END and Tok /= TK_EOF loop
                   declare
@@ -4015,6 +4097,9 @@ procedure Adacomp is
                      end loop;
                      Next_Token;
                      Expect (TK_COLON);
+                     F := New_Node (D_FIELD);
+                     N_Str_Off (F) := Pool_Str (FName, FNLen);
+                     N_Str_Len (F) := FNLen;
                      -- Access-typed field -> a pointer member (this is what
                      -- makes self-referencing records like list nodes work).
                      Fti := -1;
@@ -4024,33 +4109,32 @@ procedure Adacomp is
                      if Fti > 0 and then Sym_Kind (Fti) = SK_TYPE
                         and then Sym_Type (Fti) = TY_ACCESS
                      then
-                        Emit (" ");
                         if Sym_Arr_El (Fti) = TY_RECORD
                            and then Sym_Arr_Inner_Lo (Fti) /= 0
                         then
-                           Emit ("struct ");
-                           Emit_Name_Pool_Lower
+                           N_Op (F) := 1;   -- struct pointer
+                           N_Arg2 (F) := Pool_Name_Pool
                               (Sym_Name_Off (Sym_Arr_Inner_Lo (Fti) - 1),
                                Sym_Name_Len (Sym_Arr_Inner_Lo (Fti) - 1));
+                           N_Aux2 (F) := Sym_Name_Len (Sym_Arr_Inner_Lo (Fti) - 1);
                         else
-                           Emit_C_Type (Sym_Arr_El (Fti));
+                           N_Op (F) := 2;   -- scalar pointer
+                           N_Int (F) := Sym_Arr_El (Fti);
                         end if;
-                        Emit (" *");
-                        Emit_Lower (FName, FNLen);
-                        Emit (";");
                         Next_Token;
                      else
-                        FTy := Parse_Type_Ref;
-                        Emit (" ");
-                        Emit_C_Type (FTy);
-                        Emit (" ");
-                        Emit_Lower (FName, FNLen);
-                        Emit (";");
+                        N_Op (F) := 0;      -- scalar
+                        N_Int (F) := Parse_Type_Ref;
                      end if;
+                     if Prev_F = 0 then
+                        N_First (Tnode) := F;
+                     else
+                        N_Next (Prev_F) := F;
+                     end if;
+                     Prev_F := F;
                      Expect (TK_SEMI);
                   end;
                end loop;
-               Emit_Ln (" };");
                Expect (TK_END);
                Expect (TK_RECORD);
             end;
@@ -4058,24 +4142,40 @@ procedure Adacomp is
             -- enumeration: `type T is (A, B, C);` -> a C enum whose
             -- constants are the lowercased literals (a=0, b=1, ...). Each
             -- literal is registered as a constant; the type is an int.
+            -- Built as a D_TYPE_ENUM node with a D_ENUM_LIT chain; the
+            -- declaration walker renders the enum and the <type>_image
+            -- function (Phase 3 seam: no emission here).
             declare
-               First     : Boolean := True;
                Type_Idx  : Integer := Sym_Count;
-               First_Lit : Integer := Sym_Count + 1;
                Nlits     : Integer;
+               L         : Integer;
+               Prev_L    : Integer := 0;
             begin
                Sym_Type (Type_Idx) := TY_ENUM;
-               Emit ("enum { ");
+               Tnode := New_Node (D_TYPE_ENUM);
+               N_Str_Off (Tnode) := Pool_Name_Pool (Sym_Name_Off (Type_Idx),
+                                                    Sym_Name_Len (Type_Idx));
+               N_Str_Len (Tnode) := Sym_Name_Len (Type_Idx);
+               -- T'Image support only at file scope — a nested C function
+               -- would be illegal (proc-local enum 'Image is deferred).
+               if Indent_Level = 0 then
+                  N_Op (Tnode) := 1;
+               end if;
                Next_Token;   -- consume '('
                while Tok /= TK_RPAREN and Tok /= TK_EOF loop
-                  if not First then Emit (", "); end if;
-                  First := False;
-                  Emit_Lower (Tok_Val, Tok_Len);     -- literal -> C constant
+                  L := New_Node (D_ENUM_LIT);
+                  N_Str_Off (L) := Pool_Str (Tok_Val, Tok_Len);
+                  N_Str_Len (L) := Tok_Len;
+                  if Prev_L = 0 then
+                     N_First (Tnode) := L;
+                  else
+                     N_Next (Prev_L) := L;
+                  end if;
+                  Prev_L := L;
                   Add_Sym (SK_CONST, TY_ENUM);        -- register the literal
                   Next_Token;
                   if Tok = TK_COMMA then Next_Token; end if;
                end loop;
-               Emit_Ln (" };");
                Expect (TK_RPAREN);
                Nlits := Sym_Count - Type_Idx;
                -- The type carries its position range [0, Nlits-1] so
@@ -4083,25 +4183,6 @@ procedure Adacomp is
                Sym_Has_Range (Type_Idx) := 1;
                Sym_Range_Lo (Type_Idx) := 0;
                Sym_Range_Hi (Type_Idx) := Nlits - 1;
-               -- T'Image support: <type>_image(v) returning the uppercased
-               -- literal name. Only emit at file scope (a nested C function
-               -- would be illegal; proc-local enum 'Image is deferred).
-               if Indent_Level = 0 then
-                  Emit ("static const char *");
-                  Emit_Name_Pool_Lower (Sym_Name_Off (Type_Idx),
-                                        Sym_Name_Len (Type_Idx));
-                  Emit_Ln ("_image(int v) {");
-                  Emit_Ln ("    switch (v) {");
-                  for I in 0 .. Nlits - 1 loop
-                     Emit ("    case "); Emit_Int (I); Emit (": return """);
-                     Emit_Name_Pool_Upper (Sym_Name_Off (First_Lit + I),
-                                           Sym_Name_Len (First_Lit + I));
-                     Emit_Ln (""";");
-                  end loop;
-                  Emit_Ln ("    default: return ""?"";");
-                  Emit_Ln ("    }");
-                  Emit_Ln ("}");
-               end if;
             end;
          elsif Tok = TK_RANGE then
             -- `type T is range L .. H;` -> an integer type carrying a
@@ -4125,7 +4206,7 @@ procedure Adacomp is
             end loop;
          end if;
          Expect (TK_SEMI);
-         return 0;
+         return Tnode;
       end if;
 
       if Tok = TK_SUBTYPE then
