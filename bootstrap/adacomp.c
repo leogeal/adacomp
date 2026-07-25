@@ -149,6 +149,12 @@ static int *def_nlen = NULL;
 static int def_cap = 0;
 static int def_count = 0;
 
+/* Parse-time declarative nesting depth (0 = library level). Replaces
+   parse-time reads of the emitter's indent_level now that subprogram
+   emission is deferred to the walker: enum image functions are only
+   generated at depth 0. */
+static int decl_depth = 0;
+
 static void grow_defs(int need) {
     if (need < def_cap) return;
     int new_cap = def_cap ? def_cap * 2 : 256;
@@ -718,12 +724,15 @@ enum {
     D_VAR_DOTTED=35,       /* X : Some.Other.Dotted_Type [:= expr]; (treated as int) */
     D_VAR_ACCESS=36,       /* X : Some_Access_Type [:= expr]; -> Elem *x = NULL; */
     D_VAR_RECORD=37,       /* X : Some_Record_Type; -> struct t x = {0}; */
-    /* Type-definition nodes (Phase 3 seam: type defs are built and
-       walked like everything else instead of emitting during parse). */
-    D_TYPE_RECORD=38,      /* type R is record ... end record; -> struct */
-    D_FIELD=39,            /* one record field; chained via n_next */
-    D_TYPE_ENUM=40,        /* type T is (A, B, C); -> enum + image fn */
-    D_ENUM_LIT=41          /* one enum literal; chained via n_next */
+    /* Type/subprogram-definition nodes (Phase 3 seam: built and walked
+       like everything else instead of emitting during parse). Numbered
+       from 60 so declaration kinds never alias statement kinds. */
+    D_TYPE_RECORD=60,      /* type R is record ... end record; -> struct */
+    D_FIELD=61,            /* one record field; chained via n_next */
+    D_TYPE_ENUM=62,        /* type T is (A, B, C); -> enum + image fn */
+    D_ENUM_LIT=63,         /* one enum literal; chained via n_next */
+    D_SUBPROG=64,          /* procedure/function: signature + whole body */
+    D_PARAM=65             /* one parameter; chained via n_next */
 };
 
 enum {
@@ -938,14 +947,6 @@ static void emit_with_includes(void) {
 /* A subprogram's emitted C name: <pkg>_<name> when declared inside a
    package, else just <name>. cur_pkg is the package symbol index + 1
    (0 = not in a package), so package symbol index 0 isn't ambiguous. */
-static void emit_sub_name(const char *s, int len) {
-    if (cur_pkg) {
-        emit_str_lower(sym_name[cur_pkg - 1], sym_nlen[cur_pkg - 1]);
-        emit("_");
-    }
-    emit_str_lower(s, len);
-}
-
 static int parse_primary_ast(void) {
     int n;
     if (tok == TK_INT_LIT) {
@@ -2749,6 +2750,50 @@ static void emit_declaration_ast(int n) {
             emit_line("    }");
             emit_line("}");
         }
+    } else if (kind == D_SUBPROG) {
+        /* Signature (unindented, GNU nested functions when non-top):
+           `void name(` / `<ret> name(`, params, then `);` for a forward
+           declaration or the braced declarations + body. */
+        if (n_int[n] == 0) {
+            emit("void ");
+        } else {
+            emit_c_type(n_int[n]);
+            emit(" ");
+        }
+        emit_pool_lower(n_str_off[n], n_str_len[n]);
+        emit("(");
+        int firstp = 1;
+        for (int p = n_first[n]; p != 0; p = n_next[p]) {
+            if (!firstp) emit(", ");
+            firstp = 0;
+            if (n_op[p] == 1) {
+                emit_c_type(n_int[p]);
+                emit(" *");
+            } else if (n_op[p] == 2) {
+                emit("struct ");
+                emit_pool_lower(n_arg2[p], n_aux2[p]);
+                emit(" ");
+            } else {
+                emit_c_type(n_int[p]);
+                emit(" ");
+            }
+            emit_pool_lower(n_str_off[p], n_str_len[p]);
+        }
+        /* Zero params render as `()` for procedures but `(void)` for
+           functions — matching the historical output exactly. */
+        if (firstp && n_int[n] != 0) emit("void");
+        if (n_op[n] == 1) {
+            emit_line(");");
+        } else {
+            emit_line(") {");
+            indent_level++;
+            emit_declaration_chain(n_arg2[n]);
+            if (n_right[n] != 0) emit_handled(n_left[n], n_right[n]);
+            else emit_statement_chain(n_left[n]);
+            indent_level--;
+            emit_line("}");
+            emit_line("");
+        }
     } else if (kind == D_VAR_RECORD) {
         /* struct <typename> name [= <other record>] (default {0}). */
         emit_indent();
@@ -3006,7 +3051,7 @@ static int parse_declaration_ast(void) {
             n_str_len[tnode] = sym_nlen[type_idx];
             /* T'Image support only at file scope — a nested C function
                would be illegal (proc-local enum 'Image is deferred). */
-            n_op[tnode] = (indent_level == 0) ? 1 : 0;
+            n_op[tnode] = (decl_depth == 0) ? 1 : 0;
             next_token();   /* consume '(' */
             int first_lit = sym_count;
             int prev_l = 0;
@@ -3129,9 +3174,23 @@ static int parse_declaration_ast(void) {
                 restore_lex(&s);
             }
 
-            emit("void ");
-            emit_sub_name(pname, plen);
-            emit("(");
+            int sp = new_node(D_SUBPROG);
+            n_int[sp] = 0;                 /* 0 = procedure (void) */
+            /* Resolve the emitted (possibly package-mangled) name now,
+               so the walker never reads the symbol table. */
+            {
+                char ename[MAX_NAME * 2 + 2];
+                int elen = 0;
+                if (cur_pkg) {
+                    memcpy(ename, sym_name[cur_pkg - 1], sym_nlen[cur_pkg - 1]);
+                    elen = sym_nlen[cur_pkg - 1];
+                    ename[elen++] = '_';
+                }
+                memcpy(ename + elen, pname, plen);
+                elen += plen;
+                n_str_off[sp] = pool_str(ename, elen);
+                n_str_len[sp] = elen;
+            }
 
             push_scope();
 
@@ -3141,19 +3200,20 @@ static int parse_declaration_ast(void) {
                 if (sym_kind[si] == SK_PROC) { psym = si; break; }
             int def_base = def_count;
             int nparams = 0;
+            int prev_p = 0;
 
             if (tok == TK_LPAREN) {
                 next_token();
-                int first = 1;
                 while (tok != TK_RPAREN && tok != TK_EOF) {
-                    if (!first) emit(", ");
-                    first = 0;
                     char pn[MAX_NAME];
                     int pnl = tok_len;
                     memcpy(pn, tok_val, tok_len);
                     add_sym(SK_PARAM, TY_INTEGER);
                     next_token();
                     expect(TK_COLON);
+                    int pp = new_node(D_PARAM);
+                    n_str_off[pp] = pool_str(pn, pnl);
+                    n_str_len[pp] = pnl;
                     /* Named array type as parameter decays to a pointer; a
                        record type passes by value as `struct <name>`. */
                     int arr_idx = -1;
@@ -3171,25 +3231,25 @@ static int parse_declaration_ast(void) {
                         sym_arr_lo[sym_count-1] = sym_arr_lo[arr_idx];
                         sym_arr_hi[sym_count-1] = sym_arr_hi[arr_idx];
                         sym_arr_el[sym_count-1] = sym_arr_el[arr_idx];
-                        emit_c_type(sym_arr_el[arr_idx]);
-                        emit(" *");
-                        emit_str_lower(pn, pnl);
+                        n_op[pp] = 1;                 /* elem-pointer param */
+                        n_int[pp] = sym_arr_el[arr_idx];
                         next_token();
                     } else if (rec_idx >= 0) {
                         sym_type[sym_count-1] = TY_RECORD;
-                        emit("struct ");
-                        emit_str_lower(sym_name[rec_idx], sym_nlen[rec_idx]);
-                        emit(" ");
-                        emit_str_lower(pn, pnl);
+                        n_op[pp] = 2;                 /* by-value struct */
+                        n_arg2[pp] = pool_str(sym_name[rec_idx], sym_nlen[rec_idx]);
+                        n_aux2[pp] = sym_nlen[rec_idx];
                         next_token();
                     } else {
                         int typ = parse_type_ref();
                         sym_type[sym_count-1] = typ;
                         if (typ == TY_STRING) sym_arr_lo[sym_count-1] = 1;
-                        emit_c_type(typ);
-                        emit(" ");
-                        emit_str_lower(pn, pnl);
+                        n_op[pp] = 0;                 /* scalar */
+                        n_int[pp] = typ;
                     }
+                    if (prev_p == 0) n_first[sp] = pp;
+                    else n_next[prev_p] = pp;
+                    prev_p = pp;
                     /* Optional default: `:= <literal or named constant>`.
                        Doesn't affect the C signature; call sites append
                        omitted trailing arguments from the recorded slot. */
@@ -3229,26 +3289,24 @@ static int parse_declaration_ast(void) {
 
             /* Forward declaration: `procedure Name (...);` with no body */
             if (tok == TK_SEMI) {
-                emit_line(");");
+                n_op[sp] = 1;
                 next_token();
                 pop_scope();
-                return 0;
+                return sp;
             }
 
-            emit_line(") {");
             expect(TK_IS);
-            indent_level++;
-            parse_declarations();
+            decl_depth++;
+            n_arg2[sp] = parse_var_decl_chain();   /* nested declarations */
             expect(TK_BEGIN);
-            parse_statements();
-            indent_level--;
-            emit_line("}");
-            emit_line("");
+            n_left[sp] = parse_statement_chain();  /* body */
+            n_right[sp] = g_pending_handlers;      /* handler arms, or 0 */
+            decl_depth--;
             expect(TK_END);
             if (tok == TK_IDENT) next_token();
             expect(TK_SEMI);
             pop_scope();
-            return 0;
+            return sp;
         }
 
         if (tok == TK_FUNCTION) {
@@ -3260,24 +3318,36 @@ static int parse_declaration_ast(void) {
             if (cur_pkg) sym_arr_lo[sym_count-1] = cur_pkg;
             next_token();
 
+            int sp = new_node(D_SUBPROG);
+            {
+                char ename[MAX_NAME * 2 + 2];
+                int elen = 0;
+                if (cur_pkg) {
+                    memcpy(ename, sym_name[cur_pkg - 1], sym_nlen[cur_pkg - 1]);
+                    elen = sym_nlen[cur_pkg - 1];
+                    ename[elen++] = '_';
+                }
+                memcpy(ename + elen, fname, flen);
+                elen += flen;
+                n_str_off[sp] = pool_str(ename, elen);
+                n_str_len[sp] = elen;
+            }
+
             push_scope();
 
-            /* Collect params */
-            char pnames[20][MAX_NAME];
-            int plens[20];
-            int ptypes[20];
-            int pel_type[20];   /* element type when ptypes[i]==TY_ARRAY, else 0 */
-            int prec_idx[20];   /* record type symbol index when TY_RECORD, else -1 */
-            int pcount = 0;
-
+            int prev_p = 0;
             if (tok == TK_LPAREN) {
                 next_token();
                 while (tok != TK_RPAREN && tok != TK_EOF) {
-                    plens[pcount] = tok_len;
-                    memcpy(pnames[pcount], tok_val, tok_len);
+                    char pn[MAX_NAME];
+                    int pnl = tok_len;
+                    memcpy(pn, tok_val, tok_len);
                     add_sym(SK_PARAM, TY_INTEGER);
                     next_token();
                     expect(TK_COLON);
+                    int pp = new_node(D_PARAM);
+                    n_str_off[pp] = pool_str(pn, pnl);
+                    n_str_len[pp] = pnl;
                     /* Named array type: pointer-decay parameter */
                     int arr_idx = -1;
                     int rec_idx = -1;
@@ -3289,80 +3359,58 @@ static int parse_declaration_ast(void) {
                             rec_idx = ti;
                         }
                     }
-                    prec_idx[pcount] = -1;
                     if (arr_idx >= 0) {
-                        ptypes[pcount] = TY_ARRAY;
-                        pel_type[pcount] = sym_arr_el[arr_idx];
                         sym_type[sym_count-1] = TY_ARRAY;
                         sym_arr_lo[sym_count-1] = sym_arr_lo[arr_idx];
                         sym_arr_hi[sym_count-1] = sym_arr_hi[arr_idx];
                         sym_arr_el[sym_count-1] = sym_arr_el[arr_idx];
+                        n_op[pp] = 1;
+                        n_int[pp] = sym_arr_el[arr_idx];
                         next_token();
                     } else if (rec_idx >= 0) {
-                        ptypes[pcount] = TY_RECORD;
-                        pel_type[pcount] = 0;
-                        prec_idx[pcount] = rec_idx;
                         sym_type[sym_count-1] = TY_RECORD;
+                        n_op[pp] = 2;
+                        n_arg2[pp] = pool_str(sym_name[rec_idx], sym_nlen[rec_idx]);
+                        n_aux2[pp] = sym_nlen[rec_idx];
                         next_token();
                     } else {
-                        ptypes[pcount] = parse_type_ref();
-                        pel_type[pcount] = 0;
-                        sym_type[sym_count-1] = ptypes[pcount];
-                        if (ptypes[pcount] == TY_STRING) sym_arr_lo[sym_count-1] = 1;
+                        int typ = parse_type_ref();
+                        sym_type[sym_count-1] = typ;
+                        if (typ == TY_STRING) sym_arr_lo[sym_count-1] = 1;
+                        n_op[pp] = 0;
+                        n_int[pp] = typ;
                     }
-                    pcount++;
+                    if (prev_p == 0) n_first[sp] = pp;
+                    else n_next[prev_p] = pp;
+                    prev_p = pp;
                     if (tok == TK_SEMI) next_token();
                 }
                 expect(TK_RPAREN);
             }
 
             expect(TK_RETURN);
-            int ret_type = parse_type_ref();
-
-            emit_c_type(ret_type);
-            emit(" ");
-            emit_sub_name(fname, flen);
-            emit("(");
-            for (int i = 0; i < pcount; i++) {
-                if (i > 0) emit(", ");
-                if (ptypes[i] == TY_ARRAY) {
-                    emit_c_type(pel_type[i]);
-                    emit(" *");
-                } else if (ptypes[i] == TY_RECORD) {
-                    emit("struct ");
-                    emit_str_lower(sym_name[prec_idx[i]], sym_nlen[prec_idx[i]]);
-                    emit(" ");
-                } else {
-                    emit_c_type(ptypes[i]);
-                    emit(" ");
-                }
-                emit_str_lower(pnames[i], plens[i]);
-            }
-            if (pcount == 0) emit("void");
+            n_int[sp] = parse_type_ref();   /* non-zero: function ret type */
 
             /* Forward declaration: `function F (...) return T;` with no body */
             if (tok == TK_SEMI) {
-                emit_line(");");
+                n_op[sp] = 1;
                 next_token();
                 pop_scope();
-                return 0;
+                return sp;
             }
 
-            emit_line(") {");
-
             expect(TK_IS);
-            indent_level++;
-            parse_declarations();
+            decl_depth++;
+            n_arg2[sp] = parse_var_decl_chain();   /* nested declarations */
             expect(TK_BEGIN);
-            parse_statements();
-            indent_level--;
-            emit_line("}");
-            emit_line("");
+            n_left[sp] = parse_statement_chain();  /* body */
+            n_right[sp] = g_pending_handlers;      /* handler arms, or 0 */
+            decl_depth--;
             expect(TK_END);
             if (tok == TK_IDENT) next_token();
             expect(TK_SEMI);
             pop_scope();
-            return 0;
+            return sp;
         }
 
         if (tok == TK_IDENT) {

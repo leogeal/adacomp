@@ -92,10 +92,12 @@ via `g_pending_handlers` and attached to the owning frame node.
 | `D_VAR_STRING` 33 / `D_VAR_FILE` 34 / `D_VAR_DOTTED` 35 | strings, File_Type, dotted-type vars |
 | `D_VAR_ACCESS` 36 | access var; `n_aux1` elem TY (TY_RECORD pools struct name in `n_arg2`) |
 | `D_VAR_RECORD` 37 | record var; `n_arg2`+`n_int` type name |
-| `D_TYPE_RECORD` 38 | record type; `n_str` name; `n_first` `D_FIELD` chain |
-| `D_FIELD` 39 | field; `n_op` 0 scalar / 1 struct-ptr (`n_arg2`+`n_aux2` name) / 2 scalar-ptr; `n_int` TY |
-| `D_TYPE_ENUM` 40 | enum type; `n_str` name; `n_first` `D_ENUM_LIT` chain; `n_op`=1 emit image fn |
-| `D_ENUM_LIT` 41 | one literal; `n_str` |
+| `D_TYPE_RECORD` 60 | record type; `n_str` name; `n_first` `D_FIELD` chain |
+| `D_FIELD` 61 | field; `n_op` 0 scalar / 1 struct-ptr (`n_arg2`+`n_aux2` name) / 2 scalar-ptr; `n_int` TY |
+| `D_TYPE_ENUM` 62 | enum type; `n_str` name; `n_first` `D_ENUM_LIT` chain; `n_op`=1 emit image fn |
+| `D_ENUM_LIT` 63 | one literal; `n_str` |
+| `D_SUBPROG` 64 | whole procedure/function: `n_str` resolved (mangled) name; `n_int` return TY (0 = procedure); `n_op`=1 forward decl; `n_first` `D_PARAM` chain; `n_arg2` nested decl chain; `n_left` body statement chain; `n_right` handler arms |
+| `D_PARAM` 65 | parameter; `n_op` 0 scalar / 1 elem-pointer (array decay) / 2 by-value struct (`n_arg2`+`n_aux2` name); `n_int` TY |
 
 ## Backend contract and remaining seam work
 
@@ -103,10 +105,16 @@ A backend implements three walkers — declarations, statements
 (`emit_statement_chain`), expressions — plus the handled-frame wrapper
 (`emit_handled`). Everything they need is on the nodes.
 
+Subprograms are whole subtrees: a `D_SUBPROG` carries its parameters,
+nested declarations (recursively including nested subprograms — emitted
+as GNU C nested functions), body, and handlers; the walker renders the
+complete definition. Nesting depth at parse time is tracked by
+`decl_depth` (the emitter's `indent_level` is walk-state only).
+
 **Not yet routed through the IR** (still emitted as C text during
-parsing): subprogram signatures and bodies' scaffolding (`void f(...) {`
-/ `}`), package unit scaffolding (`#include`s, prototypes), the program
-preamble (`int_to_str`, `int main`). These are the remaining Phase 3
-steps; until they land, a second backend cannot be plugged in, but the
-surface shrinks with each conversion (type definitions were converted
-first, validated byte-identically).
+parsing): package unit scaffolding (`#include`s, spec prototypes), the
+program preamble (`int_to_str`, `int main`), and the in-proc `package`
+namespace declaration. These are the remaining Phase 3 steps; until
+they land, a second backend cannot be plugged in, but the surface
+shrinks with each conversion (type definitions first, then whole
+subprograms — each validated byte-identically).

@@ -696,8 +696,20 @@ adacomp.adb itself.
   mid-statement-build, before the enclosing block was walked).
   Verified byte-identical over all 35 fixtures + adacomp.adb +
   multifile units, under both compilers.
-- [ ] Subprogram declarations build-then-walk (signatures, param
-  lists, forward decls; bodies already build/walk their statements).
+- [x] **Subprograms build-then-walk.** A procedure/function is now one
+  D_SUBPROG subtree: resolved (package-mangled) name, D_PARAM chain
+  (scalar / array-decay / by-value struct variants), nested declaration
+  chain (recursively containing nested D_SUBPROGs — rendered as GNU C
+  nested functions exactly as before), body statement chain, and
+  handler arms. The walker emits the whole definition; forward
+  declarations are a node flag. Parse no longer touches the emitter's
+  indent_level (a new parse-side decl_depth drives the enum
+  image-function file-scope test), parameterless procs keep emitting
+  `()` vs functions' `(void)`, and defaults recording is untouched.
+  D_* kinds renumbered to 60+ so declaration kinds never alias
+  statement kinds. Verified byte-identical (bootstrap AND stage1 vs
+  the pre-seam reference) over all fixtures, adacomp.adb, the
+  multifile units, and a nested-subprogram probe.
 - [ ] Unit scaffolding behind the backend (program preamble,
   `int main`, package spec/body emission).
 - [ ] Single backend entry point (one dispatch table / module per

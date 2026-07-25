@@ -200,6 +200,12 @@ procedure Adacomp is
    Def_Cap   : Integer := 0;
    Def_Count : Integer := 0;
 
+   -- Parse-time declarative nesting depth (0 = library level). Replaces
+   -- parse-time reads of the emitter's Indent_Level now that subprogram
+   -- emission is deferred to the walker: enum image functions are only
+   -- generated at depth 0.
+   Decl_Depth : Integer := 0;
+
    -- Output
    Out_File : Ada.Text_IO.File_Type;
 
@@ -314,12 +320,15 @@ procedure Adacomp is
    D_VAR_FILE        : constant Integer := 34;
    D_VAR_DOTTED      : constant Integer := 35;
    D_VAR_ACCESS      : constant Integer := 36;
-   --  Type-definition nodes (Phase 3 seam: type defs are built and
-   --  walked like everything else instead of emitting during parse).
-   D_TYPE_RECORD     : constant Integer := 38;
-   D_FIELD           : constant Integer := 39;
-   D_TYPE_ENUM       : constant Integer := 40;
-   D_ENUM_LIT        : constant Integer := 41;
+   --  Type/subprogram-definition nodes (Phase 3 seam: built and walked
+   --  like everything else instead of emitting during parse). Numbered
+   --  from 60 so declaration kinds never alias statement kinds.
+   D_TYPE_RECORD     : constant Integer := 60;
+   D_FIELD           : constant Integer := 61;
+   D_TYPE_ENUM       : constant Integer := 62;
+   D_ENUM_LIT        : constant Integer := 63;
+   D_SUBPROG         : constant Integer := 64;
+   D_PARAM           : constant Integer := 65;
    D_VAR_RECORD      : constant Integer := 37;
 
    -- Node storage: 13 parallel growable arrays (access-to-Int_Vec, the
@@ -1121,17 +1130,6 @@ procedure Adacomp is
          Emit_Ch (To_Upper (Name_Pool (Off + I - 1)));
       end loop;
    end Emit_Name_Pool_Upper;
-
-   -- A subprogram's emitted C name: <pkg>_<name> inside a package, else
-   -- just <name>. Cur_Pkg is the package symbol index + 1 (0 = none).
-   procedure Emit_Sub_Name (Buf : Tok_Buffer; Len : Integer) is
-   begin
-      if Cur_Pkg /= 0 then
-         Emit_Name_Pool_Lower (Sym_Name_Off (Cur_Pkg - 1), Sym_Name_Len (Cur_Pkg - 1));
-         Emit ("_");
-      end if;
-      Emit_Lower (Buf, Len);
-   end Emit_Sub_Name;
 
    -- Symbol table
    function Pool_Eq (Off : Integer; Len : Integer; Buf : Tok_Buffer; BLen : Integer) return Boolean is
@@ -3822,6 +3820,61 @@ procedure Adacomp is
                Emit_Ln ("}");
             end if;
          end;
+      elsif Kind = D_SUBPROG then
+         -- Signature (unindented; GNU nested functions when non-top):
+         -- `void name(` / `<ret> name(`, params, then `);` for a forward
+         -- declaration or the braced declarations + body.
+         declare
+            P      : Integer;
+            First  : Boolean := True;
+         begin
+            if N_Int (N) = 0 then
+               Emit ("void ");
+            else
+               Emit_C_Type (N_Int (N));
+               Emit (" ");
+            end if;
+            Emit_Pool_Lower (N_Str_Off (N), N_Str_Len (N));
+            Emit ("(");
+            P := N_First (N);
+            while P /= 0 loop
+               if not First then Emit (", "); end if;
+               First := False;
+               if N_Op (P) = 1 then
+                  Emit_C_Type (N_Int (P));
+                  Emit (" *");
+               elsif N_Op (P) = 2 then
+                  Emit ("struct ");
+                  Emit_Pool_Lower (N_Arg2 (P), N_Aux2 (P));
+                  Emit (" ");
+               else
+                  Emit_C_Type (N_Int (P));
+                  Emit (" ");
+               end if;
+               Emit_Pool_Lower (N_Str_Off (P), N_Str_Len (P));
+               P := N_Next (P);
+            end loop;
+            -- Zero params render as `()` for procedures but `(void)` for
+            -- functions — matching the historical output exactly.
+            if First and N_Int (N) /= 0 then
+               Emit ("void");
+            end if;
+            if N_Op (N) = 1 then
+               Emit_Ln (");");
+            else
+               Emit_Ln (") {");
+               Indent_Level := Indent_Level + 1;
+               Emit_Declaration_Chain (N_Arg2 (N));
+               if N_Right (N) /= 0 then
+                  Emit_Handled (N_Left (N), N_Right (N));
+               else
+                  Emit_Statement_Chain (N_Left (N));
+               end if;
+               Indent_Level := Indent_Level - 1;
+               Emit_Ln ("}");
+               Emit_Ln ("");
+            end if;
+         end;
       elsif Kind = D_VAR_RECORD then
          -- struct <typename> name [= <other record>] (default {0}).
          Emit_Indent;
@@ -4158,7 +4211,7 @@ procedure Adacomp is
                N_Str_Len (Tnode) := Sym_Name_Len (Type_Idx);
                -- T'Image support only at file scope — a nested C function
                -- would be illegal (proc-local enum 'Image is deferred).
-               if Indent_Level = 0 then
+               if Decl_Depth = 0 then
                   N_Op (Tnode) := 1;
                end if;
                Next_Token;   -- consume '('
@@ -4287,7 +4340,9 @@ procedure Adacomp is
             declare
                P_Name : Tok_Buffer;
                P_Len  : Integer;
-               Is_Fwd : Boolean := False;
+               SP     : Integer;
+               EName  : Tok_Buffer;
+               ELen   : Integer;
             begin
                P_Len := Tok_Len;
                for I in 1 .. Tok_Len loop
@@ -4308,14 +4363,29 @@ procedure Adacomp is
                   Sym_Arr_Hi (Sym_Count) := 1;   -- free-proc tag
                   return 0;
                end if;
-               Emit ("void ");
-               Emit_Sub_Name (P_Name, P_Len);
-               Emit ("(");
+               SP := New_Node (D_SUBPROG);
+               N_Int (SP) := 0;              -- 0 = procedure (void)
+               -- Resolve the emitted (possibly package-mangled) name now,
+               -- so the walker never reads the symbol table.
+               ELen := 0;
+               if Cur_Pkg /= 0 then
+                  for I in 1 .. Sym_Name_Len (Cur_Pkg - 1) loop
+                     ELen := ELen + 1;
+                     EName (ELen) := Name_Pool (Sym_Name_Off (Cur_Pkg - 1) + I - 1);
+                  end loop;
+                  ELen := ELen + 1;
+                  EName (ELen) := '_';
+               end if;
+               for I in 1 .. P_Len loop
+                  ELen := ELen + 1;
+                  EName (ELen) := P_Name (I);
+               end loop;
+               N_Str_Off (SP) := Pool_Str (EName, ELen);
+               N_Str_Len (SP) := ELen;
                Push_Scope;
                if Tok = TK_LPAREN then
                   Next_Token;
                   declare
-                     First : Boolean := True;
                      Parm : Tok_Buffer;
                      Parm_Len : Integer;
                      Arr_Idx : Integer;
@@ -4324,6 +4394,8 @@ procedure Adacomp is
                      Def_Base : Integer := Def_Count;
                      NParams : Integer := 0;
                      Neg : Boolean;
+                     PP : Integer;
+                     Prev_P : Integer := 0;
                   begin
                      -- proc symbol index: params get added after it
                      for Si in reverse 1 .. Sym_Count loop
@@ -4333,8 +4405,6 @@ procedure Adacomp is
                         end if;
                      end loop;
                      while Tok /= TK_RPAREN and Tok /= TK_EOF loop
-                        if not First then Emit (", "); end if;
-                        First := False;
                         Parm_Len := Tok_Len;
                         for I in 1 .. Tok_Len loop
                            Parm (I) := Tok_Val (I);
@@ -4342,6 +4412,9 @@ procedure Adacomp is
                         Add_Sym (SK_PARAM, TY_INTEGER);
                         Next_Token;
                         Expect (TK_COLON);
+                        PP := New_Node (D_PARAM);
+                        N_Str_Off (PP) := Pool_Str (Parm, Parm_Len);
+                        N_Str_Len (PP) := Parm_Len;
                         Arr_Idx := 0;
                         Rec_Idx := 0;
                         if Tok = TK_IDENT then
@@ -4362,16 +4435,15 @@ procedure Adacomp is
                            Sym_Arr_Lo (Sym_Count) := Sym_Arr_Lo (Arr_Idx);
                            Sym_Arr_Hi (Sym_Count) := Sym_Arr_Hi (Arr_Idx);
                            Sym_Arr_El (Sym_Count) := Sym_Arr_El (Arr_Idx);
-                           Emit_C_Type (Sym_Arr_El (Arr_Idx));
-                           Emit (" *");
-                           Emit_Lower (Parm, Parm_Len);
+                           N_Op (PP) := 1;            -- elem-pointer param
+                           N_Int (PP) := Sym_Arr_El (Arr_Idx);
                            Next_Token;
                         elsif Rec_Idx > 0 then
                            Sym_Type (Sym_Count) := TY_RECORD;
-                           Emit ("struct ");
-                           Emit_Name_Pool_Lower (Sym_Name_Off (Rec_Idx), Sym_Name_Len (Rec_Idx));
-                           Emit (" ");
-                           Emit_Lower (Parm, Parm_Len);
+                           N_Op (PP) := 2;            -- by-value struct
+                           N_Arg2 (PP) := Pool_Name_Pool (Sym_Name_Off (Rec_Idx),
+                                                          Sym_Name_Len (Rec_Idx));
+                           N_Aux2 (PP) := Sym_Name_Len (Rec_Idx);
                            Next_Token;
                         else
                            Typ := Parse_Type_Ref;
@@ -4379,10 +4451,15 @@ procedure Adacomp is
                            if Typ = TY_STRING then
                               Sym_Arr_Lo (Sym_Count) := 1;
                            end if;
-                           Emit_C_Type (Typ);
-                           Emit (" ");
-                           Emit_Lower (Parm, Parm_Len);
+                           N_Op (PP) := 0;            -- scalar
+                           N_Int (PP) := Typ;
                         end if;
+                        if Prev_P = 0 then
+                           N_First (SP) := PP;
+                        else
+                           N_Next (Prev_P) := PP;
+                        end if;
+                        Prev_P := PP;
                         -- Optional default: `:= <literal or named
                         -- constant>`. Doesn't affect the C signature;
                         -- call sites append omitted trailing arguments.
@@ -4436,29 +4513,26 @@ procedure Adacomp is
                      end if;
                   end;
                end if;
+               -- Forward declaration: `procedure Name (...);` no body
                if Tok = TK_SEMI then
-                  Is_Fwd := True;
-                  Emit_Ln (");");
+                  N_Op (SP) := 1;
                   Next_Token;
                   Pop_Scope;
+                  return SP;
                end if;
-               if not Is_Fwd then
-                  Emit_Ln (") {");
-                  Expect (TK_IS);
-                  Indent_Level := Indent_Level + 1;
-                  Parse_Declarations;
-                  Expect (TK_BEGIN);
-                  Parse_Statements;
-                  Indent_Level := Indent_Level - 1;
-                  Emit_Ln ("}");
-                  Emit_Ln ("");
-                  Expect (TK_END);
-                  if Tok = TK_IDENT then Next_Token; end if;
-                  Expect (TK_SEMI);
-                  Pop_Scope;
-               end if;
+               Expect (TK_IS);
+               Decl_Depth := Decl_Depth + 1;
+               N_Arg2 (SP) := Parse_Var_Decl_Chain;    -- nested declarations
+               Expect (TK_BEGIN);
+               N_Left (SP) := Parse_Statement_Chain;   -- body
+               N_Right (SP) := G_Pending_Handlers;     -- handler arms, or 0
+               Decl_Depth := Decl_Depth - 1;
+               Expect (TK_END);
+               if Tok = TK_IDENT then Next_Token; end if;
+               Expect (TK_SEMI);
+               Pop_Scope;
+               return SP;
             end;
-         return 0;
          end if;
 
          if Tok = TK_FUNCTION then
@@ -4466,16 +4540,15 @@ procedure Adacomp is
             declare
                F_Name : Tok_Buffer;
                F_Len  : Integer;
-               Ret    : Integer;
-               P_Names : array (1 .. 20) of Tok_Buffer;
-               P_Lens  : array (1 .. 20) of Integer;
-               P_Types : array (1 .. 20) of Integer;
-               P_El    : array (1 .. 20) of Integer;
-               P_Rec   : array (1 .. 20) of Integer;  -- record type sym idx, else 0
-               P_Count : Integer := 0;
-               Is_Fwd  : Boolean := False;
+               SP     : Integer;
+               EName  : Tok_Buffer;
+               ELen   : Integer;
                Arr_Idx : Integer;
                Rec_Idx : Integer;
+               PP      : Integer;
+               Prev_P  : Integer := 0;
+               Parm     : Tok_Buffer;
+               Parm_Len : Integer;
             begin
                F_Len := Tok_Len;
                for I in 1 .. Tok_Len loop
@@ -4484,21 +4557,38 @@ procedure Adacomp is
                Add_Sym (SK_FUNC, TY_INTEGER);
                if Cur_Pkg /= 0 then Sym_Arr_Lo (Sym_Count) := Cur_Pkg; end if;
                Next_Token;
+               SP := New_Node (D_SUBPROG);
+               ELen := 0;
+               if Cur_Pkg /= 0 then
+                  for I in 1 .. Sym_Name_Len (Cur_Pkg - 1) loop
+                     ELen := ELen + 1;
+                     EName (ELen) := Name_Pool (Sym_Name_Off (Cur_Pkg - 1) + I - 1);
+                  end loop;
+                  ELen := ELen + 1;
+                  EName (ELen) := '_';
+               end if;
+               for I in 1 .. F_Len loop
+                  ELen := ELen + 1;
+                  EName (ELen) := F_Name (I);
+               end loop;
+               N_Str_Off (SP) := Pool_Str (EName, ELen);
+               N_Str_Len (SP) := ELen;
                Push_Scope;
                if Tok = TK_LPAREN then
                   Next_Token;
                   while Tok /= TK_RPAREN and Tok /= TK_EOF loop
-                     P_Count := P_Count + 1;
-                     P_Lens (P_Count) := Tok_Len;
+                     Parm_Len := Tok_Len;
                      for I in 1 .. Tok_Len loop
-                        P_Names (P_Count) (I) := Tok_Val (I);
+                        Parm (I) := Tok_Val (I);
                      end loop;
                      Add_Sym (SK_PARAM, TY_INTEGER);
                      Next_Token;
                      Expect (TK_COLON);
+                     PP := New_Node (D_PARAM);
+                     N_Str_Off (PP) := Pool_Str (Parm, Parm_Len);
+                     N_Str_Len (PP) := Parm_Len;
                      Arr_Idx := 0;
                      Rec_Idx := 0;
-                     P_Rec (P_Count) := 0;
                      if Tok = TK_IDENT then
                         Arr_Idx := Find_Sym (Tok_Val, Tok_Len);
                         if Arr_Idx > 0 and then Sym_Kind (Arr_Idx) = SK_TYPE
@@ -4513,76 +4603,61 @@ procedure Adacomp is
                         end if;
                      end if;
                      if Arr_Idx > 0 then
-                        P_Types (P_Count) := TY_ARRAY;
-                        P_El (P_Count) := Sym_Arr_El (Arr_Idx);
                         Sym_Type (Sym_Count) := TY_ARRAY;
                         Sym_Arr_Lo (Sym_Count) := Sym_Arr_Lo (Arr_Idx);
                         Sym_Arr_Hi (Sym_Count) := Sym_Arr_Hi (Arr_Idx);
                         Sym_Arr_El (Sym_Count) := Sym_Arr_El (Arr_Idx);
+                        N_Op (PP) := 1;            -- elem-pointer param
+                        N_Int (PP) := Sym_Arr_El (Arr_Idx);
                         Next_Token;
                      elsif Rec_Idx > 0 then
-                        P_Types (P_Count) := TY_RECORD;
-                        P_El (P_Count) := 0;
-                        P_Rec (P_Count) := Rec_Idx;
                         Sym_Type (Sym_Count) := TY_RECORD;
+                        N_Op (PP) := 2;            -- by-value struct
+                        N_Arg2 (PP) := Pool_Name_Pool (Sym_Name_Off (Rec_Idx),
+                                                       Sym_Name_Len (Rec_Idx));
+                        N_Aux2 (PP) := Sym_Name_Len (Rec_Idx);
                         Next_Token;
                      else
-                        P_Types (P_Count) := Parse_Type_Ref;
-                        P_El (P_Count) := 0;
-                        Sym_Type (Sym_Count) := P_Types (P_Count);
-                        if P_Types (P_Count) = TY_STRING then
+                        Typ := Parse_Type_Ref;
+                        Sym_Type (Sym_Count) := Typ;
+                        if Typ = TY_STRING then
                            Sym_Arr_Lo (Sym_Count) := 1;
                         end if;
+                        N_Op (PP) := 0;            -- scalar
+                        N_Int (PP) := Typ;
                      end if;
+                     if Prev_P = 0 then
+                        N_First (SP) := PP;
+                     else
+                        N_Next (Prev_P) := PP;
+                     end if;
+                     Prev_P := PP;
                      if Tok = TK_SEMI then Next_Token; end if;
                   end loop;
                   Expect (TK_RPAREN);
                end if;
                Expect (TK_RETURN);
-               Ret := Parse_Type_Ref;
-               Emit_C_Type (Ret);
-               Emit (" ");
-               Emit_Sub_Name (F_Name, F_Len);
-               Emit ("(");
-               for I in 1 .. P_Count loop
-                  if I > 1 then Emit (", "); end if;
-                  if P_Types (I) = TY_ARRAY then
-                     Emit_C_Type (P_El (I));
-                     Emit (" *");
-                  elsif P_Types (I) = TY_RECORD then
-                     Emit ("struct ");
-                     Emit_Name_Pool_Lower (Sym_Name_Off (P_Rec (I)), Sym_Name_Len (P_Rec (I)));
-                     Emit (" ");
-                  else
-                     Emit_C_Type (P_Types (I));
-                     Emit (" ");
-                  end if;
-                  Emit_Lower (P_Names (I), P_Lens (I));
-               end loop;
-               if P_Count = 0 then Emit ("void"); end if;
+               N_Int (SP) := Parse_Type_Ref;   -- non-zero: function ret type
+               -- Forward declaration: `function F (...) return T;` no body
                if Tok = TK_SEMI then
-                  Is_Fwd := True;
-                  Emit_Ln (");");
+                  N_Op (SP) := 1;
                   Next_Token;
                   Pop_Scope;
+                  return SP;
                end if;
-               if not Is_Fwd then
-                  Emit_Ln (") {");
-                  Expect (TK_IS);
-                  Indent_Level := Indent_Level + 1;
-                  Parse_Declarations;
-                  Expect (TK_BEGIN);
-                  Parse_Statements;
-                  Indent_Level := Indent_Level - 1;
-                  Emit_Ln ("}");
-                  Emit_Ln ("");
-                  Expect (TK_END);
-                  if Tok = TK_IDENT then Next_Token; end if;
-                  Expect (TK_SEMI);
-                  Pop_Scope;
-               end if;
+               Expect (TK_IS);
+               Decl_Depth := Decl_Depth + 1;
+               N_Arg2 (SP) := Parse_Var_Decl_Chain;    -- nested declarations
+               Expect (TK_BEGIN);
+               N_Left (SP) := Parse_Statement_Chain;   -- body
+               N_Right (SP) := G_Pending_Handlers;     -- handler arms, or 0
+               Decl_Depth := Decl_Depth - 1;
+               Expect (TK_END);
+               if Tok = TK_IDENT then Next_Token; end if;
+               Expect (TK_SEMI);
+               Pop_Scope;
+               return SP;
             end;
-         return 0;
          end if;
 
          if Tok = TK_IDENT then
